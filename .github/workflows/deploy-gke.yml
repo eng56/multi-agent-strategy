@@ -5,7 +5,7 @@ permissions: {contents: read, id-token: write}
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    environment: demo
+    environment: Production
     steps:
       - uses: actions/checkout@v4
       - name: Validate GKE deployment variables
@@ -25,7 +25,7 @@ jobs:
           done
           if [ "${#missing[@]}" -gt 0 ]; then
             printf 'Missing GitHub Actions variables: %s\n' "${missing[*]}" >&2
-            printf 'Add them under Settings > Secrets and variables > Actions > Variables, or under the demo environment variables because this job uses environment: demo. Do not store these non-secret identifiers as secrets unless the workflow is changed to secrets.*.\n' >&2
+            printf 'Add them under Settings > Secrets and variables > Actions > Variables, or under the Production environment variables because this job uses environment: Production. Do not store these non-secret identifiers as secrets unless the workflow is changed to secrets.*.\n' >&2
             exit 1
           fi
       - uses: google-github-actions/auth@v3
