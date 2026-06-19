@@ -27,13 +27,34 @@ There are intentionally no local Kafka, Redis, object-storage, Langfuse, model, 
 ## Cloud demo
 
 1. Create a GKE Autopilot cluster, Artifact Registry repository, and GCS bucket.
-2. Enable Workload Identity and the GKE Secret Manager add-on.
+2. Enable Workload Identity and the GKE Secret Manager add-on. For an existing cluster, run `gcloud container clusters update "$GKE_CLUSTER" --enable-secret-manager --location="$GCP_REGION" --project="$GCP_PROJECT_ID"`.
 3. Give the runtime Google service account least-privilege GCS access. Do not grant pods permission to create Kubernetes Secrets.
 4. Store deployment variables from `.env.example` as the dotenv-formatted `runtime-env` Google Secret Manager secret.
 5. Configure GitHub variables `GCP_WORKLOAD_IDENTITY_PROVIDER`, `GCP_DEPLOY_SERVICE_ACCOUNT`,
    `GKE_CLUSTER`, `GCP_REGION`, `GCP_PROJECT_ID`, and `ARTIFACT_REGISTRY_REPO`.
 6. Configure Vercel server-side `ORCHESTRATOR_API_URL`, `ORCHESTRATOR_API_TOKEN`, and `DEMO_PASSWORD`,
    plus deployment credentials `VERCEL_TOKEN`, `VERCEL_ORG_ID`, and `VERCEL_PROJECT_ID` in GitHub.
+
+### GitHub deploy service account IAM
+
+The GitHub Actions deploy service account referenced by `GCP_DEPLOY_SERVICE_ACCOUNT` must be allowed
+to fetch GKE credentials, push images, and apply Kubernetes manifests. For the first demo, grant these
+roles at the project level:
+
+```bash
+gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \
+  --member="serviceAccount:$GCP_DEPLOY_SERVICE_ACCOUNT" \
+  --role="roles/container.developer"
+
+gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \
+  --member="serviceAccount:$GCP_DEPLOY_SERVICE_ACCOUNT" \
+  --role="roles/artifactregistry.writer"
+```
+
+`roles/container.developer` includes the `container.clusters.get` permission required by
+`google-github-actions/get-gke-credentials`. If you still see Kubernetes `forbidden` errors after
+credentials are fetched, bind the same deploy identity to an appropriate Kubernetes RBAC role in the
+target cluster or temporarily use `roles/container.admin` for the demo deploy service account.
 
 ## Tool limits
 

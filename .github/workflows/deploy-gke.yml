@@ -34,6 +34,17 @@ jobs:
       - uses: google-github-actions/get-gke-credentials@v3
         with: {cluster_name: "${{ vars.GKE_CLUSTER }}", location: "${{ vars.GCP_REGION }}"}
       - run: gcloud auth configure-docker "${{ vars.GCP_REGION }}-docker.pkg.dev" --quiet
+      - name: Validate GKE Secret Manager add-on
+        run: |
+          if ! kubectl get crd secretproviderclasses.secrets-store.csi.x-k8s.io >/dev/null 2>&1; then
+            printf '%s\n' 'Missing SecretProviderClass CRD. Enable the managed GKE Secret Manager add-on before deploying.' >&2
+            printf 'Run: gcloud container clusters update %s --enable-secret-manager --location=%s --project=%s\n' "${{ vars.GKE_CLUSTER }}" "${{ vars.GCP_REGION }}" "${{ vars.GCP_PROJECT_ID }}" >&2
+            exit 1
+          fi
+          if ! kubectl get csidriver secrets-store-gke.csi.k8s.io >/dev/null 2>&1; then
+            printf '%s\n' 'Missing secrets-store-gke.csi.k8s.io CSIDriver. Wait for the GKE Secret Manager add-on to finish installing, then rerun the deployment.' >&2
+            exit 1
+          fi
       - id: image
         run: |
           IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.ARTIFACT_REGISTRY_REPO }}/runtime:${GITHUB_SHA}"
