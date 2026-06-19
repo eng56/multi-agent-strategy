@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     confluent_sasl_mechanism: Literal["PLAIN"] = "PLAIN"
     upstash_redis_rest_url: AnyHttpUrl
     upstash_redis_rest_token: str
+    openrouter_api_key: str
+    tavily_api_key: str
+    market_data_api_key: str
     market_data_provider: Literal["polygon", "massive", "alpha_vantage"] = "polygon"
     langfuse_public_key: str
     langfuse_secret_key: str
@@ -26,7 +29,6 @@ class Settings(BaseSettings):
     gcs_bucket_name: str
     artifact_registry_repo: str
     orchestrator_api_token: str
-    kms_key_name: str
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     runtime_topic: str = "agent-runtime"
     polygon_base_url: str = "https://api.polygon.io"

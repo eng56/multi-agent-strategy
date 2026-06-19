@@ -1,4 +1,4 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal
 from uuid import UUID, uuid4
@@ -30,7 +30,6 @@ class RunStatus(StrEnum):
     COMPLETED = "completed"
     PARTIAL_BUDGET_EXHAUSTED = "partial_budget_exhausted"
     FAILED = "failed"
-    EXPIRED = "expired"
 
 
 class RoleModelPolicy(BaseModel):
@@ -76,18 +75,11 @@ class Budget(BaseModel):
     active_agents: int = 0
 
 
-class UserCredentials(BaseModel):
-    openrouter_api_key: str = Field(min_length=8)
-    tavily_api_key: str = Field(min_length=8)
-    market_data_api_key: str = Field(min_length=8)
-
-
 class RunRequest(BaseModel):
     question: str = Field(min_length=3, max_length=10_000)
     llm_budget_usd: float = Field(gt=0)
     models: ModelPolicy
     tool_budget: ToolBudget = Field(default_factory=ToolBudget)
-    credentials: UserCredentials
 
     @model_validator(mode="after")
     def validate_caps(self) -> "RunRequest":
@@ -114,7 +106,6 @@ class Run(BaseModel):
     budget: Budget
     models: ModelPolicy
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    expires_at: datetime = Field(default_factory=lambda: datetime.now(UTC) + timedelta(hours=6))
     final_answer: str | None = None
 
 

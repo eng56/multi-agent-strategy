@@ -12,4 +12,3 @@ data:
   RUNTIME_TOPIC: agent-runtime
   TAVILY_BASE_URL: https://api.tavily.com
   POLYGON_BASE_URL: https://api.polygon.io
-  KMS_KEY_NAME: projects/GCP_PROJECT_ID/locations/global/keyRings/runtime/cryptoKeys/ephemeral-user-credentials

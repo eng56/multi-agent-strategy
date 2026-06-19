@@ -1,7 +1,6 @@
 """Role-specific event worker; all infrastructure dependencies remain managed services."""
 import asyncio
 import os
-from datetime import UTC, datetime
 
 from src.agents.workflow import HANDLERS, aggregate, deterministic_partial
 from src.common.budget import BudgetExceeded
@@ -9,10 +8,6 @@ from src.runtime import build_runtime
 
 
 async def dispatch(runtime, role, event) -> None:
-    run = await runtime.blackboard.get_run(event.run_id)
-    if run and datetime.now(UTC) >= run.expires_at:
-        await deterministic_partial(runtime, event.run_id, "The six-hour credential window expired.")
-        return
     handler = HANDLERS.get(role, {}).get(event.type)
     if not handler:
         return

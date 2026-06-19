@@ -189,7 +189,6 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
         run.final_answer = final.answer
         run.status = RunStatus.COMPLETED
         await runtime.blackboard.put_run(run)
-        await runtime.credentials.delete(event.run_id)
 
 
 async def judge(runtime: Runtime, event: EventEnvelope) -> None:
@@ -211,7 +210,6 @@ async def judge(runtime: Runtime, event: EventEnvelope) -> None:
     run.status = RunStatus.COMPLETED
     await runtime.blackboard.put_final(final)
     await runtime.blackboard.put_run(run)
-    await runtime.credentials.delete(event.run_id)
 
 
 HANDLERS = {
@@ -237,7 +235,6 @@ async def deterministic_partial(runtime: Runtime, run_id: UUID, reason: str) -> 
     answer = f"# Partial Investment Research Report\n\nReason: {reason}\n\n## Verified findings\n{findings}\n\nThis deterministic report was assembled without an additional LLM call."
     final = FinalReport(run_id=run_id, answer=answer, verified_claim_ids=[claim.id for claim in verified], sources=sorted({source for claim in verified for source in claim.sources}), partial=True)
     run.final_answer = answer
-    run.status = RunStatus.EXPIRED if "expired" in reason.lower() else RunStatus.PARTIAL_BUDGET_EXHAUSTED
+    run.status = RunStatus.PARTIAL_BUDGET_EXHAUSTED
     await runtime.blackboard.put_final(final)
     await runtime.blackboard.put_run(run)
-    await runtime.credentials.delete(run_id)
