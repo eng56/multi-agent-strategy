@@ -1,0 +1,47 @@
+name: Deploy GKE Autopilot
+on:
+  push: {branches: [main]}
+permissions: {contents: read, id-token: write}
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: Production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate GKE deployment variables
+        env:
+          GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          GCP_DEPLOY_SERVICE_ACCOUNT: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          ARTIFACT_REGISTRY_REPO: ${{ vars.ARTIFACT_REGISTRY_REPO }}
+        run: |
+          missing=()
+          for name in GCP_WORKLOAD_IDENTITY_PROVIDER GCP_DEPLOY_SERVICE_ACCOUNT GKE_CLUSTER GCP_REGION GCP_PROJECT_ID ARTIFACT_REGISTRY_REPO; do
+            if [ -z "${!name}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf 'Missing GitHub Actions variables: %s\n' "${missing[*]}" >&2
+            printf 'Add them under Settings > Secrets and variables > Actions > Variables, or under the Production environment variables because this job uses environment: Production. Do not store these non-secret identifiers as secrets unless the workflow is changed to secrets.*.\n' >&2
+            exit 1
+          fi
+      - uses: google-github-actions/auth@v3
+        with: {workload_identity_provider: "${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}", service_account: "${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}"}
+      - uses: google-github-actions/setup-gcloud@v3
+      - uses: google-github-actions/get-gke-credentials@v3
+        with: {cluster_name: "${{ vars.GKE_CLUSTER }}", location: "${{ vars.GCP_REGION }}"}
+      - run: gcloud auth configure-docker "${{ vars.GCP_REGION }}-docker.pkg.dev" --quiet
+      - id: image
+        run: |
+          IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.ARTIFACT_REGISTRY_REPO }}/runtime:${GITHUB_SHA}"
+          docker build -t "$IMAGE" . && docker push "$IMAGE"
+          echo "value=$IMAGE" >> "$GITHUB_OUTPUT"
+      - run: |
+          sed -i "s|APP_IMAGE|${{ steps.image.outputs.value }}|g; s|GCP_PROJECT_ID|${{ vars.GCP_PROJECT_ID }}|g" deploy/gke/base/*.yaml
+          kubectl apply -k deploy/gke/base
+          for deployment in orchestrator-api planner-agent worker-agents verifier-agent aggregator-agent judge-agent tool-runner; do
+            kubectl rollout status "deployment/$deployment" --timeout=5m
+          done
