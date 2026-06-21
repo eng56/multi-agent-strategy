@@ -1,0 +1,31 @@
+name: Deploy Vercel Frontend
+on:
+  push: {branches: [main], paths: ["frontend/**"]}
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults: {run: {working-directory: frontend}}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Vercel deployment settings
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+        run: |
+          missing=()
+          for name in VERCEL_TOKEN VERCEL_ORG_ID VERCEL_PROJECT_ID; do
+            if [ -z "${!name}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf 'Missing Vercel deployment settings: %s\n' "${missing[*]}" >&2
+            printf 'Store VERCEL_TOKEN as a GitHub Actions secret and VERCEL_ORG_ID/VERCEL_PROJECT_ID as GitHub Actions variables.\n' >&2
+            exit 1
+          fi
+      - run: npm install -g vercel@latest
+      - run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+      - run: vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
+      - run: vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }}
+        env: {VERCEL_ORG_ID: "${{ vars.VERCEL_ORG_ID }}", VERCEL_PROJECT_ID: "${{ vars.VERCEL_PROJECT_ID }}"}
