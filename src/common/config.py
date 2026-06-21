@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import AnyHttpUrl, Field
+from pydantic import AliasChoices, AnyHttpUrl, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     market_data_provider: Literal["polygon", "massive", "alpha_vantage"] = "polygon"
     langfuse_public_key: str
     langfuse_secret_key: str
-    langfuse_host: AnyHttpUrl
+    langfuse_host: AnyHttpUrl = Field(validation_alias=AliasChoices("LANGFUSE_HOST", "LANGFUSE_BASE_URL"))
     gcp_project_id: str
     gcp_region: str
     gcs_bucket_name: str

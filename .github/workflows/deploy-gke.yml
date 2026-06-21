@@ -28,7 +28,7 @@ jobs:
             printf 'Add them under Settings > Secrets and variables > Actions > Variables, or under the Production environment variables because this job uses environment: Production. Do not store these non-secret identifiers as secrets unless the workflow is changed to secrets.*.\n' >&2
             exit 1
           fi
-      - uses: google-github-actions/auth@v3
+      - uses: google-github-actions/auth@v3https://github.com/eng56/multi-agent-strategy/pull/5/conflict?name=README.md&base_oid=78da97565d0defb9763be025c36d69b51e3905c9&head_oid=5747cfc642ff30adbcac7715d9b0eef3dfd96896
         with: {workload_identity_provider: "${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}", service_account: "${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}"}
       - uses: google-github-actions/setup-gcloud@v3
       - uses: google-github-actions/get-gke-credentials@v3
@@ -53,6 +53,19 @@ jobs:
       - run: |
           sed -i "s|APP_IMAGE|${{ steps.image.outputs.value }}|g; s|GCP_PROJECT_ID|${{ vars.GCP_PROJECT_ID }}|g" deploy/gke/base/*.yaml
           kubectl apply -k deploy/gke/base
+          failed=0
           for deployment in orchestrator-api planner-agent worker-agents verifier-agent aggregator-agent judge-agent tool-runner; do
-            kubectl rollout status "deployment/$deployment" --timeout=5m
+            if ! kubectl rollout status "deployment/$deployment" --timeout=10m; then
+              failed=1
+              printf '\n--- Diagnostics for %s ---\n' "$deployment" >&2
+              kubectl describe "deployment/$deployment" || true
+              kubectl get pods -l "app=$deployment" -o wide || true
+              kubectl describe pods -l "app=$deployment" || true
+              kubectl logs -l "app=$deployment" --all-containers --tail=100 || true
+            fi
           done
+          if [ "$failed" -ne 0 ]; then
+            printf '\n--- Recent cluster events ---\n' >&2
+            kubectl get events --sort-by=.lastTimestamp | tail -n 80 || true
+            exit 1
+          fi

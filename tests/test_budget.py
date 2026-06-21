@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from src.common.budget import BudgetExceeded, PersistentBudget
@@ -25,18 +27,16 @@ class Blackboard:
         self.run = run
 
 
-@pytest.mark.asyncio
-async def test_protected_finalization_budget_blocks_research() -> None:
+def test_protected_finalization_budget_blocks_research() -> None:
     run = Run(question="q", models=policy(), budget=Budget(limit_usd=10, spent_usd=7, tools=ToolBudget()))
     budget = PersistentBudget(Blackboard(run))  # type: ignore[arg-type]
     with pytest.raises(BudgetExceeded, match="shared budget"):
-        await budget.reserve_llm(run.id, AgentRole.RESEARCH, 1.01)
+        asyncio.run(budget.reserve_llm(run.id, AgentRole.RESEARCH, 1.01))
 
 
-@pytest.mark.asyncio
-async def test_aggregator_and_judge_can_use_their_protected_caps() -> None:
+def test_aggregator_and_judge_can_use_their_protected_caps() -> None:
     run = Run(question="q", models=policy(), budget=Budget(limit_usd=10, spent_usd=8, tools=ToolBudget()))
     budget = PersistentBudget(Blackboard(run))  # type: ignore[arg-type]
-    await budget.reserve_llm(run.id, AgentRole.AGGREGATOR, 1)
-    await budget.reserve_llm(run.id, AgentRole.JUDGE, 1)
+    asyncio.run(budget.reserve_llm(run.id, AgentRole.AGGREGATOR, 1))
+    asyncio.run(budget.reserve_llm(run.id, AgentRole.JUDGE, 1))
     assert run.budget.reserved_usd == 2
