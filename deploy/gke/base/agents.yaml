@@ -12,7 +12,7 @@ spec:
       containers:
         - name: app
           image: APP_IMAGE
-          command: ["python", "-m", "src.worker"]
+          args: ["python", "-m", "src.worker"]
           env:
             - {name: AGENT_ROLE, value: planner-agent}
           envFrom: [{configMapRef: {name: runtime-config}}]
@@ -33,7 +33,7 @@ spec:
       containers:
         - name: app
           image: APP_IMAGE
-          command: ["python", "-m", "src.worker"]
+          args: ["python", "-m", "src.worker"]
           env:
             - {name: AGENT_ROLE, value: worker-agents}
           envFrom: [{configMapRef: {name: runtime-config}}]
@@ -54,7 +54,7 @@ spec:
       containers:
         - name: app
           image: APP_IMAGE
-          command: ["python", "-m", "src.worker"]
+          args: ["python", "-m", "src.worker"]
           env:
             - {name: AGENT_ROLE, value: verifier-agent}
           envFrom: [{configMapRef: {name: runtime-config}}]
@@ -75,7 +75,7 @@ spec:
       containers:
         - name: app
           image: APP_IMAGE
-          command: ["python", "-m", "src.worker"]
+          args: ["python", "-m", "src.worker"]
           env:
             - {name: AGENT_ROLE, value: aggregator-agent}
           envFrom: [{configMapRef: {name: runtime-config}}]
@@ -96,7 +96,7 @@ spec:
       containers:
         - name: app
           image: APP_IMAGE
-          command: ["python", "-m", "src.worker"]
+          args: ["python", "-m", "src.worker"]
           env:
             - {name: AGENT_ROLE, value: judge-agent}
           envFrom: [{configMapRef: {name: runtime-config}}]
@@ -117,7 +117,7 @@ spec:
       containers:
         - name: app
           image: APP_IMAGE
-          command: ["python", "-m", "src.worker"]
+          args: ["python", "-m", "src.worker"]
           env:
             - {name: AGENT_ROLE, value: tool-runner}
           envFrom: [{configMapRef: {name: runtime-config}}]

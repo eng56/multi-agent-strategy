@@ -5,13 +5,13 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     defaults: {run: {working-directory: frontend}}
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN || vars.VERCEL_TOKEN }}
+      VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID || secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID || secrets.VERCEL_PROJECT_ID }}
     steps:
       - uses: actions/checkout@v4
       - name: Validate Vercel deployment settings
-        env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
         run: |
           missing=()
           for name in VERCEL_TOKEN VERCEL_ORG_ID VERCEL_PROJECT_ID; do
@@ -25,7 +25,7 @@ jobs:
             exit 1
           fi
       - run: npm install -g vercel@latest
-      - run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
-      - run: vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
-      - run: vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }}
-        env: {VERCEL_ORG_ID: "${{ vars.VERCEL_ORG_ID }}", VERCEL_PROJECT_ID: "${{ vars.VERCEL_PROJECT_ID }}"}
+      - run: vercel pull --yes --environment=production --token=${{ env.VERCEL_TOKEN }}
+      - run: vercel build --prod --token=${{ env.VERCEL_TOKEN }}
+      - run: vercel deploy --prebuilt --prod --token=${{ env.VERCEL_TOKEN }}
+        env: {VERCEL_ORG_ID: "${{ env.VERCEL_ORG_ID }}", VERCEL_PROJECT_ID: "${{ env.VERCEL_PROJECT_ID }}"}
