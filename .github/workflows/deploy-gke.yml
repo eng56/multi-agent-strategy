@@ -6,16 +6,16 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     environment: Production
+    env:
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER || secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_DEPLOY_SERVICE_ACCOUNT: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT || secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
+      GKE_CLUSTER: ${{ vars.GKE_CLUSTER || secrets.GKE_CLUSTER }}
+      GCP_REGION: ${{ vars.GCP_REGION || secrets.GCP_REGION }}
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID }}
+      ARTIFACT_REGISTRY_REPO: ${{ vars.ARTIFACT_REGISTRY_REPO || secrets.ARTIFACT_REGISTRY_REPO }}
     steps:
       - uses: actions/checkout@v4
       - name: Validate GKE deployment variables
-        env:
-          GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          GCP_DEPLOY_SERVICE_ACCOUNT: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
-          GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
-          GCP_REGION: ${{ vars.GCP_REGION }}
-          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
-          ARTIFACT_REGISTRY_REPO: ${{ vars.ARTIFACT_REGISTRY_REPO }}
         run: |
           missing=()
           for name in GCP_WORKLOAD_IDENTITY_PROVIDER GCP_DEPLOY_SERVICE_ACCOUNT GKE_CLUSTER GCP_REGION GCP_PROJECT_ID ARTIFACT_REGISTRY_REPO; do
@@ -29,15 +29,16 @@ jobs:
             exit 1
           fi
       - uses: google-github-actions/auth@v3
+        with: {workload_identity_provider: "${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}", service_account: "${{ env.GCP_DEPLOY_SERVICE_ACCOUNT }}"}
       - uses: google-github-actions/setup-gcloud@v3
       - uses: google-github-actions/get-gke-credentials@v3
-        with: {cluster_name: "${{ vars.GKE_CLUSTER }}", location: "${{ vars.GCP_REGION }}"}
-      - run: gcloud auth configure-docker "${{ vars.GCP_REGION }}-docker.pkg.dev" --quiet
+        with: {cluster_name: "${{ env.GKE_CLUSTER }}", location: "${{ env.GCP_REGION }}"}
+      - run: gcloud auth configure-docker "${{ env.GCP_REGION }}-docker.pkg.dev" --quiet
       - name: Validate GKE Secret Manager add-on
         run: |
           if ! kubectl get crd secretproviderclasses.secrets-store.csi.x-k8s.io >/dev/null 2>&1; then
             printf '%s\n' 'Missing SecretProviderClass CRD. Enable the managed GKE Secret Manager add-on before deploying.' >&2
-            printf 'Run: gcloud container clusters update %s --enable-secret-manager --location=%s --project=%s\n' "${{ vars.GKE_CLUSTER }}" "${{ vars.GCP_REGION }}" "${{ vars.GCP_PROJECT_ID }}" >&2
+            printf 'Run: gcloud container clusters update %s --enable-secret-manager --location=%s --project=%s\n' "${{ env.GKE_CLUSTER }}" "${{ env.GCP_REGION }}" "${{ env.GCP_PROJECT_ID }}" >&2
             exit 1
           fi
           if ! kubectl get csidriver secrets-store-gke.csi.k8s.io >/dev/null 2>&1; then
@@ -46,11 +47,11 @@ jobs:
           fi
       - id: image
         run: |
-          IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.ARTIFACT_REGISTRY_REPO }}/runtime:${GITHUB_SHA}"
+          IMAGE="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.ARTIFACT_REGISTRY_REPO }}/runtime:${GITHUB_SHA}"
           docker build -t "$IMAGE" . && docker push "$IMAGE"
           echo "value=$IMAGE" >> "$GITHUB_OUTPUT"
       - run: |
-          sed -i "s|APP_IMAGE|${{ steps.image.outputs.value }}|g; s|GCP_PROJECT_ID|${{ vars.GCP_PROJECT_ID }}|g" deploy/gke/base/*.yaml
+          sed -i "s|APP_IMAGE|${{ steps.image.outputs.value }}|g; s|GCP_PROJECT_ID|${{ env.GCP_PROJECT_ID }}|g" deploy/gke/base/*.yaml
           kubectl apply -k deploy/gke/base
           failed=0
           for deployment in orchestrator-api planner-agent worker-agents verifier-agent aggregator-agent judge-agent tool-runner; do
