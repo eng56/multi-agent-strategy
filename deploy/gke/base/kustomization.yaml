@@ -1,0 +1,6 @@
+resources:
+  - configmap.yaml
+  - secrets.yaml
+  - service-account.yaml
+  - workloads.yaml
+  - agents.yaml
