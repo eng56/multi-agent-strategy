@@ -9,6 +9,14 @@ function truncate(value: string) {
   return value.length > 500 ? `${value.slice(0, 500)}…` : value;
 }
 
+function orchestratorBaseUrl(value: string) {
+  const url = new URL(value);
+  url.pathname = url.pathname.replace(/\/(healthz|v1\/runs)\/?$/, "");
+  url.search = "";
+  url.hash = "";
+  return url.toString().replace(/\/$/, "");
+}
+
 export async function POST(request: Request) {
   const apiUrl = process.env.ORCHESTRATOR_API_URL;
   const apiToken = process.env.ORCHESTRATOR_API_TOKEN;
@@ -17,7 +25,8 @@ export async function POST(request: Request) {
   }
   const body = await request.text();
   try {
-    const response = await fetch(`${apiUrl}/v1/runs`, {
+    const baseUrl = orchestratorBaseUrl(apiUrl);
+    const response = await fetch(`${baseUrl}/v1/runs`, {
       method: "POST",
       headers: {"content-type": "application/json", "x-api-key": apiToken},
       body,
@@ -35,6 +44,14 @@ export async function POST(request: Request) {
     );
   } catch (exc) {
     const timedOut = exc instanceof DOMException && exc.name === "TimeoutError";
-    return jsonError(timedOut ? "Backend provider validation timed out" : "Could not reach orchestrator API", timedOut ? 504 : 502);
+    const invalidUrl = exc instanceof TypeError;
+    return jsonError(
+      timedOut
+        ? "Backend provider validation timed out"
+        : invalidUrl
+          ? "ORCHESTRATOR_API_URL must be the orchestrator base URL, for example http://34.27.225.48"
+          : "Could not reach orchestrator API",
+      timedOut ? 504 : 502,
+    );
   }
 }
