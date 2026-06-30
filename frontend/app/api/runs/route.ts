@@ -1,0 +1,27 @@
+export const dynamic = "force-dynamic";
+export const maxDuration = 60;
+
+function jsonError(detail: string, status: number) {
+  return Response.json({detail}, {status});
+}
+
+export async function POST(request: Request) {
+  const apiUrl = process.env.ORCHESTRATOR_API_URL;
+  const apiToken = process.env.ORCHESTRATOR_API_TOKEN;
+  if (!apiUrl || !apiToken) {
+    return jsonError("Frontend is missing ORCHESTRATOR_API_URL or ORCHESTRATOR_API_TOKEN", 500);
+  }
+  const body = await request.text();
+  try {
+    return await fetch(`${apiUrl}/v1/runs`, {
+      method: "POST",
+      headers: {"content-type": "application/json", "x-api-key": apiToken},
+      body,
+      cache: "no-store",
+      signal: AbortSignal.timeout(55000),
+    });
+  } catch (exc) {
+    const timedOut = exc instanceof DOMException && exc.name === "TimeoutError";
+    return jsonError(timedOut ? "Backend provider validation timed out" : "Could not reach orchestrator API", timedOut ? 504 : 502);
+  }
+}
