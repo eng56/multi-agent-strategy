@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: runtime-config
+data:
+  CONFLUENT_SECURITY_PROTOCOL: SASL_SSL
+  CONFLUENT_SASL_MECHANISM: PLAIN
+  MARKET_DATA_PROVIDER: polygon
+  ENVIRONMENT: demo
+  DEFAULT_MAX_PARALLEL_AGENTS: "10"
+  OPENROUTER_BASE_URL: https://openrouter.ai/api/v1
+  RUNTIME_TOPIC: agent-runtime
+  TAVILY_BASE_URL: https://api.tavily.com
+  POLYGON_BASE_URL: https://api.polygon.io
