@@ -75,12 +75,20 @@ export default function Home() {
         body: JSON.stringify({question, llm_budget_usd: budget, models: policies, tool_budget: toolLimits}),
         signal: controller.signal,
       });
-      const run = await response.json().catch(() => ({detail: "Run creation returned a non-JSON response"}));
-      if (response.ok) {
-        location.href = `/runs/${run.id}`;
+      const text = await response.text();
+      let result: {id?: string; detail?: string};
+      try {
+        result = JSON.parse(text);
+      } catch {
+        result = {
+          detail: `Run creation returned a non-JSON response (${response.status} ${response.statusText}): ${text.slice(0, 500)}`,
+        };
+      }
+      if (response.ok && result.id) {
+        location.href = `/runs/${result.id}`;
         return;
       }
-      setError(run.detail ?? "Validation failed");
+      setError(result.detail ?? "Validation failed");
     } catch (exc) {
       setError(
         exc instanceof DOMException && exc.name === "AbortError"
