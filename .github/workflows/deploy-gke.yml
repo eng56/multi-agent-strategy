@@ -1,0 +1,71 @@
+name: Deploy GKE Autopilot
+on:
+  push: {branches: [main]}
+permissions: {contents: read, id-token: write}
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: Production
+    env:
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER || secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_DEPLOY_SERVICE_ACCOUNT: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT || secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
+      GKE_CLUSTER: ${{ vars.GKE_CLUSTER || secrets.GKE_CLUSTER }}
+      GCP_REGION: ${{ vars.GCP_REGION || secrets.GCP_REGION }}
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID }}
+      ARTIFACT_REGISTRY_REPO: ${{ vars.ARTIFACT_REGISTRY_REPO || secrets.ARTIFACT_REGISTRY_REPO }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate GKE deployment variables
+        run: |
+          missing=()
+          for name in GCP_WORKLOAD_IDENTITY_PROVIDER GCP_DEPLOY_SERVICE_ACCOUNT GKE_CLUSTER GCP_REGION GCP_PROJECT_ID ARTIFACT_REGISTRY_REPO; do
+            if [ -z "${!name}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf 'Missing GitHub Actions variables: %s\n' "${missing[*]}" >&2
+            printf 'Add them under Settings > Secrets and variables > Actions > Variables, or under the Production environment variables because this job uses environment: Production. Do not store these non-secret identifiers as secrets unless the workflow is changed to secrets.*.\n' >&2
+            exit 1
+          fi
+      - uses: google-github-actions/auth@v3
+        with: {workload_identity_provider: "${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}", service_account: "${{ env.GCP_DEPLOY_SERVICE_ACCOUNT }}"}
+      - uses: google-github-actions/setup-gcloud@v3
+      - uses: google-github-actions/get-gke-credentials@v3
+        with: {cluster_name: "${{ env.GKE_CLUSTER }}", location: "${{ env.GCP_REGION }}"}
+      - run: gcloud auth configure-docker "${{ env.GCP_REGION }}-docker.pkg.dev" --quiet
+      - name: Validate GKE Secret Manager add-on
+        run: |
+          if ! kubectl get crd secretproviderclasses.secrets-store.csi.x-k8s.io >/dev/null 2>&1; then
+            printf '%s\n' 'Missing SecretProviderClass CRD. Enable the managed GKE Secret Manager add-on before deploying.' >&2
+            printf 'Run: gcloud container clusters update %s --enable-secret-manager --location=%s --project=%s\n' "${{ env.GKE_CLUSTER }}" "${{ env.GCP_REGION }}" "${{ env.GCP_PROJECT_ID }}" >&2
+            exit 1
+          fi
+          if ! kubectl get csidriver secrets-store-gke.csi.k8s.io >/dev/null 2>&1; then
+            printf '%s\n' 'Missing secrets-store-gke.csi.k8s.io CSIDriver. Wait for the GKE Secret Manager add-on to finish installing, then rerun the deployment.' >&2
+            exit 1
+          fi
+      - id: image
+        run: |
+          IMAGE="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.ARTIFACT_REGISTRY_REPO }}/runtime:${GITHUB_SHA}"
+          docker build -t "$IMAGE" . && docker push "$IMAGE"
+          echo "value=$IMAGE" >> "$GITHUB_OUTPUT"
+      - run: |
+          sed -i "s|APP_IMAGE|${{ steps.image.outputs.value }}|g; s|GCP_PROJECT_ID|${{ env.GCP_PROJECT_ID }}|g" deploy/gke/base/*.yaml
+          kubectl apply -k deploy/gke/base
+          failed=0
+          for deployment in orchestrator-api planner-agent worker-agents verifier-agent aggregator-agent judge-agent tool-runner; do
+            if ! kubectl rollout status "deployment/$deployment" --timeout=10m; then
+              failed=1
+              printf '\n--- Diagnostics for %s ---\n' "$deployment" >&2
+              kubectl describe "deployment/$deployment" || true
+              kubectl get pods -l "app=$deployment" -o wide || true
+              kubectl describe pods -l "app=$deployment" || true
+              kubectl logs -l "app=$deployment" --all-containers --tail=100 || true
+            fi
+          done
+          if [ "$failed" -ne 0 ]; then
+            printf '\n--- Recent cluster events ---\n' >&2
+            kubectl get events --sort-by=.lastTimestamp | tail -n 80 || true
+            exit 1
+          fi
