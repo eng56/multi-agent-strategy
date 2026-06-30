@@ -89,3 +89,5 @@ The first version intentionally uses simple provider-native limits: Tavily basic
 credit and market-data calls consume one request. Credential validation consumes one of each. Exact
 USD accounting is enforced for OpenRouter using reservations and returned usage cost; tool USD cost
 is not estimated because it depends on the deployment owner's provider plans.
+
+Confluent note: use a cluster-scoped Kafka API key/secret for CONFLUENT_API_KEY and CONFLUENT_API_SECRET.

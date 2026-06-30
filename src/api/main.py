@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -19,6 +20,8 @@ from src.common.models import (
 )
 from src.integrations.validation import validate_demo_configuration
 from src.runtime import build_runtime
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -67,8 +70,9 @@ async def create_run(request: RunRequest, _: None = Depends(require_api_token)) 
             runtime.settings.polygon_base_url,
         )
     except Exception as exc:
+        logger.exception("run provider validation failed question=%s", request.question[:120])
         raise HTTPException(
-            status_code=400, detail=f"provider or model validation failed: {type(exc).__name__}"
+            status_code=400, detail=f"provider or model validation failed: {type(exc).__name__}: {exc}"
         ) from exc
     request.tool_budget.tavily_credits_used = 1
     request.tool_budget.market_data_requests_used = 1
@@ -81,11 +85,24 @@ async def create_run(request: RunRequest, _: None = Depends(require_api_token)) 
             max_parallel_agents=runtime.settings.default_max_parallel_agents,
         ),
     )
-    await runtime.blackboard.put_run(run)
-    runtime.events.publish(
-        runtime.settings.runtime_topic,
-        EventEnvelope(type=EventType.RUN_CREATED, run_id=run.id, producer="orchestrator-api"),
-    )
+    try:
+        await runtime.blackboard.put_run(run)
+    except Exception as exc:
+        logger.exception("run blackboard write failed run_id=%s", run.id)
+        raise HTTPException(
+            status_code=502, detail=f"blackboard write failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    try:
+        runtime.events.publish(
+            runtime.settings.runtime_topic,
+            EventEnvelope(type=EventType.RUN_CREATED, run_id=run.id, producer="orchestrator-api"),
+        )
+    except Exception as exc:
+        logger.exception("run event publish failed run_id=%s", run.id)
+        raise HTTPException(
+            status_code=502, detail=f"event publish failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    logger.info("run created run_id=%s", run.id)
     return run
 
 
