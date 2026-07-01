@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from src.common.models import AgentRole, Budget, ModelPolicy, RoleModelPolicy, Run, ToolBudget
-from src.integrations.llm import LLMOutputError, OpenRouterLLM, parse_json_output
+from src.integrations.llm import LLMOutputError, LLMProviderError, OpenRouterLLM, parse_json_output
 
 
 def role_policy() -> RoleModelPolicy:
@@ -72,3 +72,52 @@ def test_parse_json_output_accepts_markdown_fenced_json() -> None:
     assert parse_json_output(output, "planner") == {
         "tasks": [{"title": "SAP", "question": "SAP ticker data", "tool": "market_data"}]
     }
+
+
+def test_openrouter_llm_retries_without_response_format_on_bad_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    run = Run(question="q", models=model_policy(), budget=Budget(limit_usd=1, tools=ToolBudget()))
+    seen_payloads = []
+
+    async def post(self, *_args, **kwargs):
+        seen_payloads.append(kwargs["json"])
+        if len(seen_payloads) == 1:
+            return httpx.Response(
+                400,
+                json={"error": {"message": "response_format is not supported"}},
+                request=httpx.Request("POST", "https://openrouter.example/chat/completions"),
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": str(uuid4()),
+                "choices": [{"message": {"content": '{"claims":[]}'}}],
+                "usage": {"cost": 0.001},
+            },
+            request=httpx.Request("POST", "https://openrouter.example/chat/completions"),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", post)
+    llm = OpenRouterLLM("https://openrouter.example", "key", BudgetStub(run), RecorderStub())  # type: ignore[arg-type]
+
+    assert asyncio.run(llm.json(run.id, AgentRole.RESEARCH, "claim-extractor", "system", "prompt")) == {
+        "claims": []
+    }
+    assert "response_format" in seen_payloads[0]
+    assert "response_format" not in seen_payloads[1]
+
+
+def test_openrouter_llm_reports_provider_error_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    run = Run(question="q", models=model_policy(), budget=Budget(limit_usd=1, tools=ToolBudget()))
+
+    async def post(self, *_args, **_kwargs):
+        return httpx.Response(
+            400,
+            json={"error": {"message": "bad model request"}},
+            request=httpx.Request("POST", "https://openrouter.example/chat/completions"),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", post)
+    llm = OpenRouterLLM("https://openrouter.example", "key", BudgetStub(run), RecorderStub())  # type: ignore[arg-type]
+
+    with pytest.raises(LLMProviderError, match="bad model request"):
+        asyncio.run(llm.json(run.id, AgentRole.RESEARCH, "claim-extractor", "system", "prompt"))

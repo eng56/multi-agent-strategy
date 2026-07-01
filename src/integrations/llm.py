@@ -15,6 +15,10 @@ class LLMOutputError(RuntimeError):
     """Raised when a model response cannot be parsed as the expected JSON object."""
 
 
+class LLMProviderError(RuntimeError):
+    """Raised when the model provider rejects or fails a request."""
+
+
 FENCED_JSON_RE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL | re.IGNORECASE)
 
 
@@ -34,6 +38,11 @@ def parse_json_output(output: str, name: str) -> dict[str, Any]:
         return parsed
     snippet = output[:500] if output else "<empty>"
     raise LLMOutputError(f"model returned invalid JSON for {name}: {snippet}")
+
+
+def provider_error_message(response: httpx.Response, name: str) -> str:
+    body = response.text[:1000] if response.text else "<empty>"
+    return f"model provider returned HTTP {response.status_code} for {name}: {body}"
 
 
 class LangfuseRecorder:
@@ -101,6 +110,16 @@ class OpenRouterLLM:
         await self.budget.reserve_llm(run_id, role, estimate)
         actual = estimate
         try:
+            payload = {
+                "model": policy.model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+                "response_format": {"type": "json_object"},
+                "max_tokens": policy.max_output_tokens,
+                "usage": {"include": True},
+            }
             async with httpx.AsyncClient(timeout=120) as client:
                 response = await client.post(
                     f"{self.base_url}/chat/completions",
@@ -108,18 +127,22 @@ class OpenRouterLLM:
                         "Authorization": f"Bearer {self.api_key}",
                         "Content-Type": "application/json",
                     },
-                    json={
-                        "model": policy.model,
-                        "messages": [
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": prompt},
-                        ],
-                        "response_format": {"type": "json_object"},
-                        "max_tokens": policy.max_output_tokens,
-                        "usage": {"include": True},
-                    },
+                    json=payload,
                 )
-                response.raise_for_status()
+                if response.status_code == 400:
+                    payload_without_json_mode = {key: value for key, value in payload.items() if key != "response_format"}
+                    response = await client.post(
+                        f"{self.base_url}/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {self.api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json=payload_without_json_mode,
+                    )
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    raise LLMProviderError(provider_error_message(response, name)) from exc
                 response_data = response.json()
             usage = response_data.get("usage", {})
             actual = float(usage.get("cost") or estimate)
