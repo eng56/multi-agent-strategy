@@ -1,6 +1,7 @@
+from datetime import UTC, datetime
 import json
 from json import JSONDecodeError
-from datetime import UTC, datetime
+import re
 from typing import Any
 from uuid import UUID
 
@@ -12,6 +13,27 @@ from src.common.models import AgentRole
 
 class LLMOutputError(RuntimeError):
     """Raised when a model response cannot be parsed as the expected JSON object."""
+
+
+FENCED_JSON_RE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL | re.IGNORECASE)
+
+
+def parse_json_output(output: str, name: str) -> dict[str, Any]:
+    """Parse model JSON, accepting common markdown-fenced JSON wrappers."""
+    candidates = [output]
+    fenced = FENCED_JSON_RE.match(output)
+    if fenced:
+        candidates.insert(0, fenced.group(1))
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except JSONDecodeError:
+            continue
+        if not isinstance(parsed, dict):
+            raise LLMOutputError(f"model returned non-object JSON for {name}: {json.dumps(parsed)[:500]}")
+        return parsed
+    snippet = output[:500] if output else "<empty>"
+    raise LLMOutputError(f"model returned invalid JSON for {name}: {snippet}")
 
 
 class LangfuseRecorder:
@@ -115,10 +137,6 @@ class OpenRouterLLM:
                     "metadata": {"role": role.value, "actual_cost_usd": actual},
                 },
             )
-            try:
-                return json.loads(output)
-            except JSONDecodeError as exc:
-                snippet = output[:500] if output else "<empty>"
-                raise LLMOutputError(f"model returned invalid JSON for {name}: {snippet}") from exc
+            return parse_json_output(output, name)
         finally:
             await self.budget.reconcile_llm(run_id, role, estimate, actual)

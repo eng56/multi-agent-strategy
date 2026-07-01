@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from src.common.models import AgentRole, Budget, ModelPolicy, RoleModelPolicy, Run, ToolBudget
-from src.integrations.llm import LLMOutputError, OpenRouterLLM
+from src.integrations.llm import LLMOutputError, OpenRouterLLM, parse_json_output
 
 
 def role_policy() -> RoleModelPolicy:
@@ -62,3 +62,13 @@ def test_openrouter_llm_raises_diagnostic_error_for_invalid_json(monkeypatch: py
 
     with pytest.raises(LLMOutputError, match="model returned invalid JSON for planner: not json"):
         asyncio.run(llm.json(run.id, AgentRole.PLANNER, "planner", "system", "prompt"))
+
+
+def test_parse_json_output_accepts_markdown_fenced_json() -> None:
+    output = """```json
+{"tasks":[{"title":"SAP","question":"SAP ticker data","tool":"market_data"}]}
+```"""
+
+    assert parse_json_output(output, "planner") == {
+        "tasks": [{"title": "SAP", "question": "SAP ticker data", "tool": "market_data"}]
+    }
