@@ -117,9 +117,10 @@ gcloud container clusters delete "$GKE_CLUSTER" \
 
 The first version intentionally uses simple provider-native limits: the UI defaults to a $1 shared
 OpenRouter budget, 2 Tavily credits, and 1 market-data request for each run. Tavily basic searches
-consume one credit and market-data calls consume one request. Credential validation consumes one of
-each. Exact USD accounting is enforced for OpenRouter using reservations and returned usage cost;
-tool USD cost is not estimated because it depends on the deployment owner's provider plans.
+consume one credit and market-data calls consume one request. Credential validation checks provider
+keys before the run starts, but these per-run tool limits are reserved for actual agent tool calls.
+Exact USD accounting is enforced for OpenRouter using reservations and returned usage cost; tool USD
+cost is not estimated because it depends on the deployment owner's provider plans.
 
 OpenRouter note: if provider validation returns `HTTP 401` with `User not found`, rotate the
 `OPENROUTER_API_KEY` value in Google Secret Manager `runtime-env`, restart the GKE deployments, and

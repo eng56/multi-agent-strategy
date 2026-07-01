@@ -1,4 +1,5 @@
 import json
+import logging
 from typing import Any
 from uuid import UUID
 
@@ -15,6 +16,7 @@ from src.common.models import (
 from src.runtime import Runtime
 
 SYSTEM = "You are a rigorous investment research agent. Return valid JSON only. Never invent sources."
+logger = logging.getLogger(__name__)
 
 
 def emit(runtime: Runtime, event_type: EventType, run_id: UUID, producer: str, **payload: Any) -> None:
@@ -39,10 +41,23 @@ async def plan(runtime: Runtime, event: EventEnvelope) -> None:
         'Return {"tasks":[{"title":"...","question":"...","tool":"web_search|market_data"}]}. '
         "For market_data questions include a ticker symbol in the question.",
     )
-    for item in result.get("tasks", []):
-        task = ResearchTask(run_id=run.id, **item)
+    task_items = result.get("tasks") if isinstance(result.get("tasks"), list) else []
+    created = 0
+    for item in task_items:
+        try:
+            task = ResearchTask(run_id=run.id, **item)
+        except Exception as exc:
+            logger.warning("planner produced invalid task run_id=%s error=%s item=%s", run.id, exc, item)
+            continue
         await runtime.blackboard.put_task(task)
         emit(runtime, EventType.TASK_CREATED, run.id, "planner-agent", task_id=str(task.id))
+        created += 1
+    if created == 0:
+        reason = f"planner produced no usable tasks from output: {json.dumps(result, sort_keys=True)[:1000]}"
+        logger.warning("%s run_id=%s", reason, run.id)
+        run.status = RunStatus.FAILED
+        run.failure_reason = reason
+        await runtime.blackboard.put_run(run)
 
 
 async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:

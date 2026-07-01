@@ -107,6 +107,7 @@ class Run(BaseModel):
     models: ModelPolicy
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     final_answer: str | None = None
+    failure_reason: str | None = None
 
 
 class ResearchTask(BaseModel):

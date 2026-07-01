@@ -74,8 +74,6 @@ async def create_run(request: RunRequest, _: None = Depends(require_api_token)) 
         raise HTTPException(
             status_code=400, detail=f"provider or model validation failed: {type(exc).__name__}: {exc}"
         ) from exc
-    request.tool_budget.tavily_credits_used = 1
-    request.tool_budget.market_data_requests_used = 1
     run = Run(
         question=request.question,
         models=request.models,

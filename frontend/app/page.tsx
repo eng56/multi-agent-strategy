@@ -129,7 +129,7 @@ export default function Home() {
           <h2>Simple tool limits</h2>
           <label>Tavily credits<input type="number" min="1" value={toolLimits.tavily_max_credits} onChange={(event) => setToolLimits({...toolLimits, tavily_max_credits: +event.target.value})} /></label>
           <label>Market-data requests<input type="number" min="1" value={toolLimits.market_data_max_requests} onChange={(event) => setToolLimits({...toolLimits, market_data_max_requests: +event.target.value})} /></label>
-          <p>Provider validation consumes one unit from each limit.</p>
+          <p>Provider validation checks credentials before the run; these limits are reserved for actual agent tool calls.</p>
         </section>
         {error && <p className="error">{error}</p>}
         <button disabled={busy}>{busy ? "Validating providers…" : "Validate and create run"}</button>
