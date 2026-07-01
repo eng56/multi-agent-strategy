@@ -26,6 +26,16 @@ def emit(runtime: Runtime, event_type: EventType, run_id: UUID, producer: str, *
     )
 
 
+async def stop_run(runtime: Runtime, run_id: UUID, reason: str) -> None:
+    run = await runtime.blackboard.get_run(run_id)
+    if not run or run.status in {RunStatus.COMPLETED, RunStatus.PARTIAL_BUDGET_EXHAUSTED, RunStatus.FAILED}:
+        return
+    logger.warning("stopping run_id=%s reason=%s", run_id, reason)
+    run.status = RunStatus.FAILED
+    run.failure_reason = reason
+    await runtime.blackboard.put_run(run)
+
+
 async def plan(runtime: Runtime, event: EventEnvelope) -> None:
     run = await runtime.blackboard.get_run(event.run_id)
     if not run:
@@ -41,6 +51,9 @@ async def plan(runtime: Runtime, event: EventEnvelope) -> None:
         'Return {"tasks":[{"title":"...","question":"...","tool":"web_search|market_data"}]}. '
         "For market_data questions include a ticker symbol in the question.",
     )
+    if not isinstance(result, dict):
+        await stop_run(runtime, run.id, f"planner returned non-object JSON output: {json.dumps(result)[:1000]}")
+        return
     task_items = result.get("tasks") if isinstance(result.get("tasks"), list) else []
     created = 0
     for item in task_items:
@@ -54,10 +67,7 @@ async def plan(runtime: Runtime, event: EventEnvelope) -> None:
         created += 1
     if created == 0:
         reason = f"planner produced no usable tasks from output: {json.dumps(result, sort_keys=True)[:1000]}"
-        logger.warning("%s run_id=%s", reason, run.id)
-        run.status = RunStatus.FAILED
-        run.failure_reason = reason
-        await runtime.blackboard.put_run(run)
+        await stop_run(runtime, run.id, reason)
 
 
 async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:

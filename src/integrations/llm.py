@@ -1,4 +1,5 @@
 import json
+from json import JSONDecodeError
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
@@ -7,6 +8,10 @@ import httpx
 
 from src.common.budget import PersistentBudget
 from src.common.models import AgentRole
+
+
+class LLMOutputError(RuntimeError):
+    """Raised when a model response cannot be parsed as the expected JSON object."""
 
 
 class LangfuseRecorder:
@@ -110,6 +115,10 @@ class OpenRouterLLM:
                     "metadata": {"role": role.value, "actual_cost_usd": actual},
                 },
             )
-            return json.loads(output)
+            try:
+                return json.loads(output)
+            except JSONDecodeError as exc:
+                snippet = output[:500] if output else "<empty>"
+                raise LLMOutputError(f"model returned invalid JSON for {name}: {snippet}") from exc
         finally:
             await self.budget.reconcile_llm(run_id, role, estimate, actual)

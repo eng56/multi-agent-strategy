@@ -1,10 +1,13 @@
 """Role-specific event worker; all infrastructure dependencies remain managed services."""
 import asyncio
+import logging
 import os
 
-from src.agents.workflow import HANDLERS, aggregate, deterministic_partial
+from src.agents.workflow import HANDLERS, aggregate, deterministic_partial, stop_run
 from src.common.budget import BudgetExceeded
 from src.runtime import build_runtime
+
+logger = logging.getLogger(__name__)
 
 
 async def dispatch(runtime, role, event) -> None:
@@ -22,6 +25,9 @@ async def dispatch(runtime, role, event) -> None:
             except BudgetExceeded:
                 pass
         await deterministic_partial(runtime, event.run_id, str(exc))
+    except Exception as exc:
+        logger.exception("agent handler failed role=%s event_type=%s run_id=%s", role, event.type, event.run_id)
+        await stop_run(runtime, event.run_id, f"{role} handler failed: {type(exc).__name__}: {exc}")
 
 
 def main() -> None:
