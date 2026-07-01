@@ -83,11 +83,55 @@ gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \
 credentials are fetched, bind the same deploy identity to an appropriate Kubernetes RBAC role in the
 target cluster or temporarily use `roles/container.admin` for the demo deploy service account.
 
+
+## GKE demo cost controls
+
+The deployed demo runs one public orchestrator `LoadBalancer` service and seven always-on Kubernetes
+deployments by default. The orchestrator deployment requests a small pod and exposes a public
+load balancer, while each role-specific worker deployment also keeps one replica ready for a demo run.
+
+For short idle windows, scale the demo to zero pods without changing secrets, topics, or Vercel settings:
+
+```bash
+scripts/gke-demo-cost.sh sleep
+```
+
+Wake the same deployment back up before a demo:
+
+```bash
+scripts/gke-demo-cost.sh wake
+```
+
+Scaling to zero reduces Autopilot pod usage, but it does **not** delete the GKE cluster or the external
+LoadBalancer. For the lowest idle cost between demos, delete the Autopilot cluster and recreate/redeploy
+it when needed; expect the load-balancer IP to change and update Vercel `ORCHESTRATOR_API_URL` after
+the next deploy.
+
+```bash
+gcloud container clusters delete "$GKE_CLUSTER" \
+  --location="$GCP_REGION" \
+  --project="$GCP_PROJECT_ID"
+```
+
 ## Tool limits
 
-The first version intentionally uses simple provider-native limits: Tavily basic searches consume one
-credit and market-data calls consume one request. Credential validation consumes one of each. Exact
-USD accounting is enforced for OpenRouter using reservations and returned usage cost; tool USD cost
-is not estimated because it depends on the deployment owner's provider plans.
+The first version intentionally uses simple provider-native limits: the UI defaults to a $1 shared
+OpenRouter budget, 2 Tavily credits, and 1 market-data request for each run. Tavily basic searches
+consume one credit and market-data calls consume one request. Credential validation consumes one of
+each. Exact USD accounting is enforced for OpenRouter using reservations and returned usage cost;
+tool USD cost is not estimated because it depends on the deployment owner's provider plans.
+
+OpenRouter note: if provider validation returns `HTTP 401` with `User not found`, rotate the
+`OPENROUTER_API_KEY` value in Google Secret Manager `runtime-env`, restart the GKE deployments, and
+rerun `curl -H "x-api-key: $ORCHESTRATOR_API_TOKEN" "$ORCHESTRATOR_API_URL/v1/models/openrouter"`
+before trying the UI again.
+
+Market-data note: Polygon.io rebranded to Massive.com, so `MARKET_DATA_PROVIDER` must currently stay
+`massive` and `MARKET_DATA_BASE_URL` defaults to `https://api.massive.com`. Tavily and Massive are
+separate providers with separate keys: `TAVILY_API_KEY` should look like a Tavily `tvly-...` key,
+while `MARKET_DATA_API_KEY` must be a Massive REST API key from the Massive dashboard. Massive Flat
+Files Access Key ID / Secret Access Key credentials are not supported by this prototype. If provider
+validation returns Massive `HTTP 401` with `Unknown API Key`, rotate the `MARKET_DATA_API_KEY` value
+in the same `runtime-env` secret, restart the GKE deployments, and retry run creation.
 
 Confluent note: use a cluster-scoped Kafka API key/secret for CONFLUENT_API_KEY and CONFLUENT_API_SECRET.

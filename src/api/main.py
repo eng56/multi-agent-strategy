@@ -67,7 +67,7 @@ async def create_run(request: RunRequest, _: None = Depends(require_api_token)) 
             runtime.settings.market_data_api_key,
             runtime.settings.openrouter_base_url,
             runtime.settings.tavily_base_url,
-            runtime.settings.polygon_base_url,
+            runtime.settings.market_data_base_url,
         )
     except Exception as exc:
         logger.exception("run provider validation failed question=%s", request.question[:120])

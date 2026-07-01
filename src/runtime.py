@@ -42,6 +42,6 @@ def build_runtime() -> Runtime:
             settings.tavily_api_key,
             settings.market_data_api_key,
             settings.tavily_base_url,
-            settings.polygon_base_url,
+            settings.market_data_base_url,
         ),
     )

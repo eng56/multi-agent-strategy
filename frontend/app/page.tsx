@@ -20,18 +20,20 @@ const weights: Record<string, number> = {
   judge: 0.1,
 };
 const createRunTimeoutMs = 60000;
+const defaultBudgetUsd = 1;
+const defaultToolLimits = {tavily_max_credits: 2, market_data_max_requests: 1};
 
 export default function Home() {
   const [question, setQuestion] = useState("");
-  const [budget, setBudget] = useState(10);
+  const [budget, setBudget] = useState(defaultBudgetUsd);
   const [judge, setJudge] = useState(true);
   const [models, setModels] = useState(defaultModels);
   const [available, setAvailable] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [toolLimits, setToolLimits] = useState({tavily_max_credits: 20, market_data_max_requests: 10});
+  const [toolLimits, setToolLimits] = useState(defaultToolLimits);
   const [caps, setCaps] = useState<Record<string, number>>(
-    Object.fromEntries(roles.map((role) => [role, +(10 * weights[role]).toFixed(2)])),
+    Object.fromEntries(roles.map((role) => [role, +(defaultBudgetUsd * weights[role]).toFixed(2)])),
   );
 
   useEffect(() => {

@@ -24,7 +24,7 @@ async def _checked_response(
     except httpx.HTTPStatusError as exc:
         status_code = exc.response.status_code
         body = exc.response.text[:500]
-        logger.exception(
+        logger.warning(
             "provider validation failed provider=%s action=%s status=%s response=%s",
             provider,
             action,
@@ -33,17 +33,17 @@ async def _checked_response(
         )
         raise ProviderValidationError(
             f"{provider} {action} returned HTTP {status_code}: {body}"
-        ) from exc
+        ) from None
     except httpx.RequestError as exc:
-        logger.exception(
-            "provider validation request failed provider=%s action=%s error=%s",
+        logger.warning(
+            "provider validation request failed provider=%s action=%s error_type=%s",
             provider,
             action,
-            exc,
+            type(exc).__name__,
         )
         raise ProviderValidationError(
-            f"{provider} {action} request failed: {type(exc).__name__}: {exc}"
-        ) from exc
+            f"{provider} {action} request failed: {type(exc).__name__}"
+        ) from None
     logger.info("provider validation passed provider=%s action=%s", provider, action)
     return response
 
@@ -55,7 +55,7 @@ async def validate_demo_configuration(
     market_data_api_key: str,
     openrouter_base_url: str,
     tavily_base_url: str,
-    polygon_base_url: str,
+    market_data_base_url: str,
 ) -> None:
     """Validate deployment-owned provider keys and selected models before starting a demo run."""
     timeout = httpx.Timeout(10.0, connect=5.0)
@@ -118,7 +118,7 @@ async def validate_demo_configuration(
             "market-data",
             "ticker-reference",
             lambda: client.get(
-                f"{polygon_base_url.rstrip('/')}/v3/reference/tickers/AAPL",
-                params={"apiKey": market_data_api_key},
+                f"{market_data_base_url.rstrip('/')}/v3/reference/tickers/AAPL",
+                headers={"Authorization": f"Bearer {market_data_api_key}"},
             ),
         )

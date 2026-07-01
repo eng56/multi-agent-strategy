@@ -58,8 +58,8 @@ class ModelPolicy(BaseModel):
 
 
 class ToolBudget(BaseModel):
-    tavily_max_credits: int = Field(default=20, ge=1)
-    market_data_max_requests: int = Field(default=10, ge=1)
+    tavily_max_credits: int = Field(default=2, ge=1)
+    market_data_max_requests: int = Field(default=1, ge=1)
     tavily_credits_used: int = Field(default=0, ge=0)
     market_data_requests_used: int = Field(default=0, ge=0)
 

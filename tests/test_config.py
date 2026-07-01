@@ -1,3 +1,5 @@
+import pytest
+from pydantic import ValidationError
 from src.common.config import Settings
 
 
@@ -24,3 +26,17 @@ def required_settings() -> dict[str, str]:
 def test_langfuse_base_url_is_accepted_as_legacy_alias() -> None:
     settings = Settings(**required_settings(), LANGFUSE_BASE_URL="https://cloud.langfuse.com")
     assert str(settings.langfuse_host) == "https://cloud.langfuse.com/"
+
+
+def test_market_data_provider_is_massive_only() -> None:
+    with pytest.raises(ValidationError, match="market_data_provider"):
+        Settings(**required_settings(), LANGFUSE_BASE_URL="https://cloud.langfuse.com", market_data_provider="polygon")
+
+
+def test_polygon_base_url_is_accepted_as_legacy_market_data_alias() -> None:
+    settings = Settings(
+        **required_settings(),
+        LANGFUSE_BASE_URL="https://cloud.langfuse.com",
+        POLYGON_BASE_URL="https://api.polygon.io",
+    )
+    assert settings.market_data_base_url == "https://api.polygon.io"

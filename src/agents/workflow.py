@@ -59,7 +59,7 @@ async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:
             f'Extract the primary ticker from: {task.question}. Return {{"ticker":"..."}}.',
         )
         raw = await runtime.tools.market_data(task.run_id, ticker_result["ticker"])
-        sources = [f"https://polygon.io/quote/{ticker_result['ticker']}"]
+        sources = [f"https://massive.com/stocks/{ticker_result['ticker']}"]
     else:
         raw = await runtime.tools.web_search(task.run_id, task.question)
         sources = [item["url"] for item in raw.get("results", []) if item.get("url")]

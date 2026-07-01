@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     openrouter_api_key: str
     tavily_api_key: str
     market_data_api_key: str
-    market_data_provider: Literal["polygon", "massive", "alpha_vantage"] = "polygon"
+    market_data_provider: Literal["massive"] = "massive"
     langfuse_public_key: str
     langfuse_secret_key: str
     langfuse_host: AnyHttpUrl = Field(validation_alias=AliasChoices("LANGFUSE_HOST", "LANGFUSE_BASE_URL"))
@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     orchestrator_api_token: str
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     runtime_topic: str = "agent-runtime"
-    polygon_base_url: str = "https://api.polygon.io"
+    market_data_base_url: str = Field(default="https://api.massive.com", validation_alias=AliasChoices("MARKET_DATA_BASE_URL", "POLYGON_BASE_URL"))
     tavily_base_url: str = "https://api.tavily.com"
     environment: str = "dev"
     default_max_parallel_agents: int = Field(default=10, gt=0)
