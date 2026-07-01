@@ -1,16 +1,20 @@
 import asyncio
 from types import SimpleNamespace
+from uuid import uuid4
 
-from src.agents.workflow import HANDLERS, plan
+from src.agents.workflow import HANDLERS, aggregate, plan
 from src.common.models import (
     Budget,
+    Claim,
     EventEnvelope,
     EventType,
+    FinalReport,
     ModelPolicy,
     RoleModelPolicy,
     Run,
     RunStatus,
     ToolBudget,
+    Verification,
 )
 
 
@@ -101,3 +105,58 @@ def test_planner_stops_run_when_model_returns_non_object_json() -> None:
 
     assert runtime.blackboard.run.status == RunStatus.FAILED
     assert "planner returned non-object JSON output" in runtime.blackboard.run.failure_reason
+
+
+def test_aggregator_stringifies_nested_answer_object() -> None:
+    run = Run(question="Should I buy SAP?", models=model_policy(), budget=Budget(limit_usd=1, tools=ToolBudget()))
+    task_id = uuid4()
+    claim = Claim(
+        run_id=run.id,
+        task_id=task_id,
+        statement="SAP has positive momentum.",
+        evidence_observation_ids=[uuid4()],
+        confidence=0.8,
+    )
+    verification = Verification(
+        run_id=run.id,
+        claim_id=claim.id,
+        verdict="verified",
+        rationale="Supported.",
+        confidence=0.7,
+    )
+
+    class Blackboard:
+        async def list_models(self, _run_id, kind, _model):
+            if kind == "tasks":
+                return [SimpleNamespace(id=task_id)]
+            if kind == "claims":
+                return [claim]
+            if kind == "verifications":
+                return [verification]
+            return []
+
+        async def get_run(self, _run_id):
+            return run
+
+        async def get_final(self, _run_id):
+            return None
+
+        async def put_final(self, value: FinalReport):
+            self.final = value
+
+    class LLM:
+        async def json(self, *_args, **_kwargs):
+            return {"answer": {"summary": "Buy with caution.", "risks": ["Volatility"]}}
+
+    published = []
+    runtime = SimpleNamespace(
+        blackboard=Blackboard(),
+        llm=LLM(),
+        settings=SimpleNamespace(runtime_topic="agent-runtime"),
+        events=SimpleNamespace(publish=lambda topic, event: published.append((topic, event))),
+    )
+
+    asyncio.run(aggregate(runtime, EventEnvelope(type=EventType.CLAIM_VERIFIED, run_id=run.id, producer="test")))
+
+    assert '"summary": "Buy with caution."' in runtime.blackboard.final.answer
+    assert published

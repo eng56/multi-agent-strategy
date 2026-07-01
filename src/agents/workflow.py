@@ -26,6 +26,12 @@ def emit(runtime: Runtime, event_type: EventType, run_id: UUID, producer: str, *
     )
 
 
+def text_from_model_field(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
 async def stop_run(runtime: Runtime, run_id: UUID, reason: str) -> None:
     run = await runtime.blackboard.get_run(run_id)
     if not run or run.status in {RunStatus.COMPLETED, RunStatus.PARTIAL_BUDGET_EXHAUSTED, RunStatus.FAILED}:
@@ -203,7 +209,7 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
     )
     final = FinalReport(
         run_id=event.run_id,
-        answer=result["answer"],
+        answer=text_from_model_field(result["answer"]),
         verified_claim_ids=[value.id for value in verified],
         sources=sorted({source for value in verified for source in value.sources}),
     )
