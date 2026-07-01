@@ -1,0 +1,126 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: planner-agent}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: planner-agent}}
+  template:
+    metadata: {labels: {app: planner-agent}}
+    spec:
+      serviceAccountName: agent-runtime
+      containers:
+        - name: app
+          image: APP_IMAGE
+          args: ["python", "-m", "src.worker"]
+          env:
+            - {name: AGENT_ROLE, value: planner-agent}
+          envFrom: [{configMapRef: {name: runtime-config}}]
+          resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {cpu: 500m, memory: 512Mi}}
+          volumeMounts: [{name: managed-secrets, mountPath: /var/secrets, readOnly: true}]
+      volumes: [{name: managed-secrets, csi: {driver: secrets-store-gke.csi.k8s.io, readOnly: true, volumeAttributes: {secretProviderClass: runtime-managed-secrets}}}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: worker-agents}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: worker-agents}}
+  template:
+    metadata: {labels: {app: worker-agents}}
+    spec:
+      serviceAccountName: agent-runtime
+      containers:
+        - name: app
+          image: APP_IMAGE
+          args: ["python", "-m", "src.worker"]
+          env:
+            - {name: AGENT_ROLE, value: worker-agents}
+          envFrom: [{configMapRef: {name: runtime-config}}]
+          resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {cpu: 500m, memory: 512Mi}}
+          volumeMounts: [{name: managed-secrets, mountPath: /var/secrets, readOnly: true}]
+      volumes: [{name: managed-secrets, csi: {driver: secrets-store-gke.csi.k8s.io, readOnly: true, volumeAttributes: {secretProviderClass: runtime-managed-secrets}}}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: verifier-agent}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: verifier-agent}}
+  template:
+    metadata: {labels: {app: verifier-agent}}
+    spec:
+      serviceAccountName: agent-runtime
+      containers:
+        - name: app
+          image: APP_IMAGE
+          args: ["python", "-m", "src.worker"]
+          env:
+            - {name: AGENT_ROLE, value: verifier-agent}
+          envFrom: [{configMapRef: {name: runtime-config}}]
+          resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {cpu: 500m, memory: 512Mi}}
+          volumeMounts: [{name: managed-secrets, mountPath: /var/secrets, readOnly: true}]
+      volumes: [{name: managed-secrets, csi: {driver: secrets-store-gke.csi.k8s.io, readOnly: true, volumeAttributes: {secretProviderClass: runtime-managed-secrets}}}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: aggregator-agent}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: aggregator-agent}}
+  template:
+    metadata: {labels: {app: aggregator-agent}}
+    spec:
+      serviceAccountName: agent-runtime
+      containers:
+        - name: app
+          image: APP_IMAGE
+          args: ["python", "-m", "src.worker"]
+          env:
+            - {name: AGENT_ROLE, value: aggregator-agent}
+          envFrom: [{configMapRef: {name: runtime-config}}]
+          resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {cpu: 500m, memory: 512Mi}}
+          volumeMounts: [{name: managed-secrets, mountPath: /var/secrets, readOnly: true}]
+      volumes: [{name: managed-secrets, csi: {driver: secrets-store-gke.csi.k8s.io, readOnly: true, volumeAttributes: {secretProviderClass: runtime-managed-secrets}}}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: judge-agent}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: judge-agent}}
+  template:
+    metadata: {labels: {app: judge-agent}}
+    spec:
+      serviceAccountName: agent-runtime
+      containers:
+        - name: app
+          image: APP_IMAGE
+          args: ["python", "-m", "src.worker"]
+          env:
+            - {name: AGENT_ROLE, value: judge-agent}
+          envFrom: [{configMapRef: {name: runtime-config}}]
+          resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {cpu: 500m, memory: 512Mi}}
+          volumeMounts: [{name: managed-secrets, mountPath: /var/secrets, readOnly: true}]
+      volumes: [{name: managed-secrets, csi: {driver: secrets-store-gke.csi.k8s.io, readOnly: true, volumeAttributes: {secretProviderClass: runtime-managed-secrets}}}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: tool-runner}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: tool-runner}}
+  template:
+    metadata: {labels: {app: tool-runner}}
+    spec:
+      serviceAccountName: agent-runtime
+      containers:
+        - name: app
+          image: APP_IMAGE
+          args: ["python", "-m", "src.worker"]
+          env:
+            - {name: AGENT_ROLE, value: tool-runner}
+          envFrom: [{configMapRef: {name: runtime-config}}]
+          resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {cpu: 500m, memory: 512Mi}}
+          volumeMounts: [{name: managed-secrets, mountPath: /var/secrets, readOnly: true}]
+      volumes: [{name: managed-secrets, csi: {driver: secrets-store-gke.csi.k8s.io, readOnly: true, volumeAttributes: {secretProviderClass: runtime-managed-secrets}}}]
