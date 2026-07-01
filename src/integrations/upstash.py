@@ -1,13 +1,15 @@
 import json
+import logging
 from typing import TypeVar
 from uuid import UUID
 
 import httpx
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from src.common.models import Claim, FinalReport, Observation, ResearchTask, Run, Verification
 
 T = TypeVar("T", bound=BaseModel)
+logger = logging.getLogger(__name__)
 
 
 class UpstashBlackboard:
@@ -42,7 +44,11 @@ class UpstashBlackboard:
         ids = await self.command("SMEMBERS", f"run:{run_id}:{kind}:ids") or []
         values: list[T] = []
         for item_id in ids:
-            value = await self.get_model(f"run:{run_id}:{kind}:{item_id}", model)
+            try:
+                value = await self.get_model(f"run:{run_id}:{kind}:{item_id}", model)
+            except (ValidationError, json.JSONDecodeError):
+                logger.exception("skipping invalid blackboard record run_id=%s kind=%s item_id=%s", run_id, kind, item_id)
+                continue
             if value:
                 values.append(value)
         return values

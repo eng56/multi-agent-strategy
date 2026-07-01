@@ -6,7 +6,13 @@ import httpx
 import pytest
 
 from src.common.models import AgentRole, Budget, ModelPolicy, RoleModelPolicy, Run, ToolBudget
-from src.integrations.llm import LLMOutputError, LLMProviderError, OpenRouterLLM, parse_json_output
+from src.integrations.llm import (
+    LLMOutputError,
+    LLMProviderError,
+    OpenRouterLLM,
+    completion_content,
+    parse_json_output,
+)
 
 
 def role_policy() -> RoleModelPolicy:
@@ -121,3 +127,8 @@ def test_openrouter_llm_reports_provider_error_body(monkeypatch: pytest.MonkeyPa
 
     with pytest.raises(LLMProviderError, match="bad model request"):
         asyncio.run(llm.json(run.id, AgentRole.RESEARCH, "claim-extractor", "system", "prompt"))
+
+
+def test_completion_content_reports_malformed_provider_response() -> None:
+    with pytest.raises(LLMProviderError, match="malformed completion.*quota exceeded"):
+        completion_content({"error": {"message": "quota exceeded"}}, "tool-summary")

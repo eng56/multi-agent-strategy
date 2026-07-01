@@ -118,11 +118,15 @@ async def get_run_detail(run_id: str, _: None = Depends(require_api_token)) -> R
     run = await blackboard.get_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="run not found")
-    return RunDetail(
-        run=run,
-        tasks=await blackboard.list_models(run.id, "tasks", ResearchTask),
-        observations=await blackboard.list_models(run.id, "observations", Observation),
-        claims=await blackboard.list_models(run.id, "claims", Claim),
-        verifications=await blackboard.list_models(run.id, "verifications", Verification),
-        final=await blackboard.get_final(run.id),
-    )
+    try:
+        return RunDetail(
+            run=run,
+            tasks=await blackboard.list_models(run.id, "tasks", ResearchTask),
+            observations=await blackboard.list_models(run.id, "observations", Observation),
+            claims=await blackboard.list_models(run.id, "claims", Claim),
+            verifications=await blackboard.list_models(run.id, "verifications", Verification),
+            final=await blackboard.get_final(run.id),
+        )
+    except Exception as exc:
+        logger.exception("run detail read failed run_id=%s", run_id)
+        raise HTTPException(status_code=502, detail=f"run detail read failed: {type(exc).__name__}: {exc}") from exc

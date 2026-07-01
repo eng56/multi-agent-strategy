@@ -45,6 +45,18 @@ def provider_error_message(response: httpx.Response, name: str) -> str:
     return f"model provider returned HTTP {response.status_code} for {name}: {body}"
 
 
+def completion_content(response_data: dict[str, Any], name: str) -> str:
+    try:
+        output = response_data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        snippet = json.dumps(response_data)[:1000]
+        raise LLMProviderError(f"model provider returned malformed completion for {name}: {snippet}") from exc
+    if not isinstance(output, str):
+        snippet = json.dumps(response_data)[:1000]
+        raise LLMProviderError(f"model provider returned non-text completion for {name}: {snippet}")
+    return output
+
+
 class LangfuseRecorder:
     def __init__(self, host: str, public_key: str, secret_key: str) -> None:
         self.url = f"{host.rstrip('/')}/api/public/ingestion"
@@ -146,7 +158,7 @@ class OpenRouterLLM:
                 response_data = response.json()
             usage = response_data.get("usage", {})
             actual = float(usage.get("cost") or estimate)
-            output = response_data["choices"][0]["message"]["content"]
+            output = completion_content(response_data, name)
             await self.recorder.generation(
                 str(response_data["id"]),
                 {
