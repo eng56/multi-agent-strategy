@@ -31,3 +31,10 @@ def test_list_models_skips_invalid_records() -> None:
     tasks = asyncio.run(blackboard.list_models(run_id, "tasks", ResearchTask))
 
     assert tasks == [valid]
+
+
+def test_get_final_skips_invalid_final_report() -> None:
+    run_id = uuid4()
+    blackboard = FakeBlackboard({f"run:{run_id}:final": '{"run_id":"%s","answer":"x","verified_claim_ids":[],"sources":[],"judge_score":9.5}' % run_id})
+
+    assert asyncio.run(blackboard.get_final(run_id)) is None

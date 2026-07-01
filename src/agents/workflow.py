@@ -32,6 +32,13 @@ def text_from_model_field(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
+def score_from_model_field(value: Any) -> float:
+    score = float(value)
+    if score > 1 and score <= 10:
+        score /= 10
+    return max(0, min(1, score))
+
+
 async def stop_run(runtime: Runtime, run_id: UUID, reason: str) -> None:
     run = await runtime.blackboard.get_run(run_id)
     if not run or run.status in {RunStatus.COMPLETED, RunStatus.PARTIAL_BUDGET_EXHAUSTED, RunStatus.FAILED}:
@@ -235,8 +242,8 @@ async def judge(runtime: Runtime, event: EventEnvelope) -> None:
         f"Score this answer for evidence, completeness, and usefulness. Return "
         f'{{"score":0.0,"feedback":"..."}}. Question: {run.question}. Answer: {final.answer}',
     )
-    final.judge_score = result["score"]
-    final.judge_feedback = result["feedback"]
+    final.judge_score = score_from_model_field(result["score"])
+    final.judge_feedback = text_from_model_field(result["feedback"])
     run.final_answer = final.answer
     run.status = RunStatus.COMPLETED
     await runtime.blackboard.put_final(final)

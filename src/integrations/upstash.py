@@ -75,7 +75,11 @@ class UpstashBlackboard:
         await self.put_model(f"run:{value.run_id}:final", value)
 
     async def get_final(self, run_id: UUID | str) -> FinalReport | None:
-        return await self.get_model(f"run:{run_id}:final", FinalReport)
+        try:
+            return await self.get_model(f"run:{run_id}:final", FinalReport)
+        except (ValidationError, json.JSONDecodeError):
+            logger.exception("skipping invalid final report run_id=%s", run_id)
+            return None
 
     async def get_json(self, key: str) -> dict[str, object] | None:
         value = await self.command("GET", key)

@@ -2,7 +2,7 @@ import asyncio
 from types import SimpleNamespace
 from uuid import uuid4
 
-from src.agents.workflow import HANDLERS, aggregate, plan
+from src.agents.workflow import HANDLERS, aggregate, judge, plan
 from src.common.models import (
     Budget,
     Claim,
@@ -160,3 +160,33 @@ def test_aggregator_stringifies_nested_answer_object() -> None:
 
     assert '"summary": "Buy with caution."' in runtime.blackboard.final.answer
     assert published
+
+
+def test_judge_normalizes_ten_point_score() -> None:
+    run = Run(question="Should I buy SAP?", models=model_policy(), budget=Budget(limit_usd=1, tools=ToolBudget()))
+    final = FinalReport(run_id=run.id, answer="Buy with caution.", verified_claim_ids=[], sources=[])
+
+    class Blackboard:
+        async def get_run(self, _run_id):
+            return run
+
+        async def get_final(self, _run_id):
+            return final
+
+        async def put_final(self, value: FinalReport):
+            self.final = value
+
+        async def put_run(self, value: Run):
+            self.run = value
+
+    class LLM:
+        async def json(self, *_args, **_kwargs):
+            return {"score": 9.5, "feedback": {"summary": "Strong answer."}}
+
+    runtime = SimpleNamespace(blackboard=Blackboard(), llm=LLM())
+
+    asyncio.run(judge(runtime, EventEnvelope(type=EventType.FINAL_CREATED, run_id=run.id, producer="test")))
+
+    assert runtime.blackboard.final.judge_score == 0.95
+    assert '"summary": "Strong answer."' in runtime.blackboard.final.judge_feedback
+    assert runtime.blackboard.run.status == RunStatus.COMPLETED
