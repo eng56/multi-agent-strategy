@@ -1,0 +1,34 @@
+# Application processes only. Kafka, Redis, LLM, search, market data, tracing,
+# secrets, and object storage remain managed services.
+x-app: &app
+  build: .
+  env_file: .env
+  restart: unless-stopped
+services:
+  orchestrator-api:
+    <<: *app
+    ports: ["8080:8080"]
+  planner-agent:
+    <<: *app
+    command: python -m src.worker
+    environment: {AGENT_ROLE: planner-agent}
+  worker-agents:
+    <<: *app
+    command: python -m src.worker
+    environment: {AGENT_ROLE: worker-agents}
+  verifier-agent:
+    <<: *app
+    command: python -m src.worker
+    environment: {AGENT_ROLE: verifier-agent}
+  aggregator-agent:
+    <<: *app
+    command: python -m src.worker
+    environment: {AGENT_ROLE: aggregator-agent}
+  judge-agent:
+    <<: *app
+    command: python -m src.worker
+    environment: {AGENT_ROLE: judge-agent}
+  tool-runner:
+    <<: *app
+    command: python -m src.worker
+    environment: {AGENT_ROLE: tool-runner}
