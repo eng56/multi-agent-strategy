@@ -25,7 +25,10 @@ BRANCH_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("market/fx", ("usd", "dxy", "fx", "eur/usd", "eurusd", "usdjpy", "usd/jpy", "currency")),
     ("market/oil", ("oil", "crude", "wti", "brent")),
     ("market/equities", ("equities", "equity", "stocks", "stock", "spx", "s&p", "nasdaq", "sap")),
-    ("macro/rates", ("rates", "fed", "cut", "cuts", "hike", "hikes", "yield", "yields", "treasury")),
+    (
+        "macro/rates",
+        ("rates", "fed", "cut", "cuts", "hike", "hikes", "yield", "yields", "treasury"),
+    ),
     ("macro/inflation", ("inflation", "cpi", "pce")),
     ("trust/source_verifier", ("verifier", "verification", "source")),
     ("synthesis/aggregator", ("aggregator", "aggregate", "final", "synthesis")),
@@ -83,20 +86,28 @@ def build_run_state(
     rejected_artifacts = [
         value
         for value in artifacts
-        if value.status == ArtifactStatus.REJECTED and value.artifact_type in {ArtifactType.CLAIM, ArtifactType.FORECAST}
+        if value.status == ArtifactStatus.REJECTED
+        and value.artifact_type in {ArtifactType.CLAIM, ArtifactType.FORECAST}
     ]
     disputed_artifacts = [
         value
         for value in artifacts
-        if value.status == ArtifactStatus.DISPUTED and value.artifact_type in {ArtifactType.CLAIM, ArtifactType.FORECAST}
+        if value.status == ArtifactStatus.DISPUTED
+        and value.artifact_type in {ArtifactType.CLAIM, ArtifactType.FORECAST}
     ]
-    verified_artifact_ids = {value.legacy_object_id or value.id for value in verified_artifacts}
+    verified_knowledge_artifacts = [
+        value
+        for value in verified_artifacts
+        if value.artifact_type in {ArtifactType.CLAIM, ArtifactType.FORECAST}
+    ]
+    verified_artifact_ids = {
+        value.legacy_object_id or value.id for value in verified_knowledge_artifacts
+    }
     rejected_artifact_ids = {value.legacy_object_id or value.id for value in rejected_artifacts}
     disputed_artifact_ids = {value.legacy_object_id or value.id for value in disputed_artifacts}
-    verified_knowledge_artifacts = [
-        value for value in verified_artifacts if value.artifact_type in {ArtifactType.CLAIM, ArtifactType.FORECAST}
+    open_question_artifacts = [
+        value for value in artifacts if value.artifact_type == ArtifactType.OPEN_QUESTION
     ]
-    open_question_artifacts = [value for value in artifacts if value.artifact_type == ArtifactType.OPEN_QUESTION]
     coverage_by_topic = {task.title: branch_for_task(task, agent_specs) for task in tasks}
     for artifact in artifacts:
         if artifact.branch:
@@ -129,9 +140,13 @@ def build_run_state(
         coverage_by_topic=coverage_by_topic,
         budget_remaining=budget_remaining,
         tool_budget_remaining={
-            "tavily_credits": max(0, run.budget.tools.tavily_max_credits - run.budget.tools.tavily_credits_used),
+            "tavily_credits": max(
+                0, run.budget.tools.tavily_max_credits - run.budget.tools.tavily_credits_used
+            ),
             "market_data_requests": max(
-                0, run.budget.tools.market_data_max_requests - run.budget.tools.market_data_requests_used
+                0,
+                run.budget.tools.market_data_max_requests
+                - run.budget.tools.market_data_requests_used,
             ),
         },
         agent_count=len(agent_specs),
@@ -139,7 +154,9 @@ def build_run_state(
         last_judge_feedback=final.judge_feedback if final else None,
         stop_reasons=stop_reasons,
     )
-    state.next_action_candidates = _next_actions(state, run, tasks, claims, verifications, final, artifacts)
+    state.next_action_candidates = _next_actions(
+        state, run, tasks, claims, verifications, final, artifacts
+    )
     return state
 
 
@@ -221,7 +238,9 @@ def _next_actions(
                 priority=8,
             )
         )
-    unverified_claim_ids = {claim.id for claim in claims} - {verification.claim_id for verification in verifications}
+    unverified_claim_ids = {claim.id for claim in claims} - {
+        verification.claim_id for verification in verifications
+    }
     if unverified_claim_ids:
         actions.append(
             PrincipalAction(
@@ -234,7 +253,9 @@ def _next_actions(
                 priority=7,
             )
         )
-    has_counterargument = any(value.artifact_type == ArtifactType.COUNTERARGUMENT for value in artifacts)
+    has_counterargument = any(
+        value.artifact_type == ArtifactType.COUNTERARGUMENT for value in artifacts
+    )
     if state.verified_claim_count >= 2 and not has_counterargument and state.budget_remaining > 0:
         actions.append(
             PrincipalAction(

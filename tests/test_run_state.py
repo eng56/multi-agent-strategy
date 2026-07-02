@@ -23,7 +23,9 @@ from src.common.models import (
 
 
 def role_policy(protected: float = 0) -> RoleModelPolicy:
-    return RoleModelPolicy(model="provider/model", cap_usd=1, max_call_cost_usd=0.1, protected_usd=protected)
+    return RoleModelPolicy(
+        model="provider/model", cap_usd=1, max_call_cost_usd=0.1, protected_usd=protected
+    )
 
 
 def model_policy() -> ModelPolicy:
@@ -124,7 +126,6 @@ def test_completed_run_state_exposes_stop_reason_and_judge_payoff() -> None:
     assert state.next_action_candidates == []
 
 
-
 def test_run_state_prefers_agent_spec_and_artifact_branches_before_task_tool() -> None:
     current_run = run()
     task = ResearchTask(
@@ -153,7 +154,15 @@ def test_run_state_prefers_agent_spec_and_artifact_branches_before_task_tool() -
         branches=["market/gold", "macro/rates"],
     )
 
-    state = build_run_state(current_run, [task], [], [], agent_specs=[agent], artifacts=[artifact], organization_plan=organization)
+    state = build_run_state(
+        current_run,
+        [task],
+        [],
+        [],
+        agent_specs=[agent],
+        artifacts=[artifact],
+        organization_plan=organization,
+    )
 
     assert "market/gold" in state.active_branches
     assert "macro/rates" in state.active_branches
@@ -191,7 +200,9 @@ def test_run_state_derives_counts_and_facts_from_artifacts() -> None:
         text_or_summary="Are ETF flows confirming the move?",
     )
 
-    state = build_run_state(current_run, [], [], [], artifacts=[verified, rejected, disputed, question])
+    state = build_run_state(
+        current_run, [], [], [], artifacts=[verified, rejected, disputed, question]
+    )
 
     assert state.known_facts == ["Gold has upside if real yields fall."]
     assert state.open_questions == ["Are ETF flows confirming the move?"]
@@ -221,7 +232,9 @@ def test_run_state_suggests_skeptic_candidate_until_counterargument_exists() -> 
 
     state = build_run_state(current_run, [], [], [], artifacts=artifacts)
 
-    assert PrincipalActionType.REQUEST_SKEPTIC_REVIEW in {action.action_type for action in state.next_action_candidates}
+    assert PrincipalActionType.REQUEST_SKEPTIC_REVIEW in {
+        action.action_type for action in state.next_action_candidates
+    }
 
     artifacts.append(
         Artifact(
@@ -233,7 +246,9 @@ def test_run_state_suggests_skeptic_candidate_until_counterargument_exists() -> 
     )
     state = build_run_state(current_run, [], [], [], artifacts=artifacts)
 
-    assert PrincipalActionType.REQUEST_SKEPTIC_REVIEW not in {action.action_type for action in state.next_action_candidates}
+    assert PrincipalActionType.REQUEST_SKEPTIC_REVIEW not in {
+        action.action_type for action in state.next_action_candidates
+    }
 
 
 def test_run_state_rejected_and_disputed_counts_ignore_verification_artifacts() -> None:
@@ -253,7 +268,9 @@ def test_run_state_rejected_and_disputed_counts_ignore_verification_artifacts() 
         status=ArtifactStatus.DISPUTED,
     )
 
-    state = build_run_state(current_run, [], [], [], artifacts=[rejected_verification, disputed_claim])
+    state = build_run_state(
+        current_run, [], [], [], artifacts=[rejected_verification, disputed_claim]
+    )
 
     assert state.rejected_claim_count == 0
     assert state.disputed_claim_count == 1
@@ -287,3 +304,42 @@ def test_run_state_deduplicates_legacy_and_claim_artifact_counts() -> None:
     state = build_run_state(current_run, [], [claim], [verification], artifacts=[claim_artifact])
 
     assert state.rejected_claim_count == 1
+
+
+def test_run_state_verified_count_ignores_non_knowledge_artifacts() -> None:
+    current_run = run()
+    verified_verification = Artifact(
+        run_id=current_run.id,
+        artifact_type=ArtifactType.VERIFICATION,
+        branch="trust/source_verifier",
+        text_or_summary="Verification provenance is verified.",
+        status=ArtifactStatus.VERIFIED,
+    )
+    verified_final = Artifact(
+        run_id=current_run.id,
+        artifact_type=ArtifactType.FINAL_REPORT,
+        branch="synthesis/aggregator",
+        text_or_summary="Final report is verified.",
+        status=ArtifactStatus.VERIFIED,
+    )
+
+    state = build_run_state(
+        current_run, [], [], [], artifacts=[verified_verification, verified_final]
+    )
+
+    assert state.verified_claim_count == 0
+
+
+def test_run_state_verified_count_includes_claim_artifacts() -> None:
+    current_run = run()
+    verified_claim = Artifact(
+        run_id=current_run.id,
+        artifact_type=ArtifactType.CLAIM,
+        branch="market/equities",
+        text_or_summary="SAP cloud backlog is growing.",
+        status=ArtifactStatus.VERIFIED,
+    )
+
+    state = build_run_state(current_run, [], [], [], artifacts=[verified_claim])
+
+    assert state.verified_claim_count == 1

@@ -3,7 +3,12 @@ import logging
 from typing import Any
 from uuid import UUID
 
-from src.agents.state import branch_for_task, infer_semantic_branch, tags_for_text, title_from_branch
+from src.agents.state import (
+    branch_for_task,
+    infer_semantic_branch,
+    tags_for_text,
+    title_from_branch,
+)
 from src.common.models import (
     ActionStatus,
     AgentRole,
@@ -29,11 +34,15 @@ from src.common.models import (
 )
 from src.runtime import Runtime
 
-SYSTEM = "You are a rigorous investment research agent. Return valid JSON only. Never invent sources."
+SYSTEM = (
+    "You are a rigorous investment research agent. Return valid JSON only. Never invent sources."
+)
 logger = logging.getLogger(__name__)
 
 
-def emit(runtime: Runtime, event_type: EventType, run_id: UUID, producer: str, **payload: Any) -> None:
+def emit(
+    runtime: Runtime, event_type: EventType, run_id: UUID, producer: str, **payload: Any
+) -> None:
     runtime.events.publish(
         runtime.settings.runtime_topic,
         EventEnvelope(type=event_type, run_id=run_id, producer=producer, payload=payload),
@@ -71,7 +80,9 @@ async def persist_action(
 
 async def persist_artifact(runtime: Runtime, artifact: Artifact, producer: str) -> Artifact:
     await runtime.blackboard.put_artifact(artifact)
-    emit(runtime, EventType.ARTIFACT_CREATED, artifact.run_id, producer, artifact_id=str(artifact.id))
+    emit(
+        runtime, EventType.ARTIFACT_CREATED, artifact.run_id, producer, artifact_id=str(artifact.id)
+    )
     return artifact
 
 
@@ -102,7 +113,10 @@ def semantic_branches(question: str) -> list[str]:
         ("market/gold", ("gold", "xau")),
         ("market/fx", ("usd", "dxy", "fx", "eur/usd", "eurusd", "usdjpy", "usd/jpy")),
         ("market/oil", ("oil", "crude", "wti", "brent")),
-        ("market/equities", ("equities", "equity", "stocks", "stock", "spx", "s&p", "nasdaq", "sap")),
+        (
+            "market/equities",
+            ("equities", "equity", "stocks", "stock", "spx", "s&p", "nasdaq", "sap"),
+        ),
         ("macro/rates", ("rates", "fed", "cut", "cuts", "hike", "hikes", "yield", "yields")),
         ("macro/inflation", ("inflation", "cpi", "pce")),
         ("market/crypto", ("crypto", "bitcoin", "btc", "ethereum", "eth")),
@@ -120,7 +134,11 @@ def role_for_branch(branch: str) -> tuple[str, str, list[str]]:
     if branch == "market/fx":
         return "fx agent", "fx_research_agent", ["web_search", "market_data"]
     if branch.startswith("market/"):
-        return f"{branch.split('/')[-1]} agent", "asset_research_agent", ["web_search", "market_data"]
+        return (
+            f"{branch.split('/')[-1]} agent",
+            "asset_research_agent",
+            ["web_search", "market_data"],
+        )
     return "research agent", "asset_research_agent", ["web_search", "market_data"]
 
 
@@ -228,17 +246,33 @@ def build_organization(run: Run) -> OrganizationPlan:
             "aggregator": role_budget(run, AgentRole.AGGREGATOR),
             "judge": role_budget(run, AgentRole.JUDGE) if run.models.judge else 0,
         },
-        stop_conditions=["budget exhausted", "all planned tasks verified and synthesized", "judge completed"],
+        stop_conditions=[
+            "budget exhausted",
+            "all planned tasks verified and synthesized",
+            "judge completed",
+        ],
     )
 
 
 async def persist_organization(runtime: Runtime, run: Run) -> OrganizationPlan:
     organization = build_organization(run)
     await runtime.blackboard.put_organization_plan(organization)
-    emit(runtime, EventType.ORGANIZATION_PLAN_CREATED, run.id, "planner-agent", organization_plan_id=str(organization.root_agent_id))
+    emit(
+        runtime,
+        EventType.ORGANIZATION_PLAN_CREATED,
+        run.id,
+        "planner-agent",
+        organization_plan_id=str(organization.root_agent_id),
+    )
     for spec in organization.agent_specs:
         await runtime.blackboard.put_agent_spec(spec)
-        emit(runtime, EventType.AGENT_SPEC_CREATED, run.id, "planner-agent", agent_spec_id=str(spec.id))
+        emit(
+            runtime,
+            EventType.AGENT_SPEC_CREATED,
+            run.id,
+            "planner-agent",
+            agent_spec_id=str(spec.id),
+        )
     await persist_action(
         runtime,
         run.id,
@@ -255,7 +289,11 @@ async def persist_organization(runtime: Runtime, run: Run) -> OrganizationPlan:
 
 async def stop_run(runtime: Runtime, run_id: UUID, reason: str) -> None:
     run = await runtime.blackboard.get_run(run_id)
-    if not run or run.status in {RunStatus.COMPLETED, RunStatus.PARTIAL_BUDGET_EXHAUSTED, RunStatus.FAILED}:
+    if not run or run.status in {
+        RunStatus.COMPLETED,
+        RunStatus.PARTIAL_BUDGET_EXHAUSTED,
+        RunStatus.FAILED,
+    }:
         return
     logger.warning("stopping run_id=%s reason=%s", run_id, reason)
     run.status = RunStatus.FAILED
@@ -280,7 +318,9 @@ async def plan(runtime: Runtime, event: EventEnvelope) -> None:
         "For market_data questions include a ticker symbol in the question.",
     )
     if not isinstance(result, dict):
-        await stop_run(runtime, run.id, f"planner returned non-object JSON output: {json.dumps(result)[:1000]}")
+        await stop_run(
+            runtime, run.id, f"planner returned non-object JSON output: {json.dumps(result)[:1000]}"
+        )
         return
     task_items = result.get("tasks") if isinstance(result.get("tasks"), list) else []
     created = 0
@@ -288,7 +328,9 @@ async def plan(runtime: Runtime, event: EventEnvelope) -> None:
         try:
             task = ResearchTask(run_id=run.id, **item)
         except Exception as exc:
-            logger.warning("planner produced invalid task run_id=%s error=%s item=%s", run.id, exc, item)
+            logger.warning(
+                "planner produced invalid task run_id=%s error=%s item=%s", run.id, exc, item
+            )
             continue
         await runtime.blackboard.put_task(task)
         await persist_action(
@@ -314,7 +356,9 @@ async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:
     task = next((value for value in tasks if str(value.id) == event.payload.get("task_id")), None)
     if not task:
         return
-    branch = branch_for_task(task, await runtime.blackboard.list_models(event.run_id, "agent_specs", AgentSpec))
+    branch = branch_for_task(
+        task, await runtime.blackboard.list_models(event.run_id, "agent_specs", AgentSpec)
+    )
     if task.tool == "market_data":
         ticker_result = await runtime.llm.json(
             task.run_id,
@@ -375,12 +419,21 @@ async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:
         priority=7,
         producer="tool-runner",
     )
-    emit(runtime, EventType.OBSERVATION_CREATED, task.run_id, "tool-runner", observation_id=str(observation.id))
+    emit(
+        runtime,
+        EventType.OBSERVATION_CREATED,
+        task.run_id,
+        "tool-runner",
+        observation_id=str(observation.id),
+    )
 
 
 async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
     observations = await runtime.blackboard.list_models(event.run_id, "observations", Observation)
-    observation = next((value for value in observations if str(value.id) == event.payload.get("observation_id")), None)
+    observation = next(
+        (value for value in observations if str(value.id) == event.payload.get("observation_id")),
+        None,
+    )
     if not observation:
         return
     tasks = await runtime.blackboard.list_models(event.run_id, "tasks", ResearchTask)
@@ -403,7 +456,9 @@ async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
         sources=observation.sources,
     )
     await runtime.blackboard.put_claim(claim)
-    observation_artifacts = await runtime.blackboard.list_models(event.run_id, "artifacts", Artifact)
+    observation_artifacts = await runtime.blackboard.list_models(
+        event.run_id, "artifacts", Artifact
+    )
     depends_on = [
         value.id
         for value in observation_artifacts
@@ -434,7 +489,9 @@ async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
 
 async def verify_claim(runtime: Runtime, event: EventEnvelope) -> None:
     claims = await runtime.blackboard.list_models(event.run_id, "claims", Claim)
-    claim = next((value for value in claims if str(value.id) == event.payload.get("claim_id")), None)
+    claim = next(
+        (value for value in claims if str(value.id) == event.payload.get("claim_id")), None
+    )
     if not claim:
         return
     corroboration = await runtime.tools.web_search(event.run_id, claim.statement)
@@ -448,7 +505,9 @@ async def verify_claim(runtime: Runtime, event: EventEnvelope) -> None:
         f"Claim: {claim.statement}. Results: {json.dumps(corroboration)[:30000]}",
     )
     sources = [item["url"] for item in corroboration.get("results", []) if item.get("url")]
-    artifact_pointer = runtime.artifacts.put_json(event.run_id, "verification-search", corroboration)
+    artifact_pointer = runtime.artifacts.put_json(
+        event.run_id, "verification-search", corroboration
+    )
     observation = Observation(
         run_id=event.run_id,
         task_id=claim.task_id,
@@ -503,14 +562,20 @@ async def verify_claim(runtime: Runtime, event: EventEnvelope) -> None:
             branch="trust/source_verifier",
             text_or_summary=verification.rationale,
             tags=tags_for_text(verification.rationale),
-            visibility=VisibilityScope.PUBLIC_VERIFIED if verification.verdict == "verified" else VisibilityScope.PUBLIC_UNVERIFIED,
+            visibility=VisibilityScope.PUBLIC_VERIFIED
+            if verification.verdict == "verified"
+            else VisibilityScope.PUBLIC_UNVERIFIED,
             status=status,
             confidence=verification.confidence,
             source_refs=verification.sources,
             legacy_object_type="verification",
             legacy_object_id=verification.id,
-            supports_artifact_ids=claim_artifact_ids[:1] if verification.verdict == "verified" else [],
-            contradicts_artifact_ids=claim_artifact_ids[:1] if verification.verdict == "rejected" else [],
+            supports_artifact_ids=claim_artifact_ids[:1]
+            if verification.verdict == "verified"
+            else [],
+            contradicts_artifact_ids=claim_artifact_ids[:1]
+            if verification.verdict == "rejected"
+            else [],
         ),
         "verifier-agent",
     )
@@ -525,12 +590,20 @@ async def verify_claim(runtime: Runtime, event: EventEnvelope) -> None:
         priority=6,
         producer="verifier-agent",
     )
-    emit(runtime, EventType.CLAIM_VERIFIED, event.run_id, "verifier-agent", verification_id=str(verification.id))
+    emit(
+        runtime,
+        EventType.CLAIM_VERIFIED,
+        event.run_id,
+        "verifier-agent",
+        verification_id=str(verification.id),
+    )
 
 
 async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
     tasks = await runtime.blackboard.list_models(event.run_id, "tasks", ResearchTask)
-    verifications = await runtime.blackboard.list_models(event.run_id, "verifications", Verification)
+    verifications = await runtime.blackboard.list_models(
+        event.run_id, "verifications", Verification
+    )
     if (
         not tasks
         or (len(verifications) < len(tasks) and not event.payload.get("force"))
@@ -549,7 +622,7 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
         "aggregator",
         SYSTEM,
         f"Answer the investment question using only verified claims. Include risks, opportunities, "
-        f"and limitations. Return {{\"answer\":\"...\"}}. Question: {run.question}. Claims: "
+        f'and limitations. Return {{"answer":"..."}}. Question: {run.question}. Claims: '
         f"{json.dumps([value.model_dump(mode='json') for value in verified])}",
     )
     final = FinalReport(
@@ -662,7 +735,10 @@ async def deterministic_partial(runtime: Runtime, run_id: UUID, reason: str) -> 
     verifications = await runtime.blackboard.list_models(run_id, "verifications", Verification)
     verified_ids = {item.claim_id for item in verifications if item.verdict == "verified"}
     verified = [claim for claim in claims if claim.id in verified_ids]
-    findings = "\n".join(f"- {claim.statement}" for claim in verified) or "- No claims were verified before the run stopped."
+    findings = (
+        "\n".join(f"- {claim.statement}" for claim in verified)
+        or "- No claims were verified before the run stopped."
+    )
     answer = f"# Partial Investment Research Report\n\nReason: {reason}\n\n## Verified findings\n{findings}\n\nThis deterministic report was assembled without an additional LLM call."
     final = FinalReport(
         run_id=run_id,
@@ -689,5 +765,16 @@ async def deterministic_partial(runtime: Runtime, run_id: UUID, reason: str) -> 
             legacy_object_id=run_id,
         ),
         "aggregator-agent",
+    )
+    await persist_action(
+        runtime,
+        run_id,
+        PrincipalActionType.REQUEST_AGGREGATION,
+        f"Produced deterministic partial final report: {reason}",
+        required_role="aggregator_agent",
+        target_branch="synthesis/aggregator",
+        expected_information_gain=InformationGain.LOW,
+        priority=4,
+        producer="aggregator-agent",
     )
     await runtime.blackboard.put_run(run)
