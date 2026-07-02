@@ -46,3 +46,16 @@ partial report from verified structured evidence without another LLM call.
 `claim.created` → verifier → `claim.verified` → aggregator → `final.created` → optional judge.
 Events contain identifiers and routing metadata only; current state lives in Upstash and raw artifacts
 live in GCS.
+
+## Control-loop architecture target
+
+The runtime is evolving from a linear agent pipeline into a budgeted epistemic control loop:
+
+```text
+Principal policy -> action space -> blackboard environment -> typed agents -> observations
+                 -> belief/trust update -> payoff/judge -> next action or stop
+```
+
+The first architectural seam is explicit state. `RunState` gives the Principal a compact view of the environment instead of forcing it to inspect every raw artifact. `PrincipalAction` makes the action space typed and auditable. `AgentSpec` and `OrganizationPlan` describe the generated research organization. `Artifact` is the generic graph shape used to move from flat claims toward artifact publication, lineage, contradiction tracking, and trust promotion.
+
+The API returns these structures in run detail responses so the UI can show the system, not just the answer: current state, candidate principal decisions, organization, artifacts, evidence, and payoff.

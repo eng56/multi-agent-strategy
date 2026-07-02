@@ -32,6 +32,76 @@ class RunStatus(StrEnum):
     FAILED = "failed"
 
 
+class PrincipalActionType(StrEnum):
+    SPAWN_AGENT = "spawn_agent"
+    ASSIGN_TASK = "assign_task"
+    REQUEST_TOOL_CALL = "request_tool_call"
+    REQUEST_VERIFICATION = "request_verification"
+    REQUEST_SKEPTIC_REVIEW = "request_skeptic_review"
+    REQUEST_AGGREGATION = "request_aggregation"
+    REQUEST_FOLLOWUP = "request_followup"
+    STOP_RUN = "stop_run"
+
+
+class InformationGain(StrEnum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+class ActionStatus(StrEnum):
+    PROPOSED = "proposed"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    EXECUTED = "executed"
+
+
+class AgentStatus(StrEnum):
+    PROPOSED = "proposed"
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class VisibilityScope(StrEnum):
+    PRIVATE = "private"
+    TEAM = "team"
+    PUBLIC_UNVERIFIED = "public_unverified"
+    PUBLIC_VERIFIED = "public_verified"
+
+
+class ArtifactType(StrEnum):
+    CLAIM = "claim"
+    OBSERVATION = "observation"
+    FORECAST = "forecast"
+    COUNTERARGUMENT = "counterargument"
+    OPEN_QUESTION = "open_question"
+    BACKTEST_RESULT = "backtest_result"
+    VERIFICATION = "verification"
+    JUDGE_FEEDBACK = "judge_feedback"
+    PRINCIPAL_ACTION = "principal_action"
+    FINAL_REPORT = "final_report"
+
+
+class ArtifactStatus(StrEnum):
+    DRAFT = "draft"
+    UNVERIFIED = "unverified"
+    VERIFIED = "verified"
+    REJECTED = "rejected"
+    DISPUTED = "disputed"
+
+
+class RunPhase(StrEnum):
+    INTAKE = "intake"
+    PLANNING = "planning"
+    RESEARCHING = "researching"
+    VERIFYING = "verifying"
+    SYNTHESIZING = "synthesizing"
+    JUDGING = "judging"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 class RoleModelPolicy(BaseModel):
     model: str = Field(min_length=1)
     cap_usd: float | None = Field(default=None, gt=0)
@@ -167,6 +237,96 @@ class FinalReport(BaseModel):
     judge_feedback: str | None = None
 
 
+class PrincipalAction(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    run_id: UUID
+    action_type: PrincipalActionType
+    reason: str = Field(min_length=1)
+    expected_information_gain: InformationGain = InformationGain.MEDIUM
+    estimated_cost: float = Field(default=0, ge=0)
+    target_branch: str | None = None
+    required_role: str | None = None
+    priority: int = Field(default=5, ge=1, le=10)
+    status: ActionStatus = ActionStatus.PROPOSED
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class AgentSpec(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    run_id: UUID
+    parent_id: UUID | None = None
+    name: str = Field(min_length=1)
+    role_template: str = Field(min_length=1)
+    branch: str = Field(min_length=1)
+    domain: str | None = None
+    objective: str = Field(min_length=1)
+    allowed_tools: list[str] = Field(default_factory=list)
+    retrieval_tags: list[str] = Field(default_factory=list)
+    output_schema: dict[str, Any] = Field(default_factory=dict)
+    local_budget_usd: float = Field(default=0, ge=0)
+    visibility_scope: VisibilityScope = VisibilityScope.TEAM
+    can_request_spawn: bool = False
+    status: AgentStatus = AgentStatus.PROPOSED
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class OrganizationPlan(BaseModel):
+    run_id: UUID
+    root_agent_id: UUID
+    agent_specs: list[AgentSpec] = Field(default_factory=list)
+    branches: list[str] = Field(default_factory=list)
+    manager_agents: list[UUID] = Field(default_factory=list)
+    worker_agents: list[UUID] = Field(default_factory=list)
+    verifier_agents: list[UUID] = Field(default_factory=list)
+    aggregator_agents: list[UUID] = Field(default_factory=list)
+    judge_agents: list[UUID] = Field(default_factory=list)
+    dependencies: dict[UUID, list[UUID]] = Field(default_factory=dict)
+    budget_allocation: dict[str, float] = Field(default_factory=dict)
+    stop_conditions: list[str] = Field(default_factory=list)
+
+
+class Artifact(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    run_id: UUID
+    artifact_type: ArtifactType
+    created_by_agent_id: UUID | None = None
+    branch: str | None = None
+    text_or_summary: str
+    tags: list[str] = Field(default_factory=list)
+    visibility: VisibilityScope = VisibilityScope.PUBLIC_UNVERIFIED
+    status: ArtifactStatus = ArtifactStatus.UNVERIFIED
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    source_refs: list[str] = Field(default_factory=list)
+    parent_artifact_ids: list[UUID] = Field(default_factory=list)
+    depends_on_artifact_ids: list[UUID] = Field(default_factory=list)
+    contradicts_artifact_ids: list[UUID] = Field(default_factory=list)
+    supports_artifact_ids: list[UUID] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class RunState(BaseModel):
+    run_id: UUID
+    iteration: int = 0
+    question: str
+    objective: str
+    current_phase: RunPhase = RunPhase.INTAKE
+    active_branches: list[str] = Field(default_factory=list)
+    known_facts: list[str] = Field(default_factory=list)
+    open_questions: list[str] = Field(default_factory=list)
+    verified_claim_count: int = 0
+    rejected_claim_count: int = 0
+    disputed_claim_count: int = 0
+    coverage_by_topic: dict[str, str] = Field(default_factory=dict)
+    budget_remaining: float = 0
+    tool_budget_remaining: dict[str, int] = Field(default_factory=dict)
+    agent_count: int = 0
+    last_judge_score: float | None = None
+    last_judge_feedback: str | None = None
+    stop_reasons: list[str] = Field(default_factory=list)
+    next_action_candidates: list[PrincipalAction] = Field(default_factory=list)
+
+
 class RunDetail(BaseModel):
     run: Run
     tasks: list[ResearchTask] = Field(default_factory=list)
@@ -174,6 +334,10 @@ class RunDetail(BaseModel):
     claims: list[Claim] = Field(default_factory=list)
     verifications: list[Verification] = Field(default_factory=list)
     final: FinalReport | None = None
+    run_state: RunState | None = None
+    principal_actions: list[PrincipalAction] = Field(default_factory=list)
+    agent_specs: list[AgentSpec] = Field(default_factory=list)
+    artifacts: list[Artifact] = Field(default_factory=list)
 
 
 class EventEnvelope(BaseModel):

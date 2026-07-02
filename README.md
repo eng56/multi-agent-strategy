@@ -146,3 +146,24 @@ validation returns Massive `HTTP 401` with `Unknown API Key`, rotate the `MARKET
 in the same `runtime-env` secret, restart the GKE deployments, and retry run creation.
 
 Confluent note: use a cluster-scoped Kafka API key/secret for CONFLUENT_API_KEY and CONFLUENT_API_SECRET.
+
+## Epistemic control-loop direction
+
+This project explores the systems layer behind LLM-driven multi-agent decision making: a Principal generates a temporary organization of agents, agents publish structured artifacts instead of chatting freely, a trust layer promotes or rejects knowledge, and a payoff loop decides whether to continue under budget.
+
+This is a managed-services prototype for a budgeted, hierarchical, artifact-based multi-agent decision loop. It is **not** a full Social Environment Design implementation, a POMG simulator, an RL-trained policymaker, a trading system, or a production 1,000-agent swarm.
+
+The current implementation now exposes the foundation for the next control-loop iteration:
+
+- `RunState` summarizes the Principal's environment view: phase, coverage, trusted facts, open questions, budget remaining, tool remaining, payoff feedback, and candidate next actions.
+- `PrincipalAction` records typed decisions such as tool calls, verification, aggregation, follow-up, and stopping rather than free-form agent chat.
+- `AgentSpec` and `OrganizationPlan` model the temporary research organization that can later drive hierarchy, branch budgets, and scoped memory.
+- `Artifact` provides a generic graph shape for claims, observations, counterarguments, verifications, judge feedback, and final reports with support/contradiction/dependency links.
+
+Paper mapping:
+
+- Social Environment Design: borrows the Principal/follower/environment/observation abstraction.
+- Large Legislative Models: borrows an LLM Principal conditioned on context, history, observations, and payoff.
+- Cooperative AI Policymaking Platform: borrows transparent decision-support UI and forecasting orientation.
+
+Current limitation: payoff is approximated with verifier and judge signals rather than realized real-world outcomes.

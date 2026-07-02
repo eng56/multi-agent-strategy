@@ -6,7 +6,7 @@ from uuid import UUID
 import httpx
 from pydantic import BaseModel, ValidationError
 
-from src.common.models import Claim, FinalReport, Observation, ResearchTask, Run, Verification
+from src.common.models import AgentSpec, Artifact, Claim, FinalReport, Observation, PrincipalAction, ResearchTask, Run, Verification
 
 T = TypeVar("T", bound=BaseModel)
 logger = logging.getLogger(__name__)
@@ -73,6 +73,15 @@ class UpstashBlackboard:
 
     async def put_final(self, value: FinalReport) -> None:
         await self.put_model(f"run:{value.run_id}:final", value)
+
+    async def put_principal_action(self, value: PrincipalAction) -> None:
+        await self.append_model(value.run_id, "principal_actions", value)
+
+    async def put_agent_spec(self, value: AgentSpec) -> None:
+        await self.append_model(value.run_id, "agent_specs", value)
+
+    async def put_artifact(self, value: Artifact) -> None:
+        await self.append_model(value.run_id, "artifacts", value)
 
     async def get_final(self, run_id: UUID | str) -> FinalReport | None:
         try:

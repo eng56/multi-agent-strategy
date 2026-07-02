@@ -6,12 +6,16 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
 
 from src.common.config import get_settings
+from src.agents.state import build_run_state
 from src.common.models import (
+    AgentSpec,
+    Artifact,
     Budget,
     Claim,
     EventEnvelope,
     EventType,
     Observation,
+    PrincipalAction,
     ResearchTask,
     Run,
     RunDetail,
@@ -119,13 +123,25 @@ async def get_run_detail(run_id: str, _: None = Depends(require_api_token)) -> R
     if not run:
         raise HTTPException(status_code=404, detail="run not found")
     try:
+        tasks = await blackboard.list_models(run.id, "tasks", ResearchTask)
+        observations = await blackboard.list_models(run.id, "observations", Observation)
+        claims = await blackboard.list_models(run.id, "claims", Claim)
+        verifications = await blackboard.list_models(run.id, "verifications", Verification)
+        final = await blackboard.get_final(run.id)
+        principal_actions = await blackboard.list_models(run.id, "principal_actions", PrincipalAction)
+        agent_specs = await blackboard.list_models(run.id, "agent_specs", AgentSpec)
+        artifacts = await blackboard.list_models(run.id, "artifacts", Artifact)
         return RunDetail(
             run=run,
-            tasks=await blackboard.list_models(run.id, "tasks", ResearchTask),
-            observations=await blackboard.list_models(run.id, "observations", Observation),
-            claims=await blackboard.list_models(run.id, "claims", Claim),
-            verifications=await blackboard.list_models(run.id, "verifications", Verification),
-            final=await blackboard.get_final(run.id),
+            tasks=tasks,
+            observations=observations,
+            claims=claims,
+            verifications=verifications,
+            final=final,
+            run_state=build_run_state(run, tasks, claims, verifications, final, agent_specs),
+            principal_actions=principal_actions,
+            agent_specs=agent_specs,
+            artifacts=artifacts,
         )
     except Exception as exc:
         logger.exception("run detail read failed run_id=%s", run_id)
