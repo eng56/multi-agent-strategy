@@ -80,8 +80,19 @@ def build_run_state(
     verified_claims = [claim for claim in claims if claim.id in verified_ids]
     pending_tasks = [task for task in tasks if task.status == "created"]
     verified_artifacts = [value for value in artifacts if value.status == ArtifactStatus.VERIFIED]
-    rejected_artifacts = [value for value in artifacts if value.status == ArtifactStatus.REJECTED]
-    disputed_artifacts = [value for value in artifacts if value.status == ArtifactStatus.DISPUTED]
+    rejected_artifacts = [
+        value
+        for value in artifacts
+        if value.status == ArtifactStatus.REJECTED and value.artifact_type in {ArtifactType.CLAIM, ArtifactType.FORECAST}
+    ]
+    disputed_artifacts = [
+        value
+        for value in artifacts
+        if value.status == ArtifactStatus.DISPUTED and value.artifact_type in {ArtifactType.CLAIM, ArtifactType.FORECAST}
+    ]
+    verified_artifact_ids = {value.legacy_object_id or value.id for value in verified_artifacts}
+    rejected_artifact_ids = {value.legacy_object_id or value.id for value in rejected_artifacts}
+    disputed_artifact_ids = {value.legacy_object_id or value.id for value in disputed_artifacts}
     verified_knowledge_artifacts = [
         value for value in verified_artifacts if value.artifact_type in {ArtifactType.CLAIM, ArtifactType.FORECAST}
     ]
@@ -112,9 +123,9 @@ def build_run_state(
         or [claim.statement for claim in verified_claims],
         open_questions=[value.text_or_summary for value in open_question_artifacts]
         + [task.question for task in pending_tasks],
-        verified_claim_count=len({*verified_ids, *[value.id for value in verified_knowledge_artifacts]}),
-        rejected_claim_count=len(rejected_ids) + len(rejected_artifacts),
-        disputed_claim_count=len(uncertain_ids) + len(disputed_artifacts),
+        verified_claim_count=len(verified_ids | verified_artifact_ids),
+        rejected_claim_count=len(rejected_ids | rejected_artifact_ids),
+        disputed_claim_count=len(uncertain_ids | disputed_artifact_ids),
         coverage_by_topic=coverage_by_topic,
         budget_remaining=budget_remaining,
         tool_budget_remaining={

@@ -234,3 +234,56 @@ def test_run_state_suggests_skeptic_candidate_until_counterargument_exists() -> 
     state = build_run_state(current_run, [], [], [], artifacts=artifacts)
 
     assert PrincipalActionType.REQUEST_SKEPTIC_REVIEW not in {action.action_type for action in state.next_action_candidates}
+
+
+def test_run_state_rejected_and_disputed_counts_ignore_verification_artifacts() -> None:
+    current_run = run()
+    rejected_verification = Artifact(
+        run_id=current_run.id,
+        artifact_type=ArtifactType.VERIFICATION,
+        branch="trust/source_verifier",
+        text_or_summary="Verification rejected a claim.",
+        status=ArtifactStatus.REJECTED,
+    )
+    disputed_claim = Artifact(
+        run_id=current_run.id,
+        artifact_type=ArtifactType.CLAIM,
+        branch="market/equities",
+        text_or_summary="Claim is disputed.",
+        status=ArtifactStatus.DISPUTED,
+    )
+
+    state = build_run_state(current_run, [], [], [], artifacts=[rejected_verification, disputed_claim])
+
+    assert state.rejected_claim_count == 0
+    assert state.disputed_claim_count == 1
+
+
+def test_run_state_deduplicates_legacy_and_claim_artifact_counts() -> None:
+    current_run = run()
+    claim = Claim(
+        run_id=current_run.id,
+        task_id=uuid4(),
+        statement="Claim rejected twice by legacy and artifact views.",
+        evidence_observation_ids=[uuid4()],
+        confidence=0.4,
+    )
+    verification = Verification(
+        run_id=current_run.id,
+        claim_id=claim.id,
+        verdict="rejected",
+        rationale="Unsupported.",
+        confidence=0.8,
+    )
+    claim_artifact = Artifact(
+        run_id=current_run.id,
+        artifact_type=ArtifactType.CLAIM,
+        text_or_summary=claim.statement,
+        status=ArtifactStatus.REJECTED,
+        legacy_object_type="claim",
+        legacy_object_id=claim.id,
+    )
+
+    state = build_run_state(current_run, [], [claim], [verification], artifacts=[claim_artifact])
+
+    assert state.rejected_claim_count == 1

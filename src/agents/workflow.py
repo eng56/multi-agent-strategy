@@ -141,7 +141,9 @@ def build_organization(run: Run) -> OrganizationPlan:
     )
     specs = [root]
     worker_ids: list[UUID] = []
-    for branch in semantic_branches(run.question):
+    branches = semantic_branches(run.question)
+    per_worker_budget = role_budget(run, AgentRole.RESEARCH) / max(1, len(branches))
+    for branch in branches:
         name, template, tools = role_for_branch(branch)
         spec = AgentSpec(
             run_id=run.id,
@@ -153,7 +155,7 @@ def build_organization(run: Run) -> OrganizationPlan:
             objective=f"Research {title_from_branch(branch)} evidence relevant to: {run.question}",
             allowed_tools=tools,
             retrieval_tags=tags_for_text(f"{branch} {run.question}"),
-            local_budget_usd=role_budget(run, AgentRole.RESEARCH),
+            local_budget_usd=per_worker_budget,
             visibility_scope=VisibilityScope.TEAM,
             status=AgentStatus.ACTIVE,
         )
@@ -313,17 +315,6 @@ async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:
     if not task:
         return
     branch = branch_for_task(task, await runtime.blackboard.list_models(event.run_id, "agent_specs", AgentSpec))
-    await persist_action(
-        runtime,
-        task.run_id,
-        PrincipalActionType.REQUEST_TOOL_CALL,
-        f"Executed {task.tool} for task: {task.title}",
-        required_role="tool_runner",
-        target_branch=branch,
-        expected_information_gain=InformationGain.HIGH,
-        priority=7,
-        producer="tool-runner",
-    )
     if task.tool == "market_data":
         ticker_result = await runtime.llm.json(
             task.run_id,
@@ -366,11 +357,24 @@ async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:
             visibility=VisibilityScope.PUBLIC_UNVERIFIED,
             status=ArtifactStatus.UNVERIFIED,
             source_refs=observation.sources,
+            legacy_object_type="observation",
+            legacy_object_id=observation.id,
         ),
         "tool-runner",
     )
     task.status = "completed"
     await runtime.blackboard.put_task(task)
+    await persist_action(
+        runtime,
+        task.run_id,
+        PrincipalActionType.REQUEST_TOOL_CALL,
+        f"Executed {task.tool} for task: {task.title}",
+        required_role="tool_runner",
+        target_branch=branch,
+        expected_information_gain=InformationGain.HIGH,
+        priority=7,
+        producer="tool-runner",
+    )
     emit(runtime, EventType.OBSERVATION_CREATED, task.run_id, "tool-runner", observation_id=str(observation.id))
 
 
@@ -400,7 +404,13 @@ async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
     )
     await runtime.blackboard.put_claim(claim)
     observation_artifacts = await runtime.blackboard.list_models(event.run_id, "artifacts", Artifact)
-    depends_on = [value.id for value in observation_artifacts if value.artifact_type == ArtifactType.OBSERVATION and value.text_or_summary == observation.summary]
+    depends_on = [
+        value.id
+        for value in observation_artifacts
+        if value.artifact_type == ArtifactType.OBSERVATION
+        and value.legacy_object_type == "observation"
+        and value.legacy_object_id == observation.id
+    ]
     await persist_artifact(
         runtime,
         Artifact(
@@ -413,6 +423,8 @@ async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
             status=ArtifactStatus.UNVERIFIED,
             confidence=claim.confidence,
             source_refs=claim.sources,
+            legacy_object_type="claim",
+            legacy_object_id=claim.id,
             depends_on_artifact_ids=depends_on[:1],
         ),
         "worker-agents",
@@ -425,17 +437,6 @@ async def verify_claim(runtime: Runtime, event: EventEnvelope) -> None:
     claim = next((value for value in claims if str(value.id) == event.payload.get("claim_id")), None)
     if not claim:
         return
-    await persist_action(
-        runtime,
-        event.run_id,
-        PrincipalActionType.REQUEST_VERIFICATION,
-        f"Verified claim candidate: {claim.statement[:120]}",
-        required_role="source_verifier_agent",
-        target_branch="trust/source_verifier",
-        expected_information_gain=InformationGain.MEDIUM,
-        priority=6,
-        producer="verifier-agent",
-    )
     corroboration = await runtime.tools.web_search(event.run_id, claim.statement)
     result = await runtime.llm.json(
         event.run_id,
@@ -459,13 +460,41 @@ async def verify_claim(runtime: Runtime, event: EventEnvelope) -> None:
     await runtime.blackboard.put_observation(observation)
     verification = Verification(run_id=event.run_id, claim_id=claim.id, sources=sources, **result)
     await runtime.blackboard.put_verification(verification)
+    await persist_artifact(
+        runtime,
+        Artifact(
+            run_id=event.run_id,
+            artifact_type=ArtifactType.OBSERVATION,
+            branch="trust/source_verifier",
+            text_or_summary=observation.summary,
+            tags=tags_for_text(observation.summary),
+            visibility=VisibilityScope.PUBLIC_UNVERIFIED,
+            status=ArtifactStatus.UNVERIFIED,
+            source_refs=observation.sources,
+            legacy_object_type="observation",
+            legacy_object_id=observation.id,
+        ),
+        "verifier-agent",
+    )
     artifacts = await runtime.blackboard.list_models(event.run_id, "artifacts", Artifact)
-    claim_artifact_ids = [value.id for value in artifacts if value.artifact_type == ArtifactType.CLAIM and value.text_or_summary == claim.statement]
+    claim_artifacts = [
+        value
+        for value in artifacts
+        if value.artifact_type == ArtifactType.CLAIM
+        and value.legacy_object_type == "claim"
+        and value.legacy_object_id == claim.id
+    ]
     status = {
         "verified": ArtifactStatus.VERIFIED,
         "rejected": ArtifactStatus.REJECTED,
         "uncertain": ArtifactStatus.DISPUTED,
     }[verification.verdict]
+    for claim_artifact in claim_artifacts:
+        claim_artifact.status = status
+        if verification.verdict == "verified":
+            claim_artifact.visibility = VisibilityScope.PUBLIC_VERIFIED
+        await runtime.blackboard.put_artifact(claim_artifact)
+    claim_artifact_ids = [value.id for value in claim_artifacts]
     await persist_artifact(
         runtime,
         Artifact(
@@ -478,10 +507,23 @@ async def verify_claim(runtime: Runtime, event: EventEnvelope) -> None:
             status=status,
             confidence=verification.confidence,
             source_refs=verification.sources,
+            legacy_object_type="verification",
+            legacy_object_id=verification.id,
             supports_artifact_ids=claim_artifact_ids[:1] if verification.verdict == "verified" else [],
             contradicts_artifact_ids=claim_artifact_ids[:1] if verification.verdict == "rejected" else [],
         ),
         "verifier-agent",
+    )
+    await persist_action(
+        runtime,
+        event.run_id,
+        PrincipalActionType.REQUEST_VERIFICATION,
+        f"Verified claim candidate: {claim.statement[:120]}",
+        required_role="source_verifier_agent",
+        target_branch="trust/source_verifier",
+        expected_information_gain=InformationGain.MEDIUM,
+        priority=6,
+        producer="verifier-agent",
     )
     emit(runtime, EventType.CLAIM_VERIFIED, event.run_id, "verifier-agent", verification_id=str(verification.id))
 
@@ -501,17 +543,6 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
     run = await runtime.blackboard.get_run(event.run_id)
     if not run:
         return
-    await persist_action(
-        runtime,
-        event.run_id,
-        PrincipalActionType.REQUEST_AGGREGATION,
-        "Synthesized verified claims into a final report.",
-        required_role="aggregator_agent",
-        target_branch="synthesis/aggregator",
-        expected_information_gain=InformationGain.MEDIUM,
-        priority=5,
-        producer="aggregator-agent",
-    )
     result = await runtime.llm.json(
         event.run_id,
         AgentRole.AGGREGATOR,
@@ -539,8 +570,21 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
             visibility=VisibilityScope.PUBLIC_VERIFIED,
             status=ArtifactStatus.VERIFIED,
             source_refs=final.sources,
+            legacy_object_type="final_report",
+            legacy_object_id=event.run_id,
         ),
         "aggregator-agent",
+    )
+    await persist_action(
+        runtime,
+        event.run_id,
+        PrincipalActionType.REQUEST_AGGREGATION,
+        "Synthesized verified claims into a final report.",
+        required_role="aggregator_agent",
+        target_branch="synthesis/aggregator",
+        expected_information_gain=InformationGain.MEDIUM,
+        priority=5,
+        producer="aggregator-agent",
     )
     if run.models.judge:
         emit(runtime, EventType.FINAL_CREATED, event.run_id, "aggregator-agent")
@@ -580,6 +624,8 @@ async def judge(runtime: Runtime, event: EventEnvelope) -> None:
             status=ArtifactStatus.VERIFIED,
             confidence=final.judge_score,
             source_refs=final.sources,
+            legacy_object_type="judge_feedback",
+            legacy_object_id=event.run_id,
         ),
         "judge-agent",
     )
@@ -639,6 +685,8 @@ async def deterministic_partial(runtime: Runtime, run_id: UUID, reason: str) -> 
             visibility=VisibilityScope.PUBLIC_VERIFIED,
             status=ArtifactStatus.VERIFIED,
             source_refs=final.sources,
+            legacy_object_type="final_report",
+            legacy_object_id=run_id,
         ),
         "aggregator-agent",
     )

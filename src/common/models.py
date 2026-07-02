@@ -303,6 +303,8 @@ class Artifact(BaseModel):
     status: ArtifactStatus = ArtifactStatus.UNVERIFIED
     confidence: float | None = Field(default=None, ge=0, le=1)
     source_refs: list[str] = Field(default_factory=list)
+    legacy_object_type: str | None = None
+    legacy_object_id: UUID | None = None
     parent_artifact_ids: list[UUID] = Field(default_factory=list)
     depends_on_artifact_ids: list[UUID] = Field(default_factory=list)
     contradicts_artifact_ids: list[UUID] = Field(default_factory=list)
