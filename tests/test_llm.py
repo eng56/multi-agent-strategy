@@ -9,8 +9,10 @@ from src.common.models import AgentRole, Budget, ModelPolicy, RoleModelPolicy, R
 from src.integrations.llm import (
     LLMOutputError,
     LLMProviderError,
+    LangfuseRecorder,
     OpenRouterLLM,
     completion_content,
+    langfuse_trace_id,
     parse_json_output,
 )
 
@@ -132,3 +134,39 @@ def test_openrouter_llm_reports_provider_error_body(monkeypatch: pytest.MonkeyPa
 def test_completion_content_reports_malformed_provider_response() -> None:
     with pytest.raises(LLMProviderError, match="malformed completion.*quota exceeded"):
         completion_content({"error": {"message": "quota exceeded"}}, "tool-summary")
+
+
+def test_langfuse_trace_id_uses_uuid_hex() -> None:
+    run_id = uuid4()
+
+    assert langfuse_trace_id(run_id) == run_id.hex
+    assert "-" not in langfuse_trace_id(run_id)
+    assert len(langfuse_trace_id(run_id)) == 32
+
+
+def test_langfuse_generation_creates_trace_and_generation(monkeypatch: pytest.MonkeyPatch) -> None:
+    payloads = []
+
+    async def post(self, *_args, **kwargs):
+        payloads.append(kwargs["json"])
+        return httpx.Response(207, json={"successes": []}, request=httpx.Request("POST", "https://langfuse.example/api/public/ingestion"))
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", post)
+    recorder = LangfuseRecorder("https://langfuse.example", "pk", "sk")
+
+    asyncio.run(
+        recorder.generation(
+            "generation-id",
+            {
+                "traceId": "a" * 32,
+                "name": "planner",
+                "input": "prompt",
+                "output": "{}",
+                "metadata": {"run_id": "run-id"},
+            },
+        )
+    )
+
+    assert [item["type"] for item in payloads[0]["batch"]] == ["trace-create", "generation-create"]
+    assert payloads[0]["batch"][0]["body"]["id"] == "a" * 32
+    assert payloads[0]["batch"][1]["body"]["traceId"] == "a" * 32

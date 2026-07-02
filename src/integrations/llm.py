@@ -1,14 +1,17 @@
 from datetime import UTC, datetime
 import json
 from json import JSONDecodeError
+import logging
 import re
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 
 from src.common.budget import PersistentBudget
 from src.common.models import AgentRole
+
+logger = logging.getLogger(__name__)
 
 
 class LLMOutputError(RuntimeError):
@@ -57,14 +60,30 @@ def completion_content(response_data: dict[str, Any], name: str) -> str:
     return output
 
 
+def langfuse_trace_id(run_id: UUID) -> str:
+    """Langfuse trace IDs must be 32 lowercase hex characters."""
+    return run_id.hex
+
+
 class LangfuseRecorder:
     def __init__(self, host: str, public_key: str, secret_key: str) -> None:
         self.url = f"{host.rstrip('/')}/api/public/ingestion"
         self.auth = (public_key, secret_key)
 
     async def generation(self, event_id: str, body: dict[str, Any]) -> None:
+        trace_id = body.get("traceId")
         payload = {
             "batch": [
+                {
+                    "id": str(uuid4()),
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "type": "trace-create",
+                    "body": {
+                        "id": trace_id,
+                        "name": "multi-agent-investment-run",
+                        "metadata": {"runId": body.get("metadata", {}).get("run_id")},
+                    },
+                },
                 {
                     "id": event_id,
                     "timestamp": datetime.now(UTC).isoformat(),
@@ -75,7 +94,10 @@ class LangfuseRecorder:
         }
         async with httpx.AsyncClient(timeout=10) as client:
             response = await client.post(self.url, auth=self.auth, json=payload)
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError:
+                logger.warning("langfuse generation ingest failed status=%s body=%s", response.status_code, response.text[:500])
 
     async def span(self, event_id: str, body: dict[str, Any]) -> None:
         payload = {
@@ -90,7 +112,10 @@ class LangfuseRecorder:
         }
         async with httpx.AsyncClient(timeout=10) as client:
             response = await client.post(self.url, auth=self.auth, json=payload)
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError:
+                logger.warning("langfuse span ingest failed status=%s body=%s", response.status_code, response.text[:500])
 
 
 class OpenRouterLLM:
@@ -117,7 +142,9 @@ class OpenRouterLLM:
         system = (
             f"{system}\nHard budget context: role={role.value}; "
             f"role remaining before this call=${role_remaining:.4f}; "
-            f"this call maximum reservation=${estimate:.4f}."
+            f"this call maximum reservation=${estimate:.4f}. "
+            "Use the available output budget for decision-grade detail; avoid terse answers when evidence, "
+            "risks, and caveats are needed, while still returning valid JSON."
         )
         await self.budget.reserve_llm(run_id, role, estimate)
         actual = estimate
@@ -163,13 +190,13 @@ class OpenRouterLLM:
                 str(response_data["id"]),
                 {
                     "id": str(response_data["id"]),
-                    "traceId": str(run_id),
+                    "traceId": langfuse_trace_id(run_id),
                     "name": name,
                     "model": response_data.get("model", policy.model),
                     "input": prompt,
                     "output": output,
                     "usage": usage,
-                    "metadata": {"role": role.value, "actual_cost_usd": actual},
+                    "metadata": {"role": role.value, "actual_cost_usd": actual, "run_id": str(run_id)},
                 },
             )
             return parse_json_output(output, name)

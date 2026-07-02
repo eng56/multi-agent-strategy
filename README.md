@@ -122,6 +122,16 @@ keys before the run starts, but these per-run tool limits are reserved for actua
 Exact USD accounting is enforced for OpenRouter using reservations and returned usage cost; tool USD
 cost is not estimated because it depends on the deployment owner's provider plans.
 
+The OpenRouter budget is a hard cap, not a spend target. Low-cost models such as `openai/gpt-4.1-mini`
+can complete an end-to-end run while spending only a small fraction of a $4 cap. For deeper and more
+expensive runs, choose higher-cost OpenRouter models in the UI, increase role caps, and increase
+`max_output_tokens`; the runtime will still reconcile reservations to the actual usage cost returned
+by OpenRouter.
+
+Langfuse note: traces use the run UUID converted to a 32-character hex trace ID, and each generation
+ingest also creates the parent trace. If traces are empty, verify `LANGFUSE_HOST`, `LANGFUSE_PUBLIC_KEY`,
+and `LANGFUSE_SECRET_KEY` in the `runtime-env` secret and inspect worker logs for `langfuse ... ingest failed`.
+
 OpenRouter note: if provider validation returns `HTTP 401` with `User not found`, rotate the
 `OPENROUTER_API_KEY` value in Google Secret Manager `runtime-env`, restart the GKE deployments, and
 rerun `curl -H "x-api-key: $ORCHESTRATOR_API_TOKEN" "$ORCHESTRATOR_API_URL/v1/models/openrouter"`

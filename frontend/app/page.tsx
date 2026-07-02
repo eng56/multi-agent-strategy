@@ -4,12 +4,12 @@ import {FormEvent, useEffect, useState} from "react";
 
 const roles = ["planner", "utility", "research", "verifier", "aggregator", "judge"] as const;
 const defaultModels: Record<string, string> = {
-  planner: "anthropic/claude-sonnet-4.5",
-  utility: "openai/gpt-4.1-mini",
-  research: "openai/gpt-4.1-mini",
-  verifier: "openai/gpt-4.1-mini",
-  aggregator: "anthropic/claude-sonnet-4.5",
-  judge: "openai/gpt-4.1-mini",
+  planner: "anthropic/claude-sonnet-5",
+  utility: "openai/gpt-5.4-nano",
+  research: "qwen/qwen3.6-flash",
+  verifier: "openai/gpt-5.4-mini",
+  aggregator: "anthropic/claude-sonnet-5",
+  judge: "openai/gpt-5.4-mini",
 };
 const weights: Record<string, number> = {
   planner: 0.1,
