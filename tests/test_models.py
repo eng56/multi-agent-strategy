@@ -89,3 +89,8 @@ def test_control_loop_models_serialize_typed_state() -> None:
     assert payload["action"]["action_type"] == "request_skeptic_review"
     assert payload["artifact"]["artifact_type"] == "principal_action"
     assert payload["organization"]["agent_specs"][0]["role_template"] == "principal_policy"
+
+
+def test_future_control_loop_events_serialize() -> None:
+    event = EventEnvelope(type=EventType.PRINCIPAL_ACTION_CREATED, run_id=uuid4(), producer="test")
+    assert event.model_dump(mode="json")["type"] == "principal.action.created"

@@ -59,3 +59,17 @@ Principal policy -> action space -> blackboard environment -> typed agents -> ob
 The first architectural seam is explicit state. `RunState` gives the Principal a compact view of the environment instead of forcing it to inspect every raw artifact. `PrincipalAction` makes the action space typed and auditable. `AgentSpec` and `OrganizationPlan` describe the generated research organization. `Artifact` is the generic graph shape used to move from flat claims toward artifact publication, lineage, contradiction tracking, and trust promotion.
 
 The API returns these structures in run detail responses so the UI can show the system, not just the answer: current state, candidate principal decisions, organization, artifacts, evidence, and payoff.
+
+## Runtime activation slice
+
+The previous iteration introduced the epistemic-control vocabulary. This iteration makes it partially active in runtime: the planner creates a logical organization, runtime persists executed Principal decisions, legacy workflow outputs are dual-written into the generic artifact graph, and RunState summarizes semantic branches, artifacts, budget, and candidate next actions.
+
+The system still does not implement a full recurrent Principal policy, dynamic agent spawning, AgentSpec-driven prompt composition, a complete KnowledgeRouter, or judge-triggered follow-up loops. Those are next steps.
+
+Next planned iteration:
+
+- Principal policy consumes RunState and selects actions.
+- AgentSpec drives worker prompt composition.
+- KnowledgeRouter filters artifacts by branch, tags, status, and visibility.
+- Skeptic agent creates counterargument artifacts.
+- Judge feedback can trigger one follow-up wave.

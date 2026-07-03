@@ -131,6 +131,7 @@ async def get_run_detail(run_id: str, _: None = Depends(require_api_token)) -> R
         principal_actions = await blackboard.list_models(run.id, "principal_actions", PrincipalAction)
         agent_specs = await blackboard.list_models(run.id, "agent_specs", AgentSpec)
         artifacts = await blackboard.list_models(run.id, "artifacts", Artifact)
+        organization_plan = await blackboard.get_organization_plan(run.id)
         return RunDetail(
             run=run,
             tasks=tasks,
@@ -138,10 +139,11 @@ async def get_run_detail(run_id: str, _: None = Depends(require_api_token)) -> R
             claims=claims,
             verifications=verifications,
             final=final,
-            run_state=build_run_state(run, tasks, claims, verifications, final, agent_specs),
+            run_state=build_run_state(run, tasks, claims, verifications, final, agent_specs, artifacts, organization_plan),
             principal_actions=principal_actions,
             agent_specs=agent_specs,
             artifacts=artifacts,
+            organization_plan=organization_plan,
         )
     except Exception as exc:
         logger.exception("run detail read failed run_id=%s", run_id)

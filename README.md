@@ -167,3 +167,17 @@ Paper mapping:
 - Cooperative AI Policymaking Platform: borrows transparent decision-support UI and forecasting orientation.
 
 Current limitation: payoff is approximated with verifier and judge signals rather than realized real-world outcomes.
+
+### Active control-loop runtime slice
+
+The previous iteration introduced the epistemic-control vocabulary. This iteration makes it partially active in runtime: the planner creates a logical organization, runtime persists executed Principal decisions, legacy workflow outputs are dual-written into the generic artifact graph, and RunState summarizes semantic branches, artifacts, budget, and candidate next actions.
+
+The system still does not implement a full recurrent Principal policy, dynamic agent spawning, AgentSpec-driven prompt composition, a complete KnowledgeRouter, or judge-triggered follow-up loops. Those are next steps.
+
+Next planned iteration:
+
+- Principal policy consumes RunState and selects actions.
+- AgentSpec drives worker prompt composition.
+- KnowledgeRouter filters artifacts by branch, tags, status, and visibility.
+- Skeptic agent creates counterargument artifacts.
+- Judge feedback can trigger one follow-up wave.

@@ -21,6 +21,9 @@ type AgentSpec = {
   role_template: string;
   branch: string;
   objective: string;
+  allowed_tools: string[];
+  retrieval_tags: string[];
+  local_budget_usd: number;
   status: string;
 };
 
@@ -35,6 +38,12 @@ type Artifact = {
   depends_on_artifact_ids: string[];
   contradicts_artifact_ids: string[];
   supports_artifact_ids: string[];
+};
+
+type OrganizationPlan = {
+  root_agent_id: string;
+  branches: string[];
+  stop_conditions: string[];
 };
 
 type RunState = {
@@ -81,7 +90,21 @@ type Detail = {
   principal_actions: PrincipalAction[];
   agent_specs: AgentSpec[];
   artifacts: Artifact[];
+  organization_plan?: OrganizationPlan;
 };
+
+function ActionList({ actions, empty }: { actions: PrincipalAction[]; empty: string }) {
+  if (actions.length === 0) return <p>{empty}</p>;
+  return actions.map((action) => (
+    <article key={action.id}>
+      <strong>{action.action_type}</strong> · {action.status} · priority {action.priority} · {action.expected_information_gain} information gain · ${action.estimated_cost.toFixed(2)} est.
+      <p>{action.reason}</p>
+      <small>
+        role: {action.required_role ?? "any"} {action.target_branch ? `· branch: ${action.target_branch}` : ""}
+      </small>
+    </article>
+  ));
+}
 
 export default function RunPage({ params }: { params: Promise<{ id: string }> }) {
   const [id, setId] = useState("");
@@ -103,7 +126,7 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
 
   const b = detail.run.budget;
   const state = detail.run_state;
-  const actions = [...(detail.principal_actions ?? []), ...(state?.next_action_candidates ?? [])];
+  const candidates = state?.next_action_candidates ?? [];
 
   return (
     <main className="shell">
@@ -113,9 +136,7 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
       <div className="grid">
         <section className="card">
           <h2>Budget</h2>
-          <p>
-            ${b.spent_usd.toFixed(2)} / ${b.limit_usd.toFixed(2)}
-          </p>
+          <p>${b.spent_usd.toFixed(2)} / ${b.limit_usd.toFixed(2)}</p>
           <p>
             ${b.reserved_usd.toFixed(2)} reserved · Tavily {b.tools.tavily_credits_used}/
             {b.tools.tavily_max_credits} · Market {b.tools.market_data_requests_used}/
@@ -124,25 +145,17 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
         </section>
         <section className="card">
           <h2>Progress</h2>
-          <p>
-            {detail.tasks.length} tasks · {detail.claims.length} claims · {detail.verifications.length} checks
-          </p>
+          <p>{detail.tasks.length} tasks · {detail.claims.length} claims · {detail.verifications.length} checks</p>
         </section>
       </div>
 
       {state && (
         <section className="card">
           <h2>RunState</h2>
-          <p>
-            Phase <strong>{state.current_phase}</strong> · ${state.budget_remaining.toFixed(2)} remaining · {state.agent_count} agent specs
-          </p>
-          <p>
-            Verified {state.verified_claim_count} · Rejected {state.rejected_claim_count} · Disputed {state.disputed_claim_count}
-          </p>
+          <p>Phase <strong>{state.current_phase}</strong> · ${state.budget_remaining.toFixed(2)} remaining · {state.agent_count} agent specs</p>
+          <p>Verified {state.verified_claim_count} · Rejected {state.rejected_claim_count} · Disputed {state.disputed_claim_count}</p>
           <p>Branches: {state.active_branches.join(", ") || "none yet"}</p>
-          <p>
-            Tools remaining: Tavily {state.tool_budget_remaining.tavily_credits ?? 0} · Market {state.tool_budget_remaining.market_data_requests ?? 0}
-          </p>
+          <p>Tools remaining: Tavily {state.tool_budget_remaining.tavily_credits ?? 0} · Market {state.tool_budget_remaining.market_data_requests ?? 0}</p>
           <h3>Open questions</h3>
           <ul>{state.open_questions.map((q) => <li key={q}>{q}</li>)}</ul>
           <h3>Known facts</h3>
@@ -152,26 +165,26 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
       )}
 
       <section className="card">
-        <h2>Principal decisions</h2>
-        {actions.length === 0 && <p>No principal actions recorded yet.</p>}
-        {actions.map((action) => (
-          <article key={action.id}>
-            <strong>{action.action_type}</strong> · priority {action.priority} · {action.expected_information_gain} information gain
-            <p>{action.reason}</p>
-            <small>
-              {action.required_role ?? "any role"} {action.target_branch ? `→ ${action.target_branch}` : ""}
-            </small>
-          </article>
-        ))}
+        <h2>Executed Principal decisions</h2>
+        <ActionList actions={detail.principal_actions ?? []} empty="No executed principal decisions recorded yet." />
+      </section>
+
+      <section className="card">
+        <h2>Candidate next actions</h2>
+        <ActionList actions={candidates} empty="No candidate next actions right now." />
       </section>
 
       <section className="card">
         <h2>Agent organization</h2>
+        {detail.organization_plan && <p>Branches: {detail.organization_plan.branches.join(", ")}</p>}
         {detail.agent_specs.length === 0 && <p>No explicit organization plan has been persisted yet.</p>}
         {detail.agent_specs.map((agent) => (
           <article key={agent.id}>
             <strong>{agent.name}</strong> · {agent.role_template} · {agent.branch} · {agent.status}
             <p>{agent.objective}</p>
+            <small>
+              tools: {agent.allowed_tools.join(", ") || "none"} · tags: {agent.retrieval_tags.join(", ") || "none"} · local budget ${agent.local_budget_usd.toFixed(2)}
+            </small>
           </article>
         ))}
       </section>
@@ -181,10 +194,10 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
         {detail.artifacts.length === 0 && <p>No generic artifacts have been persisted yet; legacy observations and claims are shown below.</p>}
         {detail.artifacts.map((artifact) => (
           <article key={artifact.id}>
-            <strong>{artifact.artifact_type}</strong> · {artifact.status} {artifact.confidence !== undefined ? `· confidence ${artifact.confidence.toFixed(2)}` : ""}
+            <strong>{artifact.artifact_type}</strong> · {artifact.status} · {artifact.branch ?? "unbranched"} {artifact.confidence !== undefined ? `· confidence ${artifact.confidence.toFixed(2)}` : ""}
             <p>{artifact.text_or_summary}</p>
             <small>
-              supports {artifact.supports_artifact_ids.length} · contradicts {artifact.contradicts_artifact_ids.length} · depends on {artifact.depends_on_artifact_ids.length}
+              sources {artifact.source_refs.length} · supports {artifact.supports_artifact_ids.length} · contradicts {artifact.contradicts_artifact_ids.length} · depends on {artifact.depends_on_artifact_ids.length}
             </small>
           </article>
         ))}
@@ -195,9 +208,7 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
           <h2>Final report</h2>
           <p>{detail.final.answer}</p>
           <h3>Judge</h3>
-          <p>
-            {detail.final.judge_score?.toFixed(2)} — {detail.final.judge_feedback}
-          </p>
+          <p>{detail.final.judge_score?.toFixed(2)} — {detail.final.judge_feedback}</p>
           <h3>Sources</h3>
           <ul>{detail.final.sources.map((s) => <li key={s}><a href={s} target="_blank">{s}</a></li>)}</ul>
         </section>
@@ -211,7 +222,7 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
       )}
 
       <section className="card">
-        <h2>Verified evidence</h2>
+        <h2>Legacy evidence</h2>
         {detail.claims.map((c) => {
           const v = detail.verifications.find((x) => x.claim_id === c.id);
           return (

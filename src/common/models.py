@@ -22,6 +22,12 @@ class EventType(StrEnum):
     OBSERVATION_CREATED = "observation.created"
     CLAIM_VERIFIED = "claim.verified"
     FINAL_CREATED = "final.created"
+    PRINCIPAL_ACTION_CREATED = "principal.action.created"
+    AGENT_SPEC_CREATED = "agent.spec.created"
+    ORGANIZATION_PLAN_CREATED = "organization.plan.created"
+    ARTIFACT_CREATED = "artifact.created"
+    FOLLOWUP_REQUESTED = "followup.requested"
+    SKEPTIC_REVIEW_REQUESTED = "skeptic.review.requested"
 
 
 class RunStatus(StrEnum):
@@ -297,6 +303,8 @@ class Artifact(BaseModel):
     status: ArtifactStatus = ArtifactStatus.UNVERIFIED
     confidence: float | None = Field(default=None, ge=0, le=1)
     source_refs: list[str] = Field(default_factory=list)
+    legacy_object_type: str | None = None
+    legacy_object_id: UUID | None = None
     parent_artifact_ids: list[UUID] = Field(default_factory=list)
     depends_on_artifact_ids: list[UUID] = Field(default_factory=list)
     contradicts_artifact_ids: list[UUID] = Field(default_factory=list)
@@ -338,6 +346,7 @@ class RunDetail(BaseModel):
     principal_actions: list[PrincipalAction] = Field(default_factory=list)
     agent_specs: list[AgentSpec] = Field(default_factory=list)
     artifacts: list[Artifact] = Field(default_factory=list)
+    organization_plan: OrganizationPlan | None = None
 
 
 class EventEnvelope(BaseModel):

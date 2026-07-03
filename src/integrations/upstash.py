@@ -6,7 +6,18 @@ from uuid import UUID
 import httpx
 from pydantic import BaseModel, ValidationError
 
-from src.common.models import AgentSpec, Artifact, Claim, FinalReport, Observation, PrincipalAction, ResearchTask, Run, Verification
+from src.common.models import (
+    AgentSpec,
+    Artifact,
+    Claim,
+    FinalReport,
+    Observation,
+    OrganizationPlan,
+    PrincipalAction,
+    ResearchTask,
+    Run,
+    Verification,
+)
 
 T = TypeVar("T", bound=BaseModel)
 logger = logging.getLogger(__name__)
@@ -82,6 +93,16 @@ class UpstashBlackboard:
 
     async def put_artifact(self, value: Artifact) -> None:
         await self.append_model(value.run_id, "artifacts", value)
+
+    async def put_organization_plan(self, value: OrganizationPlan) -> None:
+        await self.put_model(f"run:{value.run_id}:organization_plan", value)
+
+    async def get_organization_plan(self, run_id: UUID | str) -> OrganizationPlan | None:
+        try:
+            return await self.get_model(f"run:{run_id}:organization_plan", OrganizationPlan)
+        except (ValidationError, json.JSONDecodeError):
+            logger.exception("skipping invalid organization plan run_id=%s", run_id)
+            return None
 
     async def get_final(self, run_id: UUID | str) -> FinalReport | None:
         try:
