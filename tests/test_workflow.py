@@ -10,8 +10,10 @@ from src.agents.workflow import (
     execute_tool,
     judge,
     plan,
+    semantic_branches,
     verify_claim,
 )
+from src.integrations.llm import LLMOutputError
 from src.common.models import (
     AgentSpec,
     Artifact,
@@ -142,7 +144,10 @@ class QueueLLM:
         self.results = list(results)
 
     async def json(self, *_args, **_kwargs):
-        return self.results.pop(0)
+        result = self.results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
 
 
 def runtime(run: Run, llm: QueueLLM | None = None):
@@ -177,7 +182,7 @@ def test_future_event_types_serialize_without_handler_rewire() -> None:
     assert EventType.ARTIFACT_CREATED not in handled_events
 
 
-def test_planner_creates_organization_and_actions_then_stops_when_no_tasks() -> None:
+def test_planner_creates_organization_and_actions_then_falls_back_when_no_tasks() -> None:
     run = Run(
         question="Will gold rise if Fed cuts rates?",
         models=model_policy(),
@@ -199,8 +204,100 @@ def test_planner_creates_organization_and_actions_then_stops_when_no_tasks() -> 
     assert any(
         action.action_type == PrincipalActionType.SPAWN_AGENT for action in rt.blackboard.actions
     )
-    assert rt.blackboard.run.status == RunStatus.FAILED
-    assert "planner produced no usable tasks" in rt.blackboard.run.failure_reason
+    assert rt.blackboard.run.status == RunStatus.RUNNING
+    assert len(rt.blackboard.tasks) >= 2
+    assert any(
+        action.action_type == PrincipalActionType.ASSIGN_TASK for action in rt.blackboard.actions
+    )
+
+
+def test_planner_malformed_json_retries_and_creates_tasks() -> None:
+    run = Run(
+        question="Will gold rise if Fed cuts rates?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    rt = runtime(
+        run,
+        QueueLLM(
+            LLMOutputError("model returned invalid JSON for planner: ```json truncated"),
+            {
+                "tasks": [
+                    {
+                        "title": "Gold and Fed cuts",
+                        "question": "Find evidence on gold after surprise Fed cuts.",
+                        "tool": "web_search",
+                    }
+                ]
+            },
+        ),
+    )
+
+    asyncio.run(plan(rt, EventEnvelope(type=EventType.RUN_CREATED, run_id=run.id, producer="test")))
+
+    assert rt.blackboard.run.status == RunStatus.RUNNING
+    assert [task.title for task in rt.blackboard.tasks] == ["Gold and Fed cuts"]
+    assert any(
+        action.action_type == PrincipalActionType.ASSIGN_TASK for action in rt.blackboard.actions
+    )
+
+
+def test_planner_malformed_json_twice_uses_deterministic_fallback() -> None:
+    run = Run(
+        question="Will gold and USD move if Fed cuts rates?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    rt = runtime(
+        run,
+        QueueLLM(
+            LLMOutputError("model returned invalid JSON for planner: first bad output"),
+            LLMOutputError(
+                "model returned invalid JSON for planner-retry-compact: second bad output"
+            ),
+        ),
+    )
+
+    asyncio.run(plan(rt, EventEnvelope(type=EventType.RUN_CREATED, run_id=run.id, producer="test")))
+
+    titles = {task.title for task in rt.blackboard.tasks}
+    assert "Gold reaction to surprise Fed cut" in titles
+    assert "US dollar reaction to surprise Fed cut" in titles
+    assert rt.blackboard.run.status == RunStatus.RUNNING
+    assert rt.blackboard.run.failure_reason is None
+
+
+def test_deterministic_fallback_uses_semantic_branches_without_irrelevant_crypto() -> None:
+    run = Run(
+        question="Whether gold is better than equities after a Fed cut",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    rt = runtime(
+        run,
+        QueueLLM(
+            LLMOutputError("model returned invalid JSON for planner: first bad output"),
+            LLMOutputError(
+                "model returned invalid JSON for planner-retry-compact: second bad output"
+            ),
+        ),
+    )
+
+    asyncio.run(plan(rt, EventEnvelope(type=EventType.RUN_CREATED, run_id=run.id, producer="test")))
+
+    branches = {agent.branch for agent in rt.blackboard.agent_specs}
+    assert "market/gold" in branches
+    assert "market/equities" in branches
+    assert "macro/rates" in branches
+    assert "market/crypto" not in branches
+    assert all("Crypto" not in task.title for task in rt.blackboard.tasks)
+
+
+def test_semantic_branches_use_token_matching_for_crypto_false_positives() -> None:
+    assert "market/crypto" not in semantic_branches("whether gold is better than equities")
+    assert "market/crypto" not in semantic_branches("method for equities after Fed cuts")
+    assert "market/crypto" in semantic_branches("ETH vs BTC after Fed cuts")
+    assert "market/equities" in semantic_branches("SAP stock over the next two months")
 
 
 def test_planner_persists_assign_task_actions_and_legacy_tasks() -> None:

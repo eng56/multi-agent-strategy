@@ -7,6 +7,7 @@ from src.agents.state import (
     branch_for_task,
     infer_semantic_branch,
     tags_for_text,
+    text_matches_any,
     title_from_branch,
 )
 from src.common.models import (
@@ -32,6 +33,7 @@ from src.common.models import (
     Verification,
     VisibilityScope,
 )
+from src.integrations.llm import LLMOutputError
 from src.runtime import Runtime
 
 SYSTEM = (
@@ -107,7 +109,6 @@ def role_budget(run: Run, role: AgentRole) -> float:
 
 
 def semantic_branches(question: str) -> list[str]:
-    lowered = question.lower()
     branches: list[str] = []
     checks = [
         ("market/gold", ("gold", "xau")),
@@ -123,9 +124,98 @@ def semantic_branches(question: str) -> list[str]:
         ("market/bonds", ("bond", "bonds", "treasury")),
     ]
     for branch, needles in checks:
-        if any(needle in lowered for needle in needles):
+        if text_matches_any(question, needles):
             branches.append(branch)
     return branches or ["research/general"]
+
+
+FALLBACK_TASKS: dict[str, tuple[str, str, str]] = {
+    "market/gold": (
+        "Gold reaction to surprise Fed cut",
+        "Find evidence on 1-week to 3-month gold performance and drivers after surprise Fed cuts.",
+        "web_search",
+    ),
+    "market/fx": (
+        "US dollar reaction to surprise Fed cut",
+        "Find evidence on DXY or broad USD performance after surprise Fed cuts and lower rate differentials.",
+        "web_search",
+    ),
+    "market/equities": (
+        "US equities reaction to surprise Fed cut",
+        "Find evidence on S&P 500 performance after surprise Fed cuts, distinguishing growth scare vs easing support.",
+        "web_search",
+    ),
+    "macro/rates": (
+        "Macro context for surprise Fed cut",
+        "Find evidence on real yields, inflation expectations, recession risk, and policy path after surprise Fed cuts.",
+        "web_search",
+    ),
+    "macro/inflation": (
+        "Inflation context for surprise Fed cut",
+        "Find evidence on inflation expectations and CPI or PCE conditions around surprise Fed cuts.",
+        "web_search",
+    ),
+    "market/oil": (
+        "Oil reaction to surprise Fed cut",
+        "Find evidence on WTI or Brent performance after surprise Fed cuts and changing growth expectations.",
+        "web_search",
+    ),
+    "market/crypto": (
+        "Crypto reaction to surprise Fed cut",
+        "Find evidence on Bitcoin or Ethereum performance after surprise Fed cuts and liquidity expectations.",
+        "web_search",
+    ),
+    "market/bonds": (
+        "Bond-market reaction to surprise Fed cut",
+        "Find evidence on Treasury yields and bond returns after surprise Fed cuts.",
+        "web_search",
+    ),
+    "research/general": (
+        "General evidence for investment question",
+        "Find decision-relevant evidence, catalysts, risks, and historical context for the investment question.",
+        "web_search",
+    ),
+}
+
+
+def deterministic_task_items(
+    question: str, organization: OrganizationPlan | None
+) -> list[dict[str, str]]:
+    branches = [
+        branch
+        for branch in (organization.branches if organization else semantic_branches(question))
+        if not branch.startswith(("root", "trust/", "synthesis/"))
+    ]
+    seen: set[str] = set()
+    task_items: list[dict[str, str]] = []
+    for branch in branches or ["research/general"]:
+        if branch in seen:
+            continue
+        seen.add(branch)
+        title, task_question, tool = FALLBACK_TASKS.get(branch, FALLBACK_TASKS["research/general"])
+        task_items.append({"title": title, "question": task_question, "tool": tool})
+    return task_items
+
+
+def compact_planner_prompt(question: str) -> str:
+    return (
+        "Return JSON only, no markdown fences. Create exactly 4 tasks for this investment question. "
+        "Each task must have title <= 80 chars, question <= 220 chars, and tool exactly "
+        "web_search or market_data. Prefer web_search unless a ticker price series is required. "
+        'Schema: {"tasks":[{"title":"...","question":"...","tool":"web_search"}]}. '
+        f"Question: {question}"
+    )
+
+
+def planner_failure_reason(
+    error: Exception | None, *, retry_used: bool, fallback_used: bool
+) -> str:
+    snippet = str(error or "<no model output>")[:300]
+    return (
+        "planner failed to create usable tasks "
+        f"type={type(error).__name__ if error else 'NoUsableTasks'} role=planner name=planner "
+        f"retry_used={retry_used} deterministic_fallback_used={fallback_used} bad_output={snippet}"
+    )
 
 
 def role_for_branch(branch: str) -> tuple[str, str, list[str]]:
@@ -307,22 +397,46 @@ async def plan(runtime: Runtime, event: EventEnvelope) -> None:
         return
     run.status = RunStatus.RUNNING
     await runtime.blackboard.put_run(run)
-    await persist_organization(runtime, run)
-    result = await runtime.llm.json(
-        run.id,
-        AgentRole.PLANNER,
-        "planner",
-        SYSTEM,
-        f"Create 3-5 independent research tasks for this investment question: {run.question}. "
-        'Return {"tasks":[{"title":"...","question":"...","tool":"web_search|market_data"}]}. '
-        "For market_data questions include a ticker symbol in the question.",
-    )
-    if not isinstance(result, dict):
-        await stop_run(
-            runtime, run.id, f"planner returned non-object JSON output: {json.dumps(result)[:1000]}"
-        )
-        return
-    task_items = result.get("tasks") if isinstance(result.get("tasks"), list) else []
+    organization = await persist_organization(runtime, run)
+
+    retry_used = False
+    fallback_used = False
+    last_error: Exception | None = None
+    result: dict[str, Any] | None = None
+    for name, prompt in (
+        (
+            "planner",
+            f"Create 3-5 independent research tasks for this investment question: {run.question}. "
+            'Return {"tasks":[{"title":"...","question":"...","tool":"web_search|market_data"}]}. '
+            "For market_data questions include a ticker symbol in the question.",
+        ),
+        ("planner-retry-compact", compact_planner_prompt(run.question)),
+    ):
+        try:
+            result = await runtime.llm.json(run.id, AgentRole.PLANNER, name, SYSTEM, prompt)
+            last_error = None
+            break
+        except LLMOutputError as exc:
+            last_error = exc
+            if name == "planner":
+                retry_used = True
+                logger.warning(
+                    "planner JSON parse failed run_id=%s retrying compact prompt error=%s",
+                    run.id,
+                    str(exc)[:300],
+                )
+                continue
+            logger.warning(
+                "planner compact retry failed run_id=%s using deterministic fallback error=%s",
+                run.id,
+                str(exc)[:300],
+            )
+
+    task_items = result.get("tasks") if result and isinstance(result.get("tasks"), list) else []
+    if not task_items:
+        fallback_used = True
+        task_items = deterministic_task_items(run.question, organization)
+
     created = 0
     for item in task_items:
         try:
@@ -347,8 +461,11 @@ async def plan(runtime: Runtime, event: EventEnvelope) -> None:
         emit(runtime, EventType.TASK_CREATED, run.id, "planner-agent", task_id=str(task.id))
         created += 1
     if created == 0:
-        reason = f"planner produced no usable tasks from output: {json.dumps(result, sort_keys=True)[:1000]}"
-        await stop_run(runtime, run.id, reason)
+        await stop_run(
+            runtime,
+            run.id,
+            planner_failure_reason(last_error, retry_used=retry_used, fallback_used=fallback_used),
+        )
 
 
 async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:

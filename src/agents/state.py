@@ -36,10 +36,17 @@ BRANCH_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
+def text_matches_any(text: str, needles: tuple[str, ...]) -> bool:
+    for needle in needles:
+        pattern = rf"(?<![A-Za-z0-9]){re.escape(needle.lower())}(?![A-Za-z0-9])"
+        if re.search(pattern, text.lower()):
+            return True
+    return False
+
+
 def infer_semantic_branch(text: str, fallback: str = "research/general") -> str:
-    normalized = text.lower()
     for branch, needles in BRANCH_PATTERNS:
-        if any(needle in normalized for needle in needles):
+        if text_matches_any(text, needles):
             return branch
     return fallback
 
@@ -56,9 +63,8 @@ def branch_for_task(task: ResearchTask, agent_specs: list[AgentSpec] | None = No
 
 def tags_for_text(text: str) -> list[str]:
     tags = []
-    lowered = text.lower()
     for branch, needles in BRANCH_PATTERNS:
-        if any(needle in lowered for needle in needles):
+        if text_matches_any(text, needles):
             tags.append(branch.replace("/", ":"))
     return sorted(set(tags))
 
