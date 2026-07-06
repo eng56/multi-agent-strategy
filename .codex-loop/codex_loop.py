@@ -23,12 +23,14 @@ STATUSES = {
     "TESTING",
     "FAILED_CHECKS",
     "READY_FOR_REVIEW",
+    "NO_CHANGES",
     "MERGING",
     "MERGED",
     "COMPLETED_MANUALLY",
 }
 REVIEW_GATE_STATUSES = {"RUNNING_CODEX", "TESTING", "READY_FOR_REVIEW", "MERGING"}
-FINAL_STATUSES = {"COMPLETED_MANUALLY", "MERGED"}
+FINAL_STATUSES = {"COMPLETED_MANUALLY", "MERGED", "NO_CHANGES"}
+CONTINUE_SUCCESS_STATUSES = {"MERGED", "NO_CHANGES"}
 DEFAULT_CONFIG: dict[str, Any] = {
     "codex": {
         "command": ["codex", "exec"],
@@ -722,11 +724,11 @@ def stage_commit_push(
     state: dict[str, Any],
     state_path: Path,
     run_key: str,
-) -> str:
+) -> str | None:
     git(repo_root, ["add", "-A"])
     status = git_status_text(repo_root)
     if not status:
-        raise LoopError("No changes to commit after Codex and checks completed")
+        return None
     git(repo_root, ["commit", "-m", commit_message])
     commit_sha = git_stdout(repo_root, ["rev-parse", "HEAD"])
     git(repo_root, ["push", "-u", "origin", branch_name])
@@ -976,6 +978,21 @@ def run_one(
                 state_path,
                 run_key,
             )
+            if commit_sha is None:
+                result["status"] = "NO_CHANGES"
+                result["completed_at"] = isoformat()
+                result["base_branch"] = base_branch
+                set_status(state, state_path, prompt_key, "NO_CHANGES", run_key)
+                atomic_write_json(result_path, result)
+                switch_to_base_branch(
+                    repo_root,
+                    base_branch,
+                    bool_config(
+                        git_config.get("sync_base_branch_after_merge"),
+                        "git.sync_base_branch_after_merge",
+                    ),
+                )
+                return "NO_CHANGES"
             result["commit_sha"] = commit_sha
             atomic_write_json(result_path, result)
 
@@ -1084,6 +1101,7 @@ def print_dry_run(
     print("  - git push -u origin <branch>")
     print("  - gh pr create (if needed)")
     print("  - gh pr merge --merge --delete-branch")
+    print("  - or mark NO_CHANGES when checks pass without a commit-worthy diff")
     print("  - git switch <base-branch> && git pull --ff-only")
     print("Checks:")
     if checks:
@@ -1193,8 +1211,8 @@ def main() -> int:
                 args.mode,
             )
             processed.add(prompt_key)
-            if status != "MERGED" or not args.continue_on_success:
-                return 0 if status in {"READY_FOR_REVIEW", "MERGED"} else 1
+            if status not in CONTINUE_SUCCESS_STATUSES or not args.continue_on_success:
+                return 0 if status in {"READY_FOR_REVIEW", *CONTINUE_SUCCESS_STATUSES} else 1
 
             explicit_prompt = None
     except LoopError as error:
