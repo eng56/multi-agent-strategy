@@ -15,6 +15,7 @@ from src.agents.workflow import (
 )
 from src.integrations.llm import LLMOutputError
 from src.common.models import (
+    ActionStatus,
     AgentSpec,
     Artifact,
     ArtifactPointer,
@@ -568,7 +569,66 @@ def test_execute_tool_failure_does_not_record_executed_tool_action() -> None:
 
     rt.tools = FailingTools()
 
-    try:
+    asyncio.run(
+        execute_tool(
+            rt,
+            EventEnvelope(
+                type=EventType.TASK_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"task_id": str(task.id)},
+            ),
+        )
+    )
+
+    assert rt.blackboard.tasks[0].status == "failed"
+    assert rt.blackboard.observations == []
+    assert not any(
+        artifact.artifact_type == ArtifactType.OBSERVATION for artifact in rt.blackboard.artifacts
+    )
+    assert not any(
+        action.action_type == PrincipalActionType.REQUEST_TOOL_CALL
+        and action.status == ActionStatus.EXECUTED
+        for action in rt.blackboard.actions
+    )
+    assert any(
+        action.action_type == PrincipalActionType.REQUEST_TOOL_CALL
+        and action.status == ActionStatus.FAILED
+        and "Task failed during tool_execution" in action.reason
+        for action in rt.blackboard.actions
+    )
+
+
+def test_one_failed_task_does_not_prevent_another_task_from_completing() -> None:
+    run = Run(
+        question="Should I buy SAP stock?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    failing_task = ResearchTask(
+        run_id=run.id,
+        title="SAP failed query",
+        question="fail SAP query",
+        tool="web_search",
+    )
+    successful_task = ResearchTask(
+        run_id=run.id,
+        title="SAP stock catalysts",
+        question="SAP stock catalysts",
+        tool="web_search",
+    )
+    rt = runtime(run, QueueLLM({"summary": "SAP has cloud catalysts."}))
+    rt.blackboard.tasks.extend([failing_task, successful_task])
+
+    class PartlyFailingTools(FakeTools):
+        async def web_search(self, _run_id, query):
+            if "fail" in query:
+                raise RuntimeError("tool failed")
+            return await super().web_search(_run_id, query)
+
+    rt.tools = PartlyFailingTools()
+
+    for task in [failing_task, successful_task]:
         asyncio.run(
             execute_tool(
                 rt,
@@ -580,11 +640,56 @@ def test_execute_tool_failure_does_not_record_executed_tool_action() -> None:
                 ),
             )
         )
-    except RuntimeError:
-        pass
 
-    assert not any(
-        action.action_type == PrincipalActionType.REQUEST_TOOL_CALL
+    statuses = {task.id: task.status for task in rt.blackboard.tasks}
+    assert statuses[failing_task.id] == "failed"
+    assert statuses[successful_task.id] == "completed"
+    assert len(rt.blackboard.observations) == 1
+    assert rt.blackboard.observations[0].task_id == successful_task.id
+    assert rt.blackboard.run.status == RunStatus.CREATED
+
+
+def test_claim_generation_failure_marks_only_that_task_failed() -> None:
+    run = Run(
+        question="Should I buy SAP stock?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="SAP stock catalysts",
+        question="SAP stock catalysts",
+        tool="web_search",
+        status="completed",
+    )
+    observation_id = uuid4()
+    observation = SimpleNamespace(
+        id=observation_id,
+        run_id=run.id,
+        task_id=task.id,
+        summary="SAP cloud backlog is rising.",
+        sources=["https://example.com/sap"],
+    )
+    rt = runtime(run, QueueLLM(RuntimeError("claim model failed")))
+    rt.blackboard.tasks.append(task)
+    rt.blackboard.observations.append(observation)
+
+    asyncio.run(
+        create_claim(
+            rt,
+            EventEnvelope(
+                type=EventType.OBSERVATION_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"observation_id": str(observation_id)},
+            ),
+        )
+    )
+
+    assert rt.blackboard.tasks[0].status == "failed"
+    assert rt.blackboard.claims == []
+    assert any(
+        action.status == ActionStatus.FAILED and "claim_generation" in action.reason
         for action in rt.blackboard.actions
     )
 
@@ -679,6 +784,97 @@ def test_aggregate_failure_does_not_record_executed_aggregation_action() -> None
     assert not any(
         action.action_type == PrincipalActionType.REQUEST_AGGREGATION
         for action in rt.blackboard.actions
+    )
+
+
+def test_aggregation_proceeds_with_verified_partial_evidence_after_task_failure() -> None:
+    run = Run(
+        question="Should I buy SAP?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    completed_task = ResearchTask(
+        run_id=run.id, title="SAP", question="SAP stock", tool="web_search", status="completed"
+    )
+    failed_task = ResearchTask(
+        run_id=run.id,
+        title="SAP macro risk",
+        question="SAP macro risk",
+        tool="web_search",
+        status="failed",
+    )
+    claim = Claim(
+        run_id=run.id,
+        task_id=completed_task.id,
+        statement="SAP has positive momentum.",
+        evidence_observation_ids=[uuid4()],
+        confidence=0.8,
+    )
+    verification = Verification(
+        run_id=run.id, claim_id=claim.id, verdict="verified", rationale="Supported.", confidence=0.7
+    )
+    rt = runtime(run, QueueLLM({"answer": "Partial evidence supports SAP."}))
+    rt.blackboard.tasks.extend([completed_task, failed_task])
+    rt.blackboard.claims.append(claim)
+    rt.blackboard.verifications.append(verification)
+
+    asyncio.run(
+        aggregate(rt, EventEnvelope(type=EventType.CLAIM_VERIFIED, run_id=run.id, producer="test"))
+    )
+
+    assert rt.blackboard.final is not None
+    assert rt.blackboard.final.verified_claim_ids == [claim.id]
+    assert "Partial evidence supports SAP." in rt.blackboard.final.answer
+
+
+def test_all_tasks_failing_produces_clear_terminal_status() -> None:
+    run = Run(
+        question="Should I buy SAP stock?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    tasks = [
+        ResearchTask(
+            run_id=run.id,
+            title="SAP catalysts",
+            question="SAP catalysts",
+            tool="web_search",
+        ),
+        ResearchTask(
+            run_id=run.id,
+            title="SAP valuation",
+            question="SAP valuation",
+            tool="web_search",
+        ),
+    ]
+    rt = runtime(run, QueueLLM())
+    rt.blackboard.tasks.extend(tasks)
+
+    class FailingTools(FakeTools):
+        async def web_search(self, _run_id, _query):
+            raise RuntimeError("tool failed")
+
+    rt.tools = FailingTools()
+
+    for task in tasks:
+        asyncio.run(
+            execute_tool(
+                rt,
+                EventEnvelope(
+                    type=EventType.TASK_CREATED,
+                    run_id=run.id,
+                    producer="test",
+                    payload={"task_id": str(task.id)},
+                ),
+            )
+        )
+
+    assert all(task.status == "failed" for task in rt.blackboard.tasks)
+    assert rt.blackboard.run.status == RunStatus.FAILED
+    assert rt.blackboard.run.failure_reason
+    assert "All 2 research task(s) failed" in rt.blackboard.run.failure_reason
+    assert any(
+        action.action_type == PrincipalActionType.STOP_RUN for action in rt.blackboard.actions
     )
 
 

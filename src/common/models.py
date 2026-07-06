@@ -18,6 +18,7 @@ class AgentRole(StrEnum):
 class EventType(StrEnum):
     RUN_CREATED = "run.created"
     TASK_CREATED = "task.created"
+    TASK_FAILED = "task.failed"
     CLAIM_CREATED = "claim.created"
     OBSERVATION_CREATED = "observation.created"
     CLAIM_VERIFIED = "claim.verified"
@@ -60,6 +61,7 @@ class ActionStatus(StrEnum):
     APPROVED = "approved"
     REJECTED = "rejected"
     EXECUTED = "executed"
+    FAILED = "failed"
 
 
 class AgentStatus(StrEnum):
@@ -322,6 +324,7 @@ class RunState(BaseModel):
     active_branches: list[str] = Field(default_factory=list)
     known_facts: list[str] = Field(default_factory=list)
     open_questions: list[str] = Field(default_factory=list)
+    failed_tasks: list[str] = Field(default_factory=list)
     verified_claim_count: int = 0
     rejected_claim_count: int = 0
     disputed_claim_count: int = 0
