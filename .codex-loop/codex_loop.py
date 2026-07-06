@@ -23,9 +23,12 @@ STATUSES = {
     "TESTING",
     "FAILED_CHECKS",
     "READY_FOR_REVIEW",
+    "MERGING",
+    "MERGED",
     "COMPLETED_MANUALLY",
 }
-REVIEW_GATE_STATUSES = {"RUNNING_CODEX", "TESTING", "READY_FOR_REVIEW"}
+REVIEW_GATE_STATUSES = {"RUNNING_CODEX", "TESTING", "READY_FOR_REVIEW", "MERGING"}
+FINAL_STATUSES = {"COMPLETED_MANUALLY", "MERGED"}
 DEFAULT_CONFIG: dict[str, Any] = {
     "codex": {
         "command": ["codex", "exec"],
@@ -35,8 +38,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "checks": [["ruff", "check", "."], ["pytest"]],
     "git": {
         "create_branch": True,
-        "commit_on_success": False,
-        "push_on_success": False,
+        "commit_on_success": True,
+        "push_on_success": True,
+        "create_pr_on_success": True,
+        "merge_pr_on_success": True,
+        "delete_branch_on_merge": True,
+        "sync_base_branch_after_merge": True,
     },
     "security": {
         "env_file_by_mode": {
@@ -248,10 +255,18 @@ def load_config(loop_dir: Path, explicit_path: str | None) -> tuple[dict[str, An
     if codex.get("pass_prompt_as") not in {"stdin", "argument"}:
         raise LoopError("codex.pass_prompt_as must be 'stdin' or 'argument'")
     validate_checks(config.get("checks"))
-    if git_config.get("commit_on_success") is not False:
-        raise LoopError("git.commit_on_success must remain false in v1")
-    if git_config.get("push_on_success") is not False:
-        raise LoopError("git.push_on_success must remain false in v1")
+    for key in (
+        "commit_on_success",
+        "push_on_success",
+        "create_pr_on_success",
+        "merge_pr_on_success",
+        "delete_branch_on_merge",
+        "sync_base_branch_after_merge",
+    ):
+        if key not in git_config:
+            raise LoopError(f"git.{key} must be set")
+        if not isinstance(git_config[key], bool):
+            raise LoopError(f"git.{key} must be a boolean")
     if not isinstance(security.get("env_file_by_mode"), dict):
         raise LoopError("security.env_file_by_mode must be a mapping")
     if security.get("redact_env_values_in_logs") is not True:
@@ -323,6 +338,7 @@ def select_prompt(
     repo_root: Path,
     explicit_prompt: str | None,
     processed: set[str],
+    queue_order: list[str] | None,
 ) -> Path | None:
     if explicit_prompt:
         path = Path(explicit_prompt)
@@ -334,16 +350,20 @@ def select_prompt(
             raise LoopError(f"Prompt must be a markdown file: {path}")
         return path
 
-    prompt_paths = sorted(prompts_dir.glob("*.md"), key=lambda item: item.name)
-    if not prompt_paths:
+    if queue_order is None:
+        queue_order = [path.name for path in sorted(prompts_dir.glob("*.md"), key=lambda item: item.name)]
+    if not queue_order:
         raise LoopError(f"No markdown prompts found in {prompts_dir}")
 
-    for path in prompt_paths:
+    for name in queue_order:
+        path = prompts_dir / name
+        if path.suffix.lower() != ".md" or not path.is_file():
+            continue
         key = repo_relative(path, repo_root)
         if key in processed:
             continue
         status = state.get("prompts", {}).get(key, {}).get("status")
-        if status == "COMPLETED_MANUALLY":
+        if status in FINAL_STATUSES:
             continue
         if status in REVIEW_GATE_STATUSES:
             raise LoopError(
@@ -358,6 +378,18 @@ def safe_stem(path: Path) -> str:
     if not stem:
         raise LoopError(f"Prompt filename does not produce a safe branch name: {path.name}")
     return stem[:60]
+
+
+def load_queue_order(loop_dir: Path) -> list[str] | None:
+    path = loop_dir / "QUEUE_ORDER.md"
+    if not path.is_file():
+        return None
+    order: list[str] = []
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        match = re.match(r"\s*\d+\.\s+`([^`]+)`", raw_line)
+        if match:
+            order.append(match.group(1))
+    return order or None
 
 
 def build_names(prompt_path: Path, started_at: datetime) -> tuple[str, str]:
@@ -382,6 +414,10 @@ def git(repo_root: Path, arguments: list[str], check: bool = True) -> subprocess
     return result
 
 
+def git_stdout(repo_root: Path, arguments: list[str]) -> str:
+    return git(repo_root, arguments, check=True).stdout.strip()
+
+
 def ensure_clean_worktree(repo_root: Path) -> None:
     status = git(repo_root, ["status", "--porcelain", "--untracked-files=all"]).stdout
     if status.strip():
@@ -389,6 +425,68 @@ def ensure_clean_worktree(repo_root: Path) -> None:
             "Git worktree is not clean. Commit, stash, or otherwise resolve existing changes "
             "before running Codex."
         )
+
+
+def current_branch(repo_root: Path) -> str:
+    return git_stdout(repo_root, ["branch", "--show-current"])
+
+
+def default_branch(repo_root: Path) -> str:
+    result = subprocess.run(
+        ["gh", "repo", "view", "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"],
+        cwd=repo_root,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        local = git(repo_root, ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], check=False)
+        if local.returncode == 0:
+            ref = local.stdout.strip()
+            if ref:
+                return ref.rsplit("/", 1)[-1]
+        for candidate in ("main", "master", "trunk"):
+            if git(repo_root, ["show-ref", "--verify", "--quiet", f"refs/heads/{candidate}"], check=False).returncode == 0:
+                return candidate
+            if git(repo_root, ["show-ref", "--verify", "--quiet", f"refs/remotes/origin/{candidate}"], check=False).returncode == 0:
+                return candidate
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise LoopError(f"Could not determine default branch with gh: {detail}")
+    branch = result.stdout.strip()
+    if not branch:
+        local = git(repo_root, ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], check=False)
+        if local.returncode == 0:
+            ref = local.stdout.strip()
+            if ref:
+                return ref.rsplit("/", 1)[-1]
+        for candidate in ("main", "master", "trunk"):
+            if git(repo_root, ["show-ref", "--verify", "--quiet", f"refs/heads/{candidate}"], check=False).returncode == 0:
+                return candidate
+            if git(repo_root, ["show-ref", "--verify", "--quiet", f"refs/remotes/origin/{candidate}"], check=False).returncode == 0:
+                return candidate
+        raise LoopError("Could not determine default branch with gh")
+    return branch
+
+
+def require_gh() -> None:
+    if shutil.which("gh") is None:
+        raise LoopError("gh is required for commit/push/PR merge automation")
+
+
+def gh(repo_root: Path, arguments: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        ["gh", *arguments],
+        cwd=repo_root,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if check and result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise LoopError(f"gh {shlex.join(arguments)} failed: {detail}")
+    return result
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -414,6 +512,12 @@ def load_env_file(path: Path) -> dict[str, str]:
     return values
 
 
+def bool_config(value: Any, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise LoopError(f"{label} must be a boolean")
+    return value
+
+
 def env_path_for_mode(config: dict[str, Any], mode: str, repo_root: Path) -> Path | None:
     mapping = config["security"]["env_file_by_mode"]
     if mode not in mapping:
@@ -425,6 +529,28 @@ def env_path_for_mode(config: dict[str, Any], mode: str, repo_root: Path) -> Pat
         raise LoopError(f"Environment path for mode '{mode}' must be a string or null")
     path = Path(raw_path)
     return path if path.is_absolute() else repo_root / path
+
+
+def prompt_title(metadata: dict[str, Any], prompt_path: Path) -> str:
+    title = metadata.get("title")
+    if isinstance(title, str) and title.strip():
+        return title.strip()
+    return prompt_path.stem.replace("-", " ").replace("_", " ").strip().title()
+
+
+def pr_body(prompt_key: str, prompt_body: str, checks: list[list[str]]) -> str:
+    checks_text = "\n".join(f"- {shlex.join(command)}" for command in checks)
+    body = [
+        f"Automated Codex run for `{prompt_key}`.",
+        "",
+        f"Prompt file: `{prompt_key}`",
+        "",
+        "Checks:",
+        checks_text if checks_text else "- none",
+    ]
+    if prompt_body.strip():
+        body.extend(["", "Prompt body:", "```markdown", prompt_body.strip(), "```"])
+    return "\n".join(body)
 
 
 def redact(text: str, secret_values: list[str], enabled: bool) -> str:
@@ -523,6 +649,11 @@ def execute_checks(
     return results
 
 
+def git_status_text(repo_root: Path) -> str:
+    status = git(repo_root, ["status", "--short", "--untracked-files=all"], check=False)
+    return status.stdout.strip()
+
+
 def skip_untracked_diff(name: str) -> bool:
     path = Path(name)
     parts = path.parts
@@ -583,6 +714,80 @@ def capture_git_artifacts(
     )
 
 
+def stage_commit_push(
+    repo_root: Path,
+    branch_name: str,
+    commit_message: str,
+    prompt_key: str,
+    state: dict[str, Any],
+    state_path: Path,
+    run_key: str,
+) -> str:
+    git(repo_root, ["add", "-A"])
+    status = git_status_text(repo_root)
+    if not status:
+        raise LoopError("No changes to commit after Codex and checks completed")
+    git(repo_root, ["commit", "-m", commit_message])
+    commit_sha = git_stdout(repo_root, ["rev-parse", "HEAD"])
+    git(repo_root, ["push", "-u", "origin", branch_name])
+    return commit_sha
+
+
+def find_open_pr_number(repo_root: Path, branch_name: str) -> str | None:
+    result = gh(
+        repo_root,
+        ["pr", "list", "--head", branch_name, "--state", "open", "--json", "number", "--jq", ".[0].number"],
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise LoopError(f"Could not inspect pull requests for {branch_name}: {detail}")
+    return result.stdout.strip() or None
+
+
+def create_pr(repo_root: Path, branch_name: str, title: str, body: str) -> tuple[str, str]:
+    result = gh(
+        repo_root,
+        [
+            "pr",
+            "create",
+            "--head",
+            branch_name,
+            "--title",
+            title,
+            "--body",
+            body,
+        ],
+    )
+    url = result.stdout.strip()
+    if not url:
+        raise LoopError("gh pr create did not return a PR URL")
+    number = gh(
+        repo_root,
+        ["pr", "view", "--head", branch_name, "--json", "number", "--jq", ".number"],
+    ).stdout.strip()
+    if not number:
+        raise LoopError("Could not determine created PR number")
+    return number, url
+
+
+def merge_pr(
+    repo_root: Path,
+    pr_number: str,
+    delete_branch: bool,
+) -> None:
+    arguments = ["pr", "merge", pr_number, "--merge"]
+    if delete_branch:
+        arguments.append("--delete-branch")
+    gh(repo_root, arguments)
+
+
+def switch_to_base_branch(repo_root: Path, base_branch: str, sync: bool) -> None:
+    git(repo_root, ["switch", base_branch])
+    if sync:
+        git(repo_root, ["pull", "--ff-only", "origin", base_branch])
+
+
 def unique_run_dir(runs_dir: Path, base_name: str) -> Path:
     candidate = runs_dir / base_name
     counter = 2
@@ -607,6 +812,10 @@ def prepare_environment(
     return environment, list(loaded.values()), env_file
 
 
+def git_publish_enabled(config: dict[str, Any], key: str) -> bool:
+    return bool_config(config["git"].get(key), f"git.{key}")
+
+
 def run_one(
     prompt_path: Path,
     repo_root: Path,
@@ -623,6 +832,7 @@ def run_one(
         if "checks" in metadata
         else validate_checks(config["checks"])
     )
+    git_config = config["git"]
     environment, secrets, _ = prepare_environment(config, metadata, mode, repo_root)
     redact_enabled = bool(config["security"].get("redact_env_values_in_logs", True))
 
@@ -654,6 +864,7 @@ def run_one(
     }
     atomic_write_json(result_path, result)
     set_status(state, state_path, prompt_key, "PENDING", run_key)
+    artifacts_captured = False
 
     try:
         if config["git"].get("create_branch", True):
@@ -703,17 +914,97 @@ def run_one(
             set_status(state, state_path, prompt_key, "FAILED_CHECKS", run_key)
             return "FAILED_CHECKS"
 
+        capture_git_artifacts(repo_root, diff_path, status_path, secrets, redact_enabled)
+        artifacts_captured = True
         result["status"] = "READY_FOR_REVIEW"
         set_status(state, state_path, prompt_key, "READY_FOR_REVIEW", run_key)
-        return "READY_FOR_REVIEW"
+
+        publish_enabled = (
+            git_publish_enabled(config, "commit_on_success")
+            and git_publish_enabled(config, "push_on_success")
+            and git_publish_enabled(config, "merge_pr_on_success")
+        )
+        if not publish_enabled:
+            return "READY_FOR_REVIEW"
+
+        require_gh()
+        base_branch = default_branch(repo_root)
+        commit_message = prompt_title(metadata, prompt_path)
+        result["status"] = "MERGING"
+        set_status(state, state_path, prompt_key, "MERGING", run_key)
+        atomic_write_json(result_path, result)
+
+        try:
+            commit_sha = stage_commit_push(
+                repo_root,
+                branch_name,
+                commit_message,
+                prompt_key,
+                state,
+                state_path,
+                run_key,
+            )
+            result["commit_sha"] = commit_sha
+            atomic_write_json(result_path, result)
+
+            pr_number = find_open_pr_number(repo_root, branch_name)
+            if pr_number is None:
+                if not git_publish_enabled(config, "create_pr_on_success"):
+                    raise LoopError("No open PR exists for the successful branch")
+                pr_number, pr_url = create_pr(
+                    repo_root,
+                    branch_name,
+                    prompt_title(metadata, prompt_path),
+                    pr_body(prompt_key, prompt_body, checks),
+                )
+                result["pr_url"] = pr_url
+            else:
+                pr_url = gh(
+                    repo_root,
+                    ["pr", "view", pr_number, "--json", "url", "--jq", ".url"],
+                ).stdout.strip()
+                if pr_url:
+                    result["pr_url"] = pr_url
+            result["pr_number"] = pr_number
+            atomic_write_json(result_path, result)
+
+            merge_pr(
+                repo_root,
+                pr_number,
+                bool_config(git_config.get("delete_branch_on_merge"), "git.delete_branch_on_merge"),
+            )
+            result["status"] = "MERGED"
+            result["merged_at"] = isoformat()
+            result["base_branch"] = base_branch
+            set_status(state, state_path, prompt_key, "MERGED", run_key)
+            atomic_write_json(result_path, result)
+
+            switch_to_base_branch(
+                repo_root,
+                base_branch,
+                bool_config(
+                    git_config.get("sync_base_branch_after_merge"),
+                    "git.sync_base_branch_after_merge",
+                ),
+            )
+            return "MERGED"
+        except LoopError as error:
+            codex_log.write_text(
+                codex_log.read_text(encoding="utf-8") + f"\nPublish error: {error}\n",
+                encoding="utf-8",
+            )
+            result["status"] = "READY_FOR_REVIEW"
+            set_status(state, state_path, prompt_key, "READY_FOR_REVIEW", run_key)
+            atomic_write_json(result_path, result)
+            raise
     except LoopError as error:
-        codex_log.write_text(f"Orchestration error: {error}\n", encoding="utf-8")
-        checks_log.write_text("Checks skipped because orchestration failed.\n", encoding="utf-8")
-        result["status"] = "CODEX_FAILED"
-        set_status(state, state_path, prompt_key, "CODEX_FAILED", run_key)
-        return "CODEX_FAILED"
+        if not artifacts_captured:
+            codex_log.write_text(f"Orchestration error: {error}\n", encoding="utf-8")
+            checks_log.write_text("Checks skipped because orchestration failed.\n", encoding="utf-8")
+            result["status"] = "CODEX_FAILED"
+            set_status(state, state_path, prompt_key, "CODEX_FAILED", run_key)
+        raise
     finally:
-        capture_git_artifacts(repo_root, diff_path, status_path, secrets, redact_enabled)
         result["finished_at"] = isoformat()
         atomic_write_json(result_path, result)
         print(f"Run directory: {run_key}")
@@ -738,6 +1029,7 @@ def print_dry_run(
     if env_file is not None and metadata.get("allow_secrets") is False:
         raise LoopError("This prompt sets allow_secrets: false and cannot run in a secrets mode")
     _, branch_name = build_names(prompt_path, utc_now())
+    base_branch = default_branch(repo_root)
     codex_config = config["codex"]
     command = validate_command_list(codex_config["command"], "codex.command")
     command += list(codex_config.get("args", []))
@@ -752,6 +1044,15 @@ def print_dry_run(
         + (repo_relative(env_file, repo_root) if env_file is not None else "none")
     )
     print(f"Codex command: {display_command(command, codex_config['pass_prompt_as'])}")
+    print(f"Commit message: {prompt_title(metadata, prompt_path)}")
+    print(f"Base branch: {base_branch}")
+    print("Publish flow:")
+    print("  - git add -A")
+    print("  - git commit")
+    print("  - git push -u origin <branch>")
+    print("  - gh pr create (if needed)")
+    print("  - gh pr merge --merge --delete-branch")
+    print("  - git switch <base-branch> && git pull --ff-only")
     print("Checks:")
     if checks:
         for check in checks:
@@ -814,6 +1115,7 @@ def main() -> int:
         config, config_path = load_config(loop_dir, args.config)
         state_path = loop_dir / "state.json"
         state = load_state(state_path)
+        queue_order = load_queue_order(loop_dir)
 
         if args.mark_completed:
             if args.dry_run:
@@ -831,6 +1133,7 @@ def main() -> int:
                 repo_root,
                 explicit_prompt,
                 processed,
+                queue_order,
             )
             if prompt_path is None:
                 print("No pending prompts.")
@@ -858,16 +1161,10 @@ def main() -> int:
                 args.mode,
             )
             processed.add(prompt_key)
-            if status != "READY_FOR_REVIEW" or not args.continue_on_success:
-                return 0 if status == "READY_FOR_REVIEW" else 1
+            if status != "MERGED" or not args.continue_on_success:
+                return 0 if status in {"READY_FOR_REVIEW", "MERGED"} else 1
 
             explicit_prompt = None
-            if git(repo_root, ["status", "--porcelain", "--untracked-files=all"]).stdout.strip():
-                print(
-                    "Stopped after success: the worktree has changes to review, so another task "
-                    "cannot safely receive its own branch."
-                )
-                return 0
     except LoopError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2

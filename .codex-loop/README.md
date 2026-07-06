@@ -2,13 +2,14 @@
 
 This directory contains a deliberately small local orchestration loop. It selects
 one markdown prompt, creates a task branch, runs Codex CLI, runs configured checks,
-and saves everything needed for human review. It never pushes, merges, deploys, or
-commits.
+captures artifacts, then commits, pushes, opens or reuses the PR, merges it, and
+switches back to the base branch before moving to the next queued prompt.
 
 ## Setup
 
 The loop uses `.codex-loop/config.example.yaml` when no local config exists. To
-customize the Codex command or checks, create the ignored local config:
+customize the Codex command, checks, or publish behavior, create the ignored local
+config:
 
 ```sh
 cp .codex-loop/config.example.yaml .codex-loop/config.yaml
@@ -21,10 +22,11 @@ dependency is required.
 The worktree must be clean before a real run. This prevents existing local changes
 from leaking into a new task branch.
 
-## Add and run a prompt
+## Add and run prompts
 
-Add normal markdown files to `.codex-loop/prompts/`. Names determine queue order,
-so use numeric prefixes:
+Add normal markdown files to `.codex-loop/prompts/`. The loop uses
+`.codex-loop/QUEUE_ORDER.md` when present, so keep that file in sync with the
+prompt bundle. A numbered filename still helps as a fallback:
 
 ```text
 .codex-loop/prompts/001-fix-planner.md
@@ -37,7 +39,7 @@ Preview the first pending prompt without changing files or git state:
 python .codex-loop/codex_loop.py --dry-run
 ```
 
-Run one prompt (the default always stops after one):
+Run one prompt:
 
 ```sh
 python .codex-loop/codex_loop.py
@@ -50,9 +52,9 @@ python .codex-loop/codex_loop.py \
   --prompt .codex-loop/prompts/001-example.md
 ```
 
-`--continue-on-success` permits selection of another prompt, but only if the first
-task leaves the worktree clean. Since v1 does not auto-commit, normal code-changing
-runs stop for review even with this flag.
+`--continue-on-success` permits selection of another prompt after a successful
+merge. The loop switches back to the base branch first, so the next prompt starts
+from a clean branch.
 
 ## Optional frontmatter
 
@@ -90,20 +92,15 @@ Each real run writes:
 
 Inspect `result.json`, `git.diff`, `git.status`, and `checks.log`. Then inspect the
 live worktree with `git diff` and run any additional checks you need. If the result
-is acceptable, commit and push manually:
+is acceptable, the loop will commit, push, and merge automatically when the git
+publish toggles are enabled.
 
-```sh
-git add <reviewed-files>
-git commit -m "Describe the reviewed change"
-git push -u origin "$(git branch --show-current)"
-```
+If you want to manage the PR yourself, disable the publish toggles in
+`.codex-loop/config.yaml`. In that mode the loop still leaves you with the diff and
+checks artifacts, but it will stop at `READY_FOR_REVIEW`.
 
-Open a pull request manually after pushing. Nothing in this loop opens one.
-Before starting the next independent prompt, switch back to the intended base
-branch and update it; the loop always branches from the currently checked-out
-commit.
-
-After review, mark the prompt complete:
+After a manual review, mark the prompt complete only if you are archiving it
+instead of merging it:
 
 ```sh
 python .codex-loop/codex_loop.py \
@@ -124,8 +121,8 @@ python .codex-loop/codex_loop.py \
   --prompt .codex-loop/prompts/001-example.md
 ```
 
-An interrupted `RUNNING_CODEX` or `TESTING` state is a review gate. Inspect the
-last run, clean up deliberately, and use `--prompt` to retry it.
+An interrupted `RUNNING_CODEX`, `TESTING`, or `MERGING` state is a review gate.
+Inspect the last run, clean up deliberately, and use `--prompt` to retry it.
 
 ## Modes and credential safety
 
@@ -150,13 +147,15 @@ credentials that a code-mode subprocess should not receive.
 
 ## Recommended workflow
 
-1. Add one focused prompt.
+1. Add one focused prompt and update `QUEUE_ORDER.md`.
 2. Run the loop.
-3. Inspect `git.diff` and the live `git diff`.
+3. Inspect `git.diff`, `git.status`, and the live `git diff`.
 4. Inspect `checks.log`.
-5. Manually commit, push, and open a PR.
-6. Mark the prompt completed manually.
-7. Return to the intended base branch before starting the next prompt.
+5. Let the loop commit, push, and merge, or disable the publish toggles and do
+   those steps manually.
+6. Mark the prompt completed manually only when you are intentionally archiving it
+   instead of merging it.
 
 The recorded statuses are `PENDING`, `RUNNING_CODEX`, `CODEX_FAILED`, `TESTING`,
-`FAILED_CHECKS`, `READY_FOR_REVIEW`, and `COMPLETED_MANUALLY`.
+`FAILED_CHECKS`, `READY_FOR_REVIEW`, `MERGING`, `MERGED`, and
+`COMPLETED_MANUALLY`.

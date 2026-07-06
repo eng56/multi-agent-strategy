@@ -12,8 +12,12 @@ checks:
 
 git:
   create_branch: true
-  commit_on_success: false
-  push_on_success: false
+  commit_on_success: true
+  push_on_success: true
+  create_pr_on_success: true
+  merge_pr_on_success: true
+  delete_branch_on_merge: true
+  sync_base_branch_after_merge: true
 
 security:
   env_file_by_mode:
