@@ -4,9 +4,12 @@ from typing import AsyncIterator
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import JSONResponse
 
-from src.common.config import get_settings
+from src.api.health import health_payload, missing_runtime_payload, readiness_payload
 from src.agents.state import build_run_state
+from src.common.config import get_settings
+from src.common.health import build_version_info
 from src.common.models import (
     AgentSpec,
     Artifact,
@@ -44,8 +47,26 @@ def require_api_token(x_api_key: str = Header(default="")) -> None:
 
 
 @app.get("/healthz")
-def healthz() -> dict[str, str]:
-    return {"status": "ok"}
+def healthz() -> dict[str, object]:
+    return health_payload()
+
+
+@app.get("/health")
+def health() -> dict[str, object]:
+    return health_payload()
+
+
+@app.get("/version")
+def version() -> dict[str, str | None]:
+    return build_version_info()
+
+
+@app.get("/ready")
+async def ready() -> JSONResponse:
+    runtime = getattr(app.state, "runtime", None)
+    payload = await readiness_payload(runtime) if runtime else await missing_runtime_payload()
+    status_code = 200 if payload["status"] == "ok" else 503
+    return JSONResponse(status_code=status_code, content=payload)
 
 
 @app.get("/v1/models/openrouter")

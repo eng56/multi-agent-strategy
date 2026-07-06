@@ -16,6 +16,7 @@ class AgentRole(StrEnum):
 
 
 class EventType(StrEnum):
+    HEALTH_CHECK = "health.check"
     RUN_CREATED = "run.created"
     TASK_CREATED = "task.created"
     TASK_FAILED = "task.failed"

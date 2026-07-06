@@ -52,6 +52,8 @@ jobs:
             echo "SMOKE_TIMEOUT_SECONDS=600"
             echo "SMOKE_POLL_SECONDS=10"
           } >> "$GITHUB_ENV"
+      - name: Check deployed health and version
+        run: bash scripts/check-deployment.sh --expect-sha "$GITHUB_SHA"
       - name: Run deployed smoke test
         run: bash scripts/smoke-run-fed-cut.sh
       - name: Prepare smoke artifact
