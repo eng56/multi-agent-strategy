@@ -4,12 +4,14 @@ from typing import Any
 from uuid import UUID
 
 from src.agents.state import (
+    build_run_state,
     branch_for_task,
     infer_semantic_branch,
     tags_for_text,
     text_matches_any,
     title_from_branch,
 )
+from src.agents.knowledge_router import select_context_for_agent
 from src.common.budget import BudgetExceeded
 from src.common.failures import PermanentEventError, concise_exception, is_transient_failure
 from src.common.models import (
@@ -900,6 +902,48 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
     run = await runtime.blackboard.get_run(event.run_id)
     if not run:
         return
+    agent_specs = await runtime.blackboard.list_models(event.run_id, "agent_specs", AgentSpec)
+    aggregator_spec = next(
+        (
+            spec
+            for spec in agent_specs
+            if spec.role_template == "aggregator_agent" or spec.branch == "synthesis/aggregator"
+        ),
+        None,
+    ) or AgentSpec(
+        run_id=event.run_id,
+        name="aggregator",
+        role_template="aggregator_agent",
+        branch="synthesis/aggregator",
+        objective="Synthesize trusted claims into a decision-grade final report.",
+    )
+    artifacts = await runtime.blackboard.list_models(event.run_id, "artifacts", Artifact)
+    run_state = build_run_state(
+        run,
+        tasks,
+        claims,
+        verifications,
+        agent_specs=agent_specs or [aggregator_spec],
+        artifacts=artifacts,
+    )
+    routed_artifacts = select_context_for_agent(
+        agent_spec=aggregator_spec,
+        run_state=run_state,
+        artifacts=artifacts,
+        tasks=tasks,
+    )
+    routed_context = [
+        {
+            "id": str(artifact.id),
+            "type": artifact.artifact_type.value,
+            "branch": artifact.branch,
+            "status": artifact.status.value,
+            "confidence": artifact.confidence,
+            "summary": artifact.text_or_summary,
+            "sources": artifact.source_refs,
+        }
+        for artifact in routed_artifacts
+    ]
     result = await runtime.llm.json(
         event.run_id,
         AgentRole.AGGREGATOR,
@@ -907,7 +951,8 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
         SYSTEM,
         f"Answer the investment question using only verified claims. Include risks, opportunities, "
         f'and limitations. Return {{"answer":"..."}}. Question: {run.question}. Claims: '
-        f"{json.dumps([value.model_dump(mode='json') for value in verified])}",
+        f"{json.dumps([value.model_dump(mode='json') for value in verified])}. "
+        f"Routed artifact context: {json.dumps(routed_context)[:12000]}",
     )
     final = FinalReport(
         run_id=event.run_id,
