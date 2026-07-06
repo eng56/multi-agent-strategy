@@ -1,12 +1,17 @@
 import json
 import logging
+import re
 from typing import Any
 from uuid import UUID
 
 from src.agents.state import (
+    FOLLOWUP_JUDGE_SCORE_THRESHOLD,
+    MAX_FOLLOWUP_WAVES,
     build_run_state,
     branch_for_task,
     infer_semantic_branch,
+    max_task_wave,
+    should_reaggregate_after_followup,
     tags_for_text,
     text_matches_any,
     title_from_branch,
@@ -184,6 +189,99 @@ def score_from_model_field(value: Any) -> float:
     if score > 1 and score <= 10:
         score /= 10
     return max(0, min(1, score))
+
+
+def flatten_feedback_values(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        values: list[str] = []
+        for item in value.values():
+            values.extend(flatten_feedback_values(item))
+        return values
+    if isinstance(value, list):
+        values = []
+        for item in value:
+            values.extend(flatten_feedback_values(item))
+        return values
+    return [str(value)]
+
+
+def feedback_focus_items(feedback: str | None) -> list[str]:
+    raw_values: list[str] = []
+    if feedback:
+        parsed: Any | None = None
+        if feedback.lstrip().startswith(("{", "[")):
+            try:
+                parsed = json.loads(feedback)
+            except json.JSONDecodeError:
+                parsed = None
+        raw_values = flatten_feedback_values(parsed) if parsed is not None else [feedback]
+
+    segments: list[str] = []
+    for value in raw_values:
+        for segment in re.split(r"(?:\n+|(?<=[.!?;])\s+)", value):
+            clean = re.sub(r"^[\s\-*\d.)]+", "", segment).strip()
+            clean = re.sub(r"\s+", " ", clean)
+            if clean:
+                segments.append(clean)
+
+    if not segments:
+        segments.append("Strengthen weak evidence, coverage, or usefulness gaps.")
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for segment in segments:
+        key = segment.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(segment)
+        if len(deduped) == 3:
+            break
+    return deduped
+
+
+def followup_title(focus: str) -> str:
+    title_words = re.sub(r"[^A-Za-z0-9]+", " ", focus).strip().split()
+    if not title_words:
+        title_words = ["evidence", "gap"]
+    return f"Follow-up: {' '.join(title_words[:8])}"[:80].rstrip()
+
+
+def followup_task_items(run: Run, final: FinalReport, wave_number: int) -> list[dict[str, Any]]:
+    score = final.judge_score if final.judge_score is not None else 0
+    items: list[dict[str, Any]] = []
+    for focus in feedback_focus_items(final.judge_feedback):
+        short_focus = focus[:500].rstrip()
+        reason = (
+            f"Judge score {score:.2f} below {FOLLOWUP_JUDGE_SCORE_THRESHOLD:.2f}: "
+            f"{short_focus}"
+        )
+        question = (
+            "Find targeted evidence addressing this quality feedback: "
+            f"{short_focus}. Original question: {run.question}"
+        )
+        items.append(
+            {
+                "title": followup_title(short_focus),
+                "question": question[:1000].rstrip(),
+                "tool": "web_search",
+                "wave_number": wave_number,
+                "reason": reason[:1000].rstrip(),
+            }
+        )
+    return items
+
+
+def followup_already_requested(
+    tasks: list[ResearchTask], actions: list[PrincipalAction]
+) -> bool:
+    return max_task_wave(tasks) >= MAX_FOLLOWUP_WAVES or any(
+        action.action_type == PrincipalActionType.REQUEST_FOLLOWUP for action in actions
+    )
 
 
 def role_budget(run: Run, role: AgentRole) -> float:
@@ -595,6 +693,66 @@ async def plan(runtime: Runtime, event: EventEnvelope) -> None:
             run.id,
             planner_failure_reason(last_error, retry_used=retry_used, fallback_used=fallback_used),
         )
+
+
+async def request_followup_wave(
+    runtime: Runtime,
+    run: Run,
+    final: FinalReport,
+    existing_tasks: list[ResearchTask],
+) -> int:
+    wave_number = min(max_task_wave(existing_tasks) + 1, MAX_FOLLOWUP_WAVES)
+    score = final.judge_score if final.judge_score is not None else 0
+    reason = (
+        f"Judge score {score:.2f} below {FOLLOWUP_JUDGE_SCORE_THRESHOLD:.2f}; "
+        f"requesting targeted follow-up wave {wave_number}."
+    )
+    await persist_action(
+        runtime,
+        run.id,
+        PrincipalActionType.REQUEST_FOLLOWUP,
+        reason,
+        required_role="principal_policy",
+        target_branch="synthesis/judge",
+        expected_information_gain=InformationGain.MEDIUM,
+        priority=8,
+        producer="judge-agent",
+    )
+    emit(
+        runtime,
+        EventType.FOLLOWUP_REQUESTED,
+        run.id,
+        "judge-agent",
+        wave_number=wave_number,
+        judge_score=score,
+    )
+
+    created = 0
+    for item in followup_task_items(run, final, wave_number):
+        task = ResearchTask(run_id=run.id, **item)
+        await runtime.blackboard.put_task(task)
+        await persist_action(
+            runtime,
+            run.id,
+            PrincipalActionType.ASSIGN_TASK,
+            f"Follow-up wave {wave_number}: {task.reason or task.title}",
+            required_role="research_agent",
+            target_branch=branch_for_task(task),
+            expected_information_gain=InformationGain.HIGH,
+            priority=8,
+            producer="judge-agent",
+        )
+        emit(
+            runtime,
+            EventType.TASK_CREATED,
+            run.id,
+            "judge-agent",
+            task_id=str(task.id),
+            wave_number=wave_number,
+            followup=True,
+        )
+        created += 1
+    return created
 
 
 async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:
@@ -1075,7 +1233,11 @@ async def verify_claim(runtime: Runtime, event: EventEnvelope) -> None:
 
 async def skeptic_review(runtime: Runtime, event: EventEnvelope) -> None:
     run = await runtime.blackboard.get_run(event.run_id)
-    if not run or await runtime.blackboard.get_final(event.run_id):
+    tasks = await runtime.blackboard.list_models(event.run_id, "tasks", ResearchTask)
+    existing_final = await runtime.blackboard.get_final(event.run_id)
+    if not run or (
+        existing_final and not should_reaggregate_after_followup(existing_final, tasks)
+    ):
         return
     claims = await runtime.blackboard.list_models(event.run_id, "claims", Claim)
     verifications = await runtime.blackboard.list_models(
@@ -1185,13 +1347,14 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
     )
     completed_tasks = [task for task in tasks if task.status == "completed"]
     pending_tasks = [task for task in tasks if task.status == "created"]
+    existing_final = await runtime.blackboard.get_final(event.run_id)
     if (
         not tasks
         or (
             not event.payload.get("force")
             and (pending_tasks or len(verifications) < len(completed_tasks))
         )
-        or await runtime.blackboard.get_final(event.run_id)
+        or (existing_final and not should_reaggregate_after_followup(existing_final, tasks))
     ):
         return
     claims = await runtime.blackboard.list_models(event.run_id, "claims", Claim)
@@ -1288,6 +1451,7 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
         answer=text_from_model_field(result["answer"]),
         verified_claim_ids=[value.id for value in verified],
         sources=sorted({source for value in verified for source in value.sources}),
+        wave_number=max_task_wave(tasks),
     )
     await runtime.blackboard.put_final(final)
     await persist_artifact(
@@ -1330,6 +1494,10 @@ async def judge(runtime: Runtime, event: EventEnvelope) -> None:
     run = await runtime.blackboard.get_run(event.run_id)
     if not final or not run:
         return
+    tasks = await runtime.blackboard.list_models(event.run_id, "tasks", ResearchTask)
+    actions = await runtime.blackboard.list_models(
+        event.run_id, "principal_actions", PrincipalAction
+    )
     result = await runtime.llm.json(
         event.run_id,
         AgentRole.JUDGE,
@@ -1340,8 +1508,6 @@ async def judge(runtime: Runtime, event: EventEnvelope) -> None:
     )
     final.judge_score = score_from_model_field(result["score"])
     final.judge_feedback = text_from_model_field(result["feedback"])
-    run.final_answer = final.answer
-    run.status = RunStatus.COMPLETED
     await runtime.blackboard.put_final(final)
     await persist_artifact(
         runtime,
@@ -1360,6 +1526,19 @@ async def judge(runtime: Runtime, event: EventEnvelope) -> None:
         ),
         "judge-agent",
     )
+    run.final_answer = final.answer
+    if final.judge_score < FOLLOWUP_JUDGE_SCORE_THRESHOLD:
+        if not followup_already_requested(tasks, actions):
+            run.status = RunStatus.RUNNING
+            await runtime.blackboard.put_run(run)
+            await request_followup_wave(runtime, run, final, tasks)
+            return
+        if should_reaggregate_after_followup(final, tasks):
+            run.status = RunStatus.RUNNING
+            await runtime.blackboard.put_run(run)
+            return
+
+    run.status = RunStatus.COMPLETED
     await persist_action(
         runtime,
         event.run_id,

@@ -36,6 +36,8 @@ BRANCH_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("synthesis/aggregator", ("aggregator", "aggregate", "final", "synthesis")),
     ("synthesis/judge", ("judge", "score", "payoff")),
 )
+FOLLOWUP_JUDGE_SCORE_THRESHOLD = 0.75
+MAX_FOLLOWUP_WAVES = 1
 
 
 def text_matches_any(text: str, needles: tuple[str, ...]) -> bool:
@@ -175,6 +177,34 @@ def build_run_state(
     return state
 
 
+def max_task_wave(tasks: list[ResearchTask]) -> int:
+    return max((task.wave_number for task in tasks), default=0)
+
+
+def has_followup_wave(tasks: list[ResearchTask]) -> bool:
+    return max_task_wave(tasks) > 0
+
+
+def judge_score_needs_followup(final: FinalReport | None) -> bool:
+    return bool(
+        final
+        and final.judge_score is not None
+        and final.judge_score < FOLLOWUP_JUDGE_SCORE_THRESHOLD
+    )
+
+
+def can_request_followup_wave(final: FinalReport | None, tasks: list[ResearchTask]) -> bool:
+    return judge_score_needs_followup(final) and max_task_wave(tasks) < MAX_FOLLOWUP_WAVES
+
+
+def should_reaggregate_after_followup(
+    final: FinalReport | None, tasks: list[ResearchTask]
+) -> bool:
+    return judge_score_needs_followup(final) and max_task_wave(tasks) > (
+        final.wave_number if final else 0
+    )
+
+
 def _active_branches(
     tasks: list[ResearchTask],
     agent_specs: list[AgentSpec],
@@ -202,12 +232,19 @@ def _phase(
         return RunPhase.FAILED
     if run.status in {RunStatus.COMPLETED, RunStatus.PARTIAL_BUDGET_EXHAUSTED}:
         return RunPhase.COMPLETED
+    pending_tasks = [task for task in tasks if task.status == "created"]
+    completed_tasks = [task for task in tasks if task.status == "completed"]
+    if final and judge_score_needs_followup(final):
+        if can_request_followup_wave(final, tasks):
+            return RunPhase.JUDGING
+        if pending_tasks:
+            return RunPhase.RESEARCHING
+        if should_reaggregate_after_followup(final, tasks) and completed_tasks:
+            return RunPhase.SYNTHESIZING
     if final and final.judge_score is None and run.models.judge:
         return RunPhase.JUDGING
     if final:
         return RunPhase.COMPLETED
-    pending_tasks = [task for task in tasks if task.status == "created"]
-    completed_tasks = [task for task in tasks if task.status == "completed"]
     if tasks and all(task.status == "failed" for task in tasks):
         return RunPhase.FAILED
     if verifications and not pending_tasks and len(verifications) >= max(1, len(completed_tasks)):
@@ -288,12 +325,24 @@ def _next_actions(
                 priority=6,
             )
         )
-    if tasks and not pending_tasks and not final and (completed_tasks or state.verified_claim_count):
+    needs_followup_aggregation = should_reaggregate_after_followup(final, tasks)
+    if (
+        tasks
+        and not pending_tasks
+        and (not final or needs_followup_aggregation)
+        and (completed_tasks or state.verified_claim_count)
+    ):
         actions.append(
             PrincipalAction(
                 run_id=run.id,
                 action_type=PrincipalActionType.REQUEST_AGGREGATION,
-                reason="All planned tasks have reached a terminal state; synthesize trusted artifacts that are available.",
+                reason=(
+                    "Follow-up tasks have reached a terminal state; refresh synthesis with "
+                    "the new evidence."
+                    if needs_followup_aggregation
+                    else "All planned tasks have reached a terminal state; synthesize "
+                    "trusted artifacts that are available."
+                ),
                 expected_information_gain=InformationGain.MEDIUM,
                 required_role="aggregator_agent",
                 target_branch="synthesis/aggregator",
@@ -301,16 +350,35 @@ def _next_actions(
             )
         )
     if final and final.judge_score is not None:
-        actions.append(
-            PrincipalAction(
-                run_id=run.id,
-                action_type=PrincipalActionType.STOP_RUN,
-                reason="The payoff layer scored the final report; stop unless a follow-up threshold is configured.",
-                expected_information_gain=InformationGain.LOW,
-                target_branch="synthesis/judge",
-                priority=3,
+        if can_request_followup_wave(final, tasks):
+            actions.append(
+                PrincipalAction(
+                    run_id=run.id,
+                    action_type=PrincipalActionType.REQUEST_FOLLOWUP,
+                    reason=(
+                        f"Judge score {final.judge_score:.2f} is below "
+                        f"{FOLLOWUP_JUDGE_SCORE_THRESHOLD:.2f}; request one targeted follow-up wave."
+                    ),
+                    expected_information_gain=InformationGain.MEDIUM,
+                    target_branch="synthesis/judge",
+                    required_role="principal_policy",
+                    priority=7,
+                )
             )
-        )
+        elif not should_reaggregate_after_followup(final, tasks):
+            actions.append(
+                PrincipalAction(
+                    run_id=run.id,
+                    action_type=PrincipalActionType.STOP_RUN,
+                    reason=(
+                        "The payoff layer scored the final report and no further follow-up "
+                        "wave is available."
+                    ),
+                    expected_information_gain=InformationGain.LOW,
+                    target_branch="synthesis/judge",
+                    priority=3,
+                )
+            )
     return actions
 
 

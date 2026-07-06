@@ -195,6 +195,8 @@ class ResearchTask(BaseModel):
     question: str
     tool: Literal["web_search", "market_data"]
     status: Literal["created", "completed", "failed", "skipped_budget"] = "created"
+    wave_number: int = Field(default=0, ge=0)
+    reason: str | None = None
 
 
 class ArtifactPointer(BaseModel):
@@ -241,6 +243,7 @@ class FinalReport(BaseModel):
     verified_claim_ids: list[UUID]
     sources: list[str]
     partial: bool = False
+    wave_number: int = Field(default=0, ge=0)
     judge_score: float | None = Field(default=None, ge=0, le=1)
     judge_feedback: str | None = None
 

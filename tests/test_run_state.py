@@ -169,6 +169,94 @@ def test_completed_run_state_exposes_stop_reason_and_judge_payoff() -> None:
     assert state.next_action_candidates == []
 
 
+def test_low_judge_score_run_state_requests_first_followup_wave() -> None:
+    current_run = run()
+    final = FinalReport(
+        run_id=current_run.id,
+        answer="Buy with caution.",
+        verified_claim_ids=[],
+        sources=[],
+        judge_score=0.62,
+        judge_feedback="Needs stronger valuation evidence.",
+    )
+
+    state = build_run_state(current_run, [], [], [], final)
+
+    assert state.current_phase == RunPhase.JUDGING
+    assert state.last_judge_score == 0.62
+    assert PrincipalActionType.REQUEST_FOLLOWUP in {
+        action.action_type for action in state.next_action_candidates
+    }
+    assert PrincipalActionType.STOP_RUN not in {
+        action.action_type for action in state.next_action_candidates
+    }
+
+
+def test_followup_run_state_requests_aggregation_then_stop_after_second_low_score() -> None:
+    current_run = run()
+    task = ResearchTask(
+        run_id=current_run.id,
+        title="Follow-up: valuation",
+        question="Find valuation evidence.",
+        tool="web_search",
+        status="completed",
+        wave_number=1,
+        reason="Judge score 0.62 below 0.75: Needs valuation evidence.",
+    )
+    claim = Claim(
+        run_id=current_run.id,
+        task_id=task.id,
+        statement="SAP valuation has improved.",
+        evidence_observation_ids=[uuid4()],
+        confidence=0.8,
+    )
+    verification = Verification(
+        run_id=current_run.id,
+        claim_id=claim.id,
+        verdict="verified",
+        rationale="Supported.",
+        confidence=0.7,
+    )
+    stale_final = FinalReport(
+        run_id=current_run.id,
+        answer="Buy with caution.",
+        verified_claim_ids=[],
+        sources=[],
+        wave_number=0,
+        judge_score=0.62,
+        judge_feedback="Needs stronger valuation evidence.",
+    )
+
+    state = build_run_state(current_run, [task], [claim], [verification], stale_final)
+
+    assert state.current_phase == RunPhase.SYNTHESIZING
+    assert PrincipalActionType.REQUEST_AGGREGATION in {
+        action.action_type for action in state.next_action_candidates
+    }
+    assert PrincipalActionType.STOP_RUN not in {
+        action.action_type for action in state.next_action_candidates
+    }
+
+    second_low_final = FinalReport(
+        run_id=current_run.id,
+        answer="Still weak.",
+        verified_claim_ids=[claim.id],
+        sources=[],
+        wave_number=1,
+        judge_score=0.51,
+        judge_feedback="Still too thin.",
+    )
+    state = build_run_state(current_run, [task], [claim], [verification], second_low_final)
+
+    assert state.current_phase == RunPhase.COMPLETED
+    assert PrincipalActionType.REQUEST_FOLLOWUP not in {
+        action.action_type for action in state.next_action_candidates
+    }
+    assert PrincipalActionType.STOP_RUN in {
+        action.action_type for action in state.next_action_candidates
+    }
+
+
 def test_run_state_prefers_agent_spec_and_artifact_branches_before_task_tool() -> None:
     current_run = run()
     task = ResearchTask(

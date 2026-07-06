@@ -914,6 +914,169 @@ def test_judge_normalizes_score_dual_writes_feedback_artifact_and_stop_action() 
     assert any(
         action.action_type == PrincipalActionType.STOP_RUN for action in rt.blackboard.actions
     )
+    assert not any(
+        action.action_type == PrincipalActionType.REQUEST_FOLLOWUP
+        for action in rt.blackboard.actions
+    )
+
+
+def test_low_judge_score_creates_auditable_followup_tasks_and_continues() -> None:
+    run = Run(
+        question="Should I buy SAP?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    final = FinalReport(
+        run_id=run.id, answer="Buy with caution.", verified_claim_ids=[], sources=[]
+    )
+    rt = runtime(
+        run,
+        QueueLLM(
+            {
+                "score": 0.62,
+                "feedback": {
+                    "gaps": [
+                        "Needs stronger valuation evidence.",
+                        "Address downside risks.",
+                    ]
+                },
+            }
+        ),
+    )
+    rt.blackboard.final = final
+
+    asyncio.run(
+        judge(rt, EventEnvelope(type=EventType.FINAL_CREATED, run_id=run.id, producer="test"))
+    )
+
+    followups = [task for task in rt.blackboard.tasks if task.wave_number == 1]
+    assert rt.blackboard.final.judge_score == 0.62
+    assert rt.blackboard.run.status == RunStatus.RUNNING
+    assert 1 <= len(followups) <= 3
+    assert all(task.reason and "Judge score 0.62 below 0.75" in task.reason for task in followups)
+    assert rt.blackboard.artifacts[-1].artifact_type == ArtifactType.JUDGE_FEEDBACK
+    assert any(
+        action.action_type == PrincipalActionType.REQUEST_FOLLOWUP
+        and action.status == ActionStatus.EXECUTED
+        for action in rt.blackboard.actions
+    )
+    assign_actions = [
+        action
+        for action in rt.blackboard.actions
+        if action.action_type == PrincipalActionType.ASSIGN_TASK
+        and action.reason.startswith("Follow-up wave 1:")
+    ]
+    assert len(assign_actions) == len(followups)
+    assert not any(
+        action.action_type == PrincipalActionType.STOP_RUN for action in rt.blackboard.actions
+    )
+    published_types = [event.type for _topic, event in rt.published]
+    assert EventType.FOLLOWUP_REQUESTED in published_types
+    assert published_types.count(EventType.TASK_CREATED) == len(followups)
+
+
+def test_followup_wave_completion_refreshes_final_and_requests_judge_again() -> None:
+    run = Run(
+        question="Should I buy SAP?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="Follow-up: valuation",
+        question="Find valuation evidence.",
+        tool="web_search",
+        status="completed",
+        wave_number=1,
+        reason="Judge score 0.62 below 0.75: Needs valuation evidence.",
+    )
+    claim = Claim(
+        run_id=run.id,
+        task_id=task.id,
+        statement="SAP valuation has improved versus peers.",
+        evidence_observation_ids=[uuid4()],
+        confidence=0.8,
+    )
+    verification = Verification(
+        run_id=run.id,
+        claim_id=claim.id,
+        verdict="verified",
+        rationale="Supported.",
+        confidence=0.7,
+    )
+    old_final = FinalReport(
+        run_id=run.id,
+        answer="Buy with caution.",
+        verified_claim_ids=[],
+        sources=[],
+        wave_number=0,
+        judge_score=0.62,
+        judge_feedback="Needs stronger valuation evidence.",
+    )
+    rt = runtime(run, QueueLLM({"answer": "Updated answer with valuation evidence."}))
+    rt.blackboard.tasks.append(task)
+    rt.blackboard.claims.append(claim)
+    rt.blackboard.verifications.append(verification)
+    rt.blackboard.final = old_final
+
+    asyncio.run(
+        aggregate(rt, EventEnvelope(type=EventType.CLAIM_VERIFIED, run_id=run.id, producer="test"))
+    )
+
+    assert rt.blackboard.final.answer == "Updated answer with valuation evidence."
+    assert rt.blackboard.final.wave_number == 1
+    assert rt.blackboard.final.judge_score is None
+    assert any(event.type == EventType.FINAL_CREATED for _topic, event in rt.published)
+
+
+def test_second_low_judge_score_stops_without_another_followup_wave() -> None:
+    run = Run(
+        question="Should I buy SAP?",
+        status=RunStatus.RUNNING,
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    followup_task = ResearchTask(
+        run_id=run.id,
+        title="Follow-up: valuation",
+        question="Find valuation evidence.",
+        tool="web_search",
+        status="completed",
+        wave_number=1,
+        reason="Judge score 0.62 below 0.75: Needs valuation evidence.",
+    )
+    final = FinalReport(
+        run_id=run.id,
+        answer="Still weak.",
+        verified_claim_ids=[],
+        sources=[],
+        wave_number=1,
+    )
+    rt = runtime(run, QueueLLM({"score": 0.51, "feedback": "Still too thin."}))
+    rt.blackboard.tasks.append(followup_task)
+    rt.blackboard.actions.append(
+        PrincipalAction(
+            run_id=run.id,
+            action_type=PrincipalActionType.REQUEST_FOLLOWUP,
+            reason="Judge score 0.62 below 0.75; requesting targeted follow-up wave 1.",
+        )
+    )
+    rt.blackboard.final = final
+
+    asyncio.run(
+        judge(rt, EventEnvelope(type=EventType.FINAL_CREATED, run_id=run.id, producer="test"))
+    )
+
+    assert rt.blackboard.run.status == RunStatus.COMPLETED
+    assert len(rt.blackboard.tasks) == 1
+    assert max(task.wave_number for task in rt.blackboard.tasks) == 1
+    assert sum(
+        action.action_type == PrincipalActionType.REQUEST_FOLLOWUP
+        for action in rt.blackboard.actions
+    ) == 1
+    assert any(
+        action.action_type == PrincipalActionType.STOP_RUN for action in rt.blackboard.actions
+    )
 
 
 def test_deterministic_partial_records_executed_aggregation_action() -> None:
