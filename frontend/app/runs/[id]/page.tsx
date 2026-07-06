@@ -51,6 +51,7 @@ type RunState = {
   active_branches: string[];
   known_facts: string[];
   open_questions: string[];
+  failed_tasks?: string[];
   verified_claim_count: number;
   rejected_claim_count: number;
   disputed_claim_count: number;
@@ -158,6 +159,12 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
           <p>Tools remaining: Tavily {state.tool_budget_remaining.tavily_credits ?? 0} · Market {state.tool_budget_remaining.market_data_requests ?? 0}</p>
           <h3>Open questions</h3>
           <ul>{state.open_questions.map((q) => <li key={q}>{q}</li>)}</ul>
+          {(state.failed_tasks ?? []).length > 0 && (
+            <>
+              <h3>Failed tasks</h3>
+              <ul>{(state.failed_tasks ?? []).map((task) => <li key={task}>{task}</li>)}</ul>
+            </>
+          )}
           <h3>Known facts</h3>
           <ul>{state.known_facts.map((fact) => <li key={fact}>{fact}</li>)}</ul>
           {state.stop_reasons.length > 0 && <p>Stop reasons: {state.stop_reasons.join(" · ")}</p>}

@@ -88,6 +88,7 @@ def build_run_state(
     uncertain_ids = {value.claim_id for value in verifications if value.verdict == "uncertain"}
     verified_claims = [claim for claim in claims if claim.id in verified_ids]
     pending_tasks = [task for task in tasks if task.status == "created"]
+    failed_tasks = [task for task in tasks if task.status == "failed"]
     verified_artifacts = [value for value in artifacts if value.status == ArtifactStatus.VERIFIED]
     rejected_artifacts = [
         value
@@ -140,6 +141,7 @@ def build_run_state(
         or [claim.statement for claim in verified_claims],
         open_questions=[value.text_or_summary for value in open_question_artifacts]
         + [task.question for task in pending_tasks],
+        failed_tasks=[task.title for task in failed_tasks],
         verified_claim_count=len(verified_ids | verified_artifact_ids),
         rejected_claim_count=len(rejected_ids | rejected_artifact_ids),
         disputed_claim_count=len(uncertain_ids | disputed_artifact_ids),
@@ -197,7 +199,11 @@ def _phase(
         return RunPhase.JUDGING
     if final:
         return RunPhase.COMPLETED
-    if verifications and len(verifications) >= max(1, len(tasks)):
+    pending_tasks = [task for task in tasks if task.status == "created"]
+    completed_tasks = [task for task in tasks if task.status == "completed"]
+    if tasks and all(task.status == "failed" for task in tasks):
+        return RunPhase.FAILED
+    if verifications and not pending_tasks and len(verifications) >= max(1, len(completed_tasks)):
         return RunPhase.SYNTHESIZING
     if claims:
         return RunPhase.VERIFYING
@@ -221,6 +227,7 @@ def _next_actions(
         return []
     actions: list[PrincipalAction] = []
     pending_tasks = [task for task in tasks if task.status == "created"]
+    completed_tasks = [task for task in tasks if task.status == "completed"]
     if not tasks:
         actions.append(
             PrincipalAction(
@@ -274,12 +281,12 @@ def _next_actions(
                 priority=6,
             )
         )
-    if tasks and not pending_tasks and not final:
+    if tasks and not pending_tasks and not final and (completed_tasks or state.verified_claim_count):
         actions.append(
             PrincipalAction(
                 run_id=run.id,
                 action_type=PrincipalActionType.REQUEST_AGGREGATION,
-                reason="All planned tasks have finished; synthesize only trusted artifacts into an answer.",
+                reason="All planned tasks have reached a terminal state; synthesize trusted artifacts that are available.",
                 expected_information_gain=InformationGain.MEDIUM,
                 required_role="aggregator_agent",
                 target_branch="synthesis/aggregator",

@@ -106,6 +106,47 @@ def test_run_state_promotes_verified_claims_and_requests_aggregation() -> None:
     assert state.next_action_candidates[0].action_type == PrincipalActionType.REQUEST_AGGREGATION
 
 
+def test_run_state_exposes_failed_tasks_and_allows_partial_aggregation_candidate() -> None:
+    current_run = run()
+    completed_task = ResearchTask(
+        run_id=current_run.id,
+        title="SAP catalysts",
+        question="Find SAP catalysts",
+        tool="web_search",
+        status="completed",
+    )
+    failed_task = ResearchTask(
+        run_id=current_run.id,
+        title="SAP valuation",
+        question="Find SAP valuation evidence",
+        tool="web_search",
+        status="failed",
+    )
+    claim = Claim(
+        run_id=current_run.id,
+        task_id=completed_task.id,
+        statement="SAP has cloud-growth momentum.",
+        evidence_observation_ids=[uuid4()],
+        confidence=0.8,
+    )
+    verification = Verification(
+        run_id=current_run.id,
+        claim_id=claim.id,
+        verdict="verified",
+        rationale="Supported by sources.",
+        confidence=0.75,
+    )
+
+    state = build_run_state(
+        current_run, [completed_task, failed_task], [claim], [verification]
+    )
+
+    assert state.current_phase == RunPhase.SYNTHESIZING
+    assert state.failed_tasks == ["SAP valuation"]
+    assert state.open_questions == []
+    assert state.next_action_candidates[0].action_type == PrincipalActionType.REQUEST_AGGREGATION
+
+
 def test_completed_run_state_exposes_stop_reason_and_judge_payoff() -> None:
     current_run = run(RunStatus.COMPLETED)
     final = FinalReport(

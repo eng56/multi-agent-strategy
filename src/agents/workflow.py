@@ -10,6 +10,7 @@ from src.agents.state import (
     text_matches_any,
     title_from_branch,
 )
+from src.common.budget import BudgetExceeded
 from src.common.models import (
     ActionStatus,
     AgentRole,
@@ -62,6 +63,7 @@ async def persist_action(
     expected_information_gain: InformationGain = InformationGain.MEDIUM,
     estimated_cost: float = 0,
     priority: int = 5,
+    status: ActionStatus = ActionStatus.EXECUTED,
     producer: str = "principal-policy",
 ) -> PrincipalAction:
     action = PrincipalAction(
@@ -73,7 +75,7 @@ async def persist_action(
         expected_information_gain=expected_information_gain,
         estimated_cost=estimated_cost,
         priority=priority,
-        status=ActionStatus.EXECUTED,
+        status=status,
     )
     await runtime.blackboard.put_principal_action(action)
     emit(runtime, EventType.PRINCIPAL_ACTION_CREATED, run_id, producer, action_id=str(action.id))
@@ -86,6 +88,89 @@ async def persist_artifact(runtime: Runtime, artifact: Artifact, producer: str) 
         runtime, EventType.ARTIFACT_CREATED, artifact.run_id, producer, artifact_id=str(artifact.id)
     )
     return artifact
+
+
+def concise_exception(exc: Exception, limit: int = 240) -> str:
+    return f"{type(exc).__name__}: {str(exc)[:limit]}"
+
+
+async def fail_task(
+    runtime: Runtime,
+    task: ResearchTask,
+    branch: str,
+    stage: str,
+    exc: Exception,
+    *,
+    producer: str,
+) -> None:
+    reason = f"Task failed during {stage}: {task.title} ({concise_exception(exc)})"
+    logger.warning(
+        "task failed run_id=%s task_id=%s stage=%s error=%s",
+        task.run_id,
+        task.id,
+        stage,
+        concise_exception(exc),
+    )
+    task.status = "failed"
+    await runtime.blackboard.put_task(task)
+    await persist_action(
+        runtime,
+        task.run_id,
+        PrincipalActionType.REQUEST_TOOL_CALL,
+        reason,
+        required_role="tool_runner" if producer == "tool-runner" else "research_agent",
+        target_branch=branch,
+        expected_information_gain=InformationGain.LOW,
+        priority=6,
+        status=ActionStatus.FAILED,
+        producer=producer,
+    )
+    emit(
+        runtime,
+        EventType.TASK_FAILED,
+        task.run_id,
+        producer,
+        task_id=str(task.id),
+        stage=stage,
+        reason=reason,
+    )
+    await fail_run_if_all_tasks_failed(runtime, task.run_id)
+
+
+async def fail_run_if_all_tasks_failed(runtime: Runtime, run_id: UUID) -> None:
+    tasks = await runtime.blackboard.list_models(run_id, "tasks", ResearchTask)
+    if not tasks or any(task.status != "failed" for task in tasks):
+        return
+    if await runtime.blackboard.get_final(run_id):
+        return
+    verifications = await runtime.blackboard.list_models(run_id, "verifications", Verification)
+    if any(verification.verdict == "verified" for verification in verifications):
+        return
+    run = await runtime.blackboard.get_run(run_id)
+    if not run or run.status in {
+        RunStatus.COMPLETED,
+        RunStatus.PARTIAL_BUDGET_EXHAUSTED,
+        RunStatus.FAILED,
+    }:
+        return
+    reason = (
+        f"All {len(tasks)} research task(s) failed before any verified evidence was produced."
+    )
+    run.status = RunStatus.FAILED
+    run.failure_reason = reason
+    run.final_answer = None
+    await persist_action(
+        runtime,
+        run_id,
+        PrincipalActionType.STOP_RUN,
+        reason,
+        required_role="principal_policy",
+        target_branch="root",
+        expected_information_gain=InformationGain.LOW,
+        priority=4,
+        producer="principal-policy",
+    )
+    await runtime.blackboard.put_run(run)
 
 
 def text_from_model_field(value: Any) -> str:
@@ -471,33 +556,44 @@ async def plan(runtime: Runtime, event: EventEnvelope) -> None:
 async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:
     tasks = await runtime.blackboard.list_models(event.run_id, "tasks", ResearchTask)
     task = next((value for value in tasks if str(value.id) == event.payload.get("task_id")), None)
-    if not task:
+    if not task or task.status != "created":
         return
     branch = branch_for_task(
         task, await runtime.blackboard.list_models(event.run_id, "agent_specs", AgentSpec)
     )
-    if task.tool == "market_data":
-        ticker_result = await runtime.llm.json(
+    stage = "tool_execution"
+    try:
+        if task.tool == "market_data":
+            stage = "ticker_extraction"
+            ticker_result = await runtime.llm.json(
+                task.run_id,
+                AgentRole.UTILITY,
+                "ticker-extractor",
+                SYSTEM,
+                f'Extract the primary ticker from: {task.question}. Return {{"ticker":"..."}}.',
+            )
+            stage = "tool_execution"
+            raw = await runtime.tools.market_data(task.run_id, ticker_result["ticker"])
+            sources = [f"https://massive.com/stocks/{ticker_result['ticker']}"]
+        else:
+            raw = await runtime.tools.web_search(task.run_id, task.question)
+            sources = [item["url"] for item in raw.get("results", []) if item.get("url")]
+        stage = "raw_artifact_persistence"
+        artifact_pointer = runtime.artifacts.put_json(task.run_id, task.tool, raw)
+        stage = "tool_summary"
+        summary_result = await runtime.llm.json(
             task.run_id,
-            AgentRole.UTILITY,
-            "ticker-extractor",
+            AgentRole.RESEARCH,
+            "tool-summary",
             SYSTEM,
-            f'Extract the primary ticker from: {task.question}. Return {{"ticker":"..."}}.',
+            f"Summarize the most decision-relevant facts from this tool output. Return "
+            f'{{"summary":"..."}}. Output: {json.dumps(raw)[:30000]}',
         )
-        raw = await runtime.tools.market_data(task.run_id, ticker_result["ticker"])
-        sources = [f"https://massive.com/stocks/{ticker_result['ticker']}"]
-    else:
-        raw = await runtime.tools.web_search(task.run_id, task.question)
-        sources = [item["url"] for item in raw.get("results", []) if item.get("url")]
-    artifact_pointer = runtime.artifacts.put_json(task.run_id, task.tool, raw)
-    summary_result = await runtime.llm.json(
-        task.run_id,
-        AgentRole.RESEARCH,
-        "tool-summary",
-        SYSTEM,
-        f"Summarize the most decision-relevant facts from this tool output. Return "
-        f'{{"summary":"..."}}. Output: {json.dumps(raw)[:30000]}',
-    )
+    except BudgetExceeded:
+        raise
+    except Exception as exc:
+        await fail_task(runtime, task, branch, stage, exc, producer="tool-runner")
+        return
     observation = Observation(
         run_id=task.run_id,
         task_id=task.id,
@@ -556,22 +652,30 @@ async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
     tasks = await runtime.blackboard.list_models(event.run_id, "tasks", ResearchTask)
     task = next((value for value in tasks if value.id == observation.task_id), None)
     branch = branch_for_task(task) if task else infer_semantic_branch(observation.summary)
-    result = await runtime.llm.json(
-        event.run_id,
-        AgentRole.RESEARCH,
-        "claim-extractor",
-        SYSTEM,
-        f"Create one precise, decision-relevant claim supported only by this observation. "
-        f'Return {{"statement":"...","confidence":0.0}}. Observation: {observation.summary}',
-    )
-    claim = Claim(
-        run_id=event.run_id,
-        task_id=observation.task_id,
-        statement=result["statement"],
-        confidence=result["confidence"],
-        evidence_observation_ids=[observation.id],
-        sources=observation.sources,
-    )
+    try:
+        result = await runtime.llm.json(
+            event.run_id,
+            AgentRole.RESEARCH,
+            "claim-extractor",
+            SYSTEM,
+            f"Create one precise, decision-relevant claim supported only by this observation. "
+            f'Return {{"statement":"...","confidence":0.0}}. Observation: {observation.summary}',
+        )
+        claim = Claim(
+            run_id=event.run_id,
+            task_id=observation.task_id,
+            statement=result["statement"],
+            confidence=result["confidence"],
+            evidence_observation_ids=[observation.id],
+            sources=observation.sources,
+        )
+    except BudgetExceeded:
+        raise
+    except Exception as exc:
+        if not task:
+            raise
+        await fail_task(runtime, task, branch, "claim_generation", exc, producer="worker-agents")
+        return
     await runtime.blackboard.put_claim(claim)
     observation_artifacts = await runtime.blackboard.list_models(
         event.run_id, "artifacts", Artifact
@@ -613,7 +717,7 @@ def failed_verification_result(exc: Exception) -> dict[str, Any]:
     return {
         "verdict": "uncertain",
         "rationale": (
-            "Automated corroboration search failed, so this claim remains disputed instead of "
+            "Automated claim verification failed, so this claim remains disputed instead of "
             f"being treated as verified: {type(exc).__name__}: {str(exc)[:240]}"
         ),
         "confidence": 0.0,
@@ -631,6 +735,8 @@ async def verify_claim(runtime: Runtime, event: EventEnvelope) -> None:
         corroboration = await runtime.tools.web_search(
             event.run_id, verification_search_query(claim.statement)
         )
+    except BudgetExceeded:
+        raise
     except Exception as exc:
         logger.warning(
             "verification search failed run_id=%s claim_id=%s error=%s",
@@ -641,15 +747,26 @@ async def verify_claim(runtime: Runtime, event: EventEnvelope) -> None:
         corroboration = {"results": [], "error": f"{type(exc).__name__}: {str(exc)[:500]}"}
         result = failed_verification_result(exc)
     else:
-        result = await runtime.llm.json(
-            event.run_id,
-            AgentRole.VERIFIER,
-            "claim-verifier",
-            SYSTEM,
-            f"Verify this claim using the corroborating results. Return "
-            f'{{"verdict":"verified|rejected|uncertain","rationale":"...","confidence":0.0}}. '
-            f"Claim: {claim.statement}. Results: {json.dumps(corroboration)[:30000]}",
-        )
+        try:
+            result = await runtime.llm.json(
+                event.run_id,
+                AgentRole.VERIFIER,
+                "claim-verifier",
+                SYSTEM,
+                f"Verify this claim using the corroborating results. Return "
+                f'{{"verdict":"verified|rejected|uncertain","rationale":"...","confidence":0.0}}. '
+                f"Claim: {claim.statement}. Results: {json.dumps(corroboration)[:30000]}",
+            )
+        except BudgetExceeded:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "verification model failed run_id=%s claim_id=%s error=%s",
+                event.run_id,
+                claim.id,
+                concise_exception(exc),
+            )
+            result = failed_verification_result(exc)
     sources = [item["url"] for item in corroboration.get("results", []) if item.get("url")]
     artifact_pointer = runtime.artifacts.put_json(
         event.run_id, "verification-search", corroboration
@@ -750,15 +867,23 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
     verifications = await runtime.blackboard.list_models(
         event.run_id, "verifications", Verification
     )
+    completed_tasks = [task for task in tasks if task.status == "completed"]
+    pending_tasks = [task for task in tasks if task.status == "created"]
     if (
         not tasks
-        or (len(verifications) < len(tasks) and not event.payload.get("force"))
+        or (
+            not event.payload.get("force")
+            and (pending_tasks or len(verifications) < len(completed_tasks))
+        )
         or await runtime.blackboard.get_final(event.run_id)
     ):
         return
     claims = await runtime.blackboard.list_models(event.run_id, "claims", Claim)
     verified_ids = {value.claim_id for value in verifications if value.verdict == "verified"}
     verified = [claim for claim in claims if claim.id in verified_ids]
+    if not verified and all(task.status == "failed" for task in tasks):
+        await fail_run_if_all_tasks_failed(runtime, event.run_id)
+        return
     run = await runtime.blackboard.get_run(event.run_id)
     if not run:
         return
