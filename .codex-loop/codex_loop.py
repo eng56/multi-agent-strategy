@@ -221,7 +221,7 @@ def repo_relative(path: Path, repo_root: Path) -> str:
 def validate_command_list(value: Any, label: str) -> list[str]:
     if not isinstance(value, list) or not value or not all(isinstance(item, str) for item in value):
         raise LoopError(f"{label} must be a non-empty list of strings")
-    return value
+    return list(value)
 
 
 def validate_checks(value: Any, label: str = "checks") -> list[list[str]]:
