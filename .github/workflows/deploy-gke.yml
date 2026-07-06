@@ -48,7 +48,13 @@ jobs:
       - id: image
         run: |
           IMAGE="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.ARTIFACT_REGISTRY_REPO }}/runtime:${GITHUB_SHA}"
-          docker build -t "$IMAGE" . && docker push "$IMAGE"
+          BUILD_TIME="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          docker build \
+            --build-arg GIT_SHA="$GITHUB_SHA" \
+            --build-arg IMAGE_TAG="$IMAGE" \
+            --build-arg BUILD_TIME="$BUILD_TIME" \
+            -t "$IMAGE" .
+          docker push "$IMAGE"
           echo "value=$IMAGE" >> "$GITHUB_OUTPUT"
       - run: |
           sed -i "s|APP_IMAGE|${{ steps.image.outputs.value }}|g; s|GCP_PROJECT_ID|${{ env.GCP_PROJECT_ID }}|g" deploy/gke/base/*.yaml

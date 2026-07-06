@@ -1,7 +1,9 @@
 """Role-specific event worker; all infrastructure dependencies remain managed services."""
 import asyncio
+import json
 import logging
 import os
+import threading
 from uuid import UUID
 
 from src.agents.workflow import (
@@ -26,6 +28,12 @@ from src.common.models import (
     Observation,
     ResearchTask,
     RunStatus,
+)
+from src.common.health import (
+    WORKER_HEARTBEAT_INTERVAL_SECONDS,
+    WORKER_HEARTBEAT_TTL_SECONDS,
+    worker_heartbeat_key,
+    worker_heartbeat_payload,
 )
 from src.runtime import build_runtime
 
@@ -232,11 +240,41 @@ async def dispatch(runtime, role, event) -> None:
         )
 
 
+async def write_worker_heartbeat(runtime, role: str) -> None:
+    await runtime.blackboard.command(
+        "SET",
+        worker_heartbeat_key(role),
+        json.dumps(worker_heartbeat_payload(role), separators=(",", ":")),
+        "EX",
+        WORKER_HEARTBEAT_TTL_SECONDS,
+    )
+
+
+def start_worker_heartbeat(runtime, role: str) -> threading.Event:
+    stop_event = threading.Event()
+
+    def loop() -> None:
+        while not stop_event.is_set():
+            try:
+                asyncio.run(write_worker_heartbeat(runtime, role))
+            except Exception:
+                logger.exception("worker heartbeat failed role=%s", role)
+            stop_event.wait(WORKER_HEARTBEAT_INTERVAL_SECONDS)
+
+    thread = threading.Thread(target=loop, name=f"{role}-heartbeat", daemon=True)
+    thread.start()
+    return stop_event
+
+
 def main() -> None:
     role = os.getenv("AGENT_ROLE", "worker-agents")
     runtime = build_runtime()
-    for event in runtime.events.consume(runtime.settings.runtime_topic, role):
-        asyncio.run(dispatch(runtime, role, event))
+    heartbeat_stop = start_worker_heartbeat(runtime, role)
+    try:
+        for event in runtime.events.consume(runtime.settings.runtime_topic, role):
+            asyncio.run(dispatch(runtime, role, event))
+    finally:
+        heartbeat_stop.set()
 
 
 if __name__ == "__main__":
