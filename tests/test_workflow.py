@@ -11,6 +11,7 @@ from src.agents.workflow import (
     judge,
     plan,
     semantic_branches,
+    skeptic_review,
     verify_claim,
 )
 from src.worker import MAX_HANDLER_RETRIES, dispatch
@@ -192,6 +193,7 @@ def test_every_workflow_stage_has_an_event_handler() -> None:
     assert EventType.TASK_CREATED in HANDLERS["tool-runner"]
     assert EventType.OBSERVATION_CREATED in HANDLERS["worker-agents"]
     assert EventType.CLAIM_CREATED in HANDLERS["verifier-agent"]
+    assert EventType.SKEPTIC_REVIEW_REQUESTED in HANDLERS["skeptic-agent"]
     assert EventType.CLAIM_VERIFIED in HANDLERS["aggregator-agent"]
     assert EventType.FINAL_CREATED in HANDLERS["judge-agent"]
 
@@ -544,6 +546,139 @@ def test_verify_claim_dual_writes_verification_artifact() -> None:
     assert artifact.supports_artifact_ids
 
 
+def test_verify_claim_requests_skeptic_when_second_verified_claim_exists() -> None:
+    run = Run(
+        question="Should I buy SAP stock?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    first_claim = Claim(
+        run_id=run.id,
+        task_id=uuid4(),
+        statement="SAP backlog is rising.",
+        evidence_observation_ids=[uuid4()],
+        confidence=0.8,
+    )
+    second_claim = Claim(
+        run_id=run.id,
+        task_id=uuid4(),
+        statement="SAP cloud margins are improving.",
+        evidence_observation_ids=[uuid4()],
+        confidence=0.75,
+    )
+    rt = runtime(
+        run, QueueLLM({"verdict": "verified", "rationale": "Supported.", "confidence": 0.7})
+    )
+    rt.blackboard.claims.extend([first_claim, second_claim])
+    rt.blackboard.verifications.append(
+        Verification(
+            run_id=run.id,
+            claim_id=first_claim.id,
+            verdict="verified",
+            rationale="Supported.",
+            confidence=0.7,
+        )
+    )
+    for claim in [first_claim, second_claim]:
+        rt.blackboard.artifacts.append(
+            Artifact(
+                run_id=run.id,
+                artifact_type=ArtifactType.CLAIM,
+                branch="market/equities",
+                text_or_summary=claim.statement,
+                status=ArtifactStatus.VERIFIED if claim == first_claim else ArtifactStatus.UNVERIFIED,
+                legacy_object_type="claim",
+                legacy_object_id=claim.id,
+            )
+        )
+
+    asyncio.run(
+        verify_claim(
+            rt,
+            EventEnvelope(
+                type=EventType.CLAIM_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"claim_id": str(second_claim.id)},
+            ),
+        )
+    )
+
+    assert any(
+        action.action_type == PrincipalActionType.REQUEST_SKEPTIC_REVIEW
+        and action.status == ActionStatus.EXECUTED
+        for action in rt.blackboard.actions
+    )
+    published_types = [event.type for _topic, event in rt.published]
+    assert EventType.SKEPTIC_REVIEW_REQUESTED in published_types
+    assert EventType.CLAIM_VERIFIED not in published_types
+
+
+def test_skeptic_review_creates_counterargument_artifact_and_triggers_aggregation() -> None:
+    run = Run(
+        question="Should I buy SAP stock?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    claims = [
+        Claim(
+            run_id=run.id,
+            task_id=uuid4(),
+            statement="SAP backlog is rising.",
+            evidence_observation_ids=[uuid4()],
+            sources=[f"https://example.com/{index}"],
+            confidence=0.8,
+        )
+        for index in range(2)
+    ]
+    rt = runtime(
+        run,
+        QueueLLM(
+            {
+                "strongest_counterargument": "Valuation already prices the backlog.",
+                "contradicting_evidence": "A margin miss would weaken the thesis.",
+                "risks_regime_changes": "Rates could rise again.",
+                "what_would_change_conclusion": "Lower guidance.",
+                "confidence_calibration_comments": "Moderate confidence.",
+            }
+        ),
+    )
+    rt.blackboard.claims.extend(claims)
+    for claim in claims:
+        rt.blackboard.verifications.append(
+            Verification(
+                run_id=run.id,
+                claim_id=claim.id,
+                verdict="verified",
+                rationale="Supported.",
+                confidence=0.7,
+            )
+        )
+
+    asyncio.run(
+        skeptic_review(
+            rt,
+            EventEnvelope(
+                type=EventType.SKEPTIC_REVIEW_REQUESTED,
+                run_id=run.id,
+                producer="test",
+            ),
+        )
+    )
+
+    artifact = rt.blackboard.artifacts[-1]
+    assert artifact.artifact_type == ArtifactType.COUNTERARGUMENT
+    assert artifact.status == ArtifactStatus.VERIFIED
+    assert "Strongest counterargument: Valuation already prices the backlog." in artifact.text_or_summary
+    assert "What would change conclusion: Lower guidance." in artifact.text_or_summary
+    assert any(
+        action.action_type == PrincipalActionType.REQUEST_SKEPTIC_REVIEW
+        and action.status == ActionStatus.EXECUTED
+        for action in rt.blackboard.actions
+    )
+    assert any(event.type == EventType.CLAIM_VERIFIED for _topic, event in rt.published)
+
+
 def test_aggregator_stringifies_nested_answer_object_and_dual_writes_final_artifact() -> None:
     run = Run(
         question="Should I buy SAP?",
@@ -640,6 +775,120 @@ def test_aggregator_prompt_includes_synthesis_role_and_verified_evidence_require
     assert "trade-offs" in prompt
     assert 'Return {"answer":"..."}' in prompt
     assert rt.blackboard.final.answer == "Gold has the cleaner verified setup."
+
+
+def test_aggregation_prompt_consumes_skeptic_counterargument_artifact() -> None:
+    run = Run(
+        question="Should I buy SAP?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    task = ResearchTask(
+        run_id=run.id, title="SAP", question="SAP stock", tool="web_search", status="completed"
+    )
+    claim = Claim(
+        run_id=run.id,
+        task_id=task.id,
+        statement="SAP has positive momentum.",
+        evidence_observation_ids=[uuid4()],
+        confidence=0.8,
+    )
+    verification = Verification(
+        run_id=run.id, claim_id=claim.id, verdict="verified", rationale="Supported.", confidence=0.7
+    )
+    counterargument = Artifact(
+        run_id=run.id,
+        artifact_type=ArtifactType.COUNTERARGUMENT,
+        branch="trust/skeptic",
+        text_or_summary="Strongest counterargument: the thesis is already priced.",
+        status=ArtifactStatus.VERIFIED,
+        visibility=VisibilityScope.PUBLIC_VERIFIED,
+    )
+    llm = QueueLLM({"answer": "Buy only if valuation remains reasonable."})
+    rt = runtime(run, llm)
+    rt.blackboard.tasks.append(task)
+    rt.blackboard.claims.append(claim)
+    rt.blackboard.verifications.append(verification)
+    rt.blackboard.artifacts.append(counterargument)
+
+    asyncio.run(
+        aggregate(rt, EventEnvelope(type=EventType.CLAIM_VERIFIED, run_id=run.id, producer="test"))
+    )
+
+    prompt = llm.calls[-1]["prompt"]
+    assert "Skeptic/counterargument context" in prompt
+    assert "the thesis is already priced" in prompt
+    assert rt.blackboard.final.answer == "Buy only if valuation remains reasonable."
+
+
+def test_skeptic_failure_records_artifact_and_allows_aggregation() -> None:
+    run = Run(
+        question="Should I buy SAP stock?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    tasks = [
+        ResearchTask(
+            run_id=run.id,
+            title=f"SAP evidence {index}",
+            question="SAP stock",
+            tool="web_search",
+            status="completed",
+        )
+        for index in range(2)
+    ]
+    claims = [
+        Claim(
+            run_id=run.id,
+            task_id=tasks[index].id,
+            statement=f"Verified SAP claim {index}.",
+            evidence_observation_ids=[uuid4()],
+            confidence=0.8,
+        )
+        for index in range(2)
+    ]
+    rt = runtime(run, QueueLLM(RuntimeError("skeptic model failed"), {"answer": "Proceed."}))
+    rt.blackboard.tasks.extend(tasks)
+    rt.blackboard.claims.extend(claims)
+    for claim in claims:
+        rt.blackboard.verifications.append(
+            Verification(
+                run_id=run.id,
+                claim_id=claim.id,
+                verdict="verified",
+                rationale="Supported.",
+                confidence=0.7,
+            )
+        )
+
+    asyncio.run(
+        skeptic_review(
+            rt,
+            EventEnvelope(
+                type=EventType.SKEPTIC_REVIEW_REQUESTED,
+                run_id=run.id,
+                producer="test",
+            ),
+        )
+    )
+    aggregation_event = next(
+        event for _topic, event in rt.published if event.type == EventType.CLAIM_VERIFIED
+    )
+    asyncio.run(aggregate(rt, aggregation_event))
+
+    counterargument = next(
+        artifact
+        for artifact in rt.blackboard.artifacts
+        if artifact.artifact_type == ArtifactType.COUNTERARGUMENT
+    )
+    assert counterargument.status == ArtifactStatus.DISPUTED
+    assert "Skeptic review failed" in counterargument.text_or_summary
+    assert any(
+        action.action_type == PrincipalActionType.REQUEST_SKEPTIC_REVIEW
+        and action.status == ActionStatus.FAILED
+        for action in rt.blackboard.actions
+    )
+    assert rt.blackboard.final.answer == "Proceed."
 
 
 def test_judge_normalizes_score_dual_writes_feedback_artifact_and_stop_action() -> None:

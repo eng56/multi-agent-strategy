@@ -399,6 +399,19 @@ def build_organization(run: Run) -> OrganizationPlan:
         visibility_scope=VisibilityScope.PUBLIC_UNVERIFIED,
         status=AgentStatus.ACTIVE,
     )
+    skeptic = AgentSpec(
+        run_id=run.id,
+        parent_id=root.id,
+        name="skeptic",
+        role_template="skeptic_agent",
+        branch="trust/skeptic",
+        domain="trust",
+        objective="Challenge the emerging thesis with counterarguments, risks, and calibration checks.",
+        allowed_tools=[],
+        retrieval_tags=["trust", "skeptic", "counterargument", "risk"],
+        visibility_scope=VisibilityScope.PUBLIC_VERIFIED,
+        status=AgentStatus.ACTIVE,
+    )
     aggregator = AgentSpec(
         run_id=run.id,
         parent_id=root.id,
@@ -413,7 +426,7 @@ def build_organization(run: Run) -> OrganizationPlan:
         visibility_scope=VisibilityScope.PUBLIC_VERIFIED,
         status=AgentStatus.ACTIVE,
     )
-    specs.extend([verifier, aggregator])
+    specs.extend([verifier, skeptic, aggregator])
     verifier_ids = [verifier.id]
     aggregator_ids = [aggregator.id]
     judge_ids: list[UUID] = []
@@ -766,6 +779,126 @@ def failed_verification_result(exc: Exception) -> dict[str, Any]:
     }
 
 
+def _run_state_requests_skeptic_review(run_state) -> bool:
+    return any(
+        action.action_type == PrincipalActionType.REQUEST_SKEPTIC_REVIEW
+        for action in run_state.next_action_candidates
+    )
+
+
+async def request_skeptic_review(
+    runtime: Runtime,
+    run_id: UUID,
+    *,
+    reason: str,
+    producer: str,
+) -> None:
+    await persist_action(
+        runtime,
+        run_id,
+        PrincipalActionType.REQUEST_SKEPTIC_REVIEW,
+        reason,
+        required_role="skeptic_agent",
+        target_branch="trust/skeptic",
+        expected_information_gain=InformationGain.MEDIUM,
+        priority=6,
+        producer=producer,
+    )
+    emit(runtime, EventType.SKEPTIC_REVIEW_REQUESTED, run_id, producer)
+
+
+def _skeptic_agent_spec(run_id: UUID, agent_specs: list[AgentSpec]) -> AgentSpec:
+    return next(
+        (
+            spec
+            for spec in agent_specs
+            if spec.role_template == "skeptic_agent" or spec.branch == "trust/skeptic"
+        ),
+        None,
+    ) or AgentSpec(
+        run_id=run_id,
+        name="skeptic",
+        role_template="skeptic_agent",
+        branch="trust/skeptic",
+        domain="trust",
+        objective="Challenge the emerging thesis with counterarguments, risks, and calibration checks.",
+        retrieval_tags=["trust", "skeptic", "counterargument", "risk"],
+        visibility_scope=VisibilityScope.PUBLIC_VERIFIED,
+        status=AgentStatus.ACTIVE,
+    )
+
+
+def _counterargument_artifacts(artifacts: list[Artifact]) -> list[Artifact]:
+    return [
+        artifact
+        for artifact in artifacts
+        if artifact.artifact_type == ArtifactType.COUNTERARGUMENT
+    ]
+
+
+def _skeptic_feedback_text(result: dict[str, Any]) -> str:
+    fields = [
+        ("Strongest counterargument", "strongest_counterargument"),
+        ("Evidence that would contradict the main thesis", "contradicting_evidence"),
+        ("Risks / regime changes", "risks_regime_changes"),
+        ("What would change conclusion", "what_would_change_conclusion"),
+        ("Confidence / calibration comments", "confidence_calibration_comments"),
+    ]
+    return "\n\n".join(
+        f"{label}: {text_from_model_field(result.get(key, 'Not provided.'))}"
+        for label, key in fields
+    )
+
+
+async def _persist_skeptic_failure_artifact(
+    runtime: Runtime,
+    run_id: UUID,
+    exc: Exception,
+) -> Artifact:
+    artifact = Artifact(
+        run_id=run_id,
+        artifact_type=ArtifactType.COUNTERARGUMENT,
+        branch="trust/skeptic",
+        text_or_summary=(
+            "Skeptic review failed; aggregation may proceed without a completed "
+            f"counterargument. Failure: {concise_exception(exc)}"
+        ),
+        tags=["trust", "skeptic", "counterargument", "failure", "synthesis"],
+        visibility=VisibilityScope.PUBLIC_VERIFIED,
+        status=ArtifactStatus.DISPUTED,
+    )
+    await persist_artifact(runtime, artifact, "skeptic-agent")
+    await persist_action(
+        runtime,
+        run_id,
+        PrincipalActionType.REQUEST_SKEPTIC_REVIEW,
+        f"Skeptic review failed; allowing aggregation to proceed: {concise_exception(exc)}",
+        required_role="skeptic_agent",
+        target_branch="trust/skeptic",
+        expected_information_gain=InformationGain.LOW,
+        priority=6,
+        status=ActionStatus.FAILED,
+        producer="skeptic-agent",
+    )
+    return artifact
+
+
+def _verified_claims_and_artifacts(
+    claims: list[Claim],
+    verifications: list[Verification],
+    artifacts: list[Artifact],
+) -> tuple[list[Claim], list[Artifact]]:
+    verified_ids = {value.claim_id for value in verifications if value.verdict == "verified"}
+    verified_claims = [claim for claim in claims if claim.id in verified_ids]
+    verified_artifacts = [
+        artifact
+        for artifact in artifacts
+        if artifact.status == ArtifactStatus.VERIFIED
+        and artifact.artifact_type in {ArtifactType.CLAIM, ArtifactType.FORECAST}
+    ]
+    return verified_claims, verified_artifacts
+
+
 async def verify_claim(runtime: Runtime, event: EventEnvelope) -> None:
     claims = await runtime.blackboard.list_models(event.run_id, "claims", Claim)
     claim = next(
@@ -901,12 +1034,147 @@ async def verify_claim(runtime: Runtime, event: EventEnvelope) -> None:
         priority=6,
         producer="verifier-agent",
     )
+    run = await runtime.blackboard.get_run(event.run_id)
+    if run:
+        tasks = await runtime.blackboard.list_models(event.run_id, "tasks", ResearchTask)
+        latest_claims = await runtime.blackboard.list_models(event.run_id, "claims", Claim)
+        latest_verifications = await runtime.blackboard.list_models(
+            event.run_id, "verifications", Verification
+        )
+        latest_artifacts = await runtime.blackboard.list_models(
+            event.run_id, "artifacts", Artifact
+        )
+        agent_specs = await runtime.blackboard.list_models(event.run_id, "agent_specs", AgentSpec)
+        run_state = build_run_state(
+            run,
+            tasks,
+            latest_claims,
+            latest_verifications,
+            agent_specs=agent_specs,
+            artifacts=latest_artifacts,
+        )
+        if _run_state_requests_skeptic_review(run_state):
+            await request_skeptic_review(
+                runtime,
+                event.run_id,
+                reason=(
+                    "Verified evidence is sufficient for a preliminary thesis; request an "
+                    "adversarial counterargument before final synthesis."
+                ),
+                producer="verifier-agent",
+            )
+            return
     emit(
         runtime,
         EventType.CLAIM_VERIFIED,
         event.run_id,
         "verifier-agent",
         verification_id=str(verification.id),
+    )
+
+
+async def skeptic_review(runtime: Runtime, event: EventEnvelope) -> None:
+    run = await runtime.blackboard.get_run(event.run_id)
+    if not run or await runtime.blackboard.get_final(event.run_id):
+        return
+    claims = await runtime.blackboard.list_models(event.run_id, "claims", Claim)
+    verifications = await runtime.blackboard.list_models(
+        event.run_id, "verifications", Verification
+    )
+    artifacts = await runtime.blackboard.list_models(event.run_id, "artifacts", Artifact)
+    if _counterargument_artifacts(artifacts):
+        emit(runtime, EventType.CLAIM_VERIFIED, event.run_id, "skeptic-agent")
+        return
+
+    verified_claims, verified_artifacts = _verified_claims_and_artifacts(
+        claims, verifications, artifacts
+    )
+    verified_knowledge_ids = {claim.id for claim in verified_claims} | {
+        artifact.legacy_object_id or artifact.id for artifact in verified_artifacts
+    }
+    if len(verified_knowledge_ids) < 2:
+        emit(runtime, EventType.CLAIM_VERIFIED, event.run_id, "skeptic-agent")
+        return
+
+    agent_specs = await runtime.blackboard.list_models(event.run_id, "agent_specs", AgentSpec)
+    skeptic_spec = _skeptic_agent_spec(event.run_id, agent_specs)
+    verified_claim_payload = [claim.model_dump(mode="json") for claim in verified_claims]
+    verified_artifact_payload = [
+        {
+            "id": str(artifact.id),
+            "type": artifact.artifact_type.value,
+            "branch": artifact.branch,
+            "summary": artifact.text_or_summary,
+            "confidence": artifact.confidence,
+            "sources": artifact.source_refs,
+        }
+        for artifact in verified_artifacts
+    ]
+    input_artifact_ids = [artifact.id for artifact in verified_artifacts]
+    try:
+        result = await runtime.llm.json(
+            event.run_id,
+            AgentRole.VERIFIER,
+            "skeptic-counterargument",
+            SYSTEM,
+            f"{build_agent_instruction_block(skeptic_spec)}\n\n"
+            "Challenge the emerging investment thesis before final aggregation. Use only "
+            "the verified evidence supplied here; do not invent sources. Return "
+            '{"strongest_counterargument":"...",'
+            '"contradicting_evidence":"...",'
+            '"risks_regime_changes":"...",'
+            '"what_would_change_conclusion":"...",'
+            '"confidence_calibration_comments":"..."}. '
+            f"Question: {run.question}. Verified claims: "
+            f"{json.dumps(verified_claim_payload)[:12000]}. Verified artifacts: "
+            f"{json.dumps(verified_artifact_payload)[:12000]}",
+        )
+    except Exception as exc:
+        await _persist_skeptic_failure_artifact(runtime, event.run_id, exc)
+        emit(runtime, EventType.CLAIM_VERIFIED, event.run_id, "skeptic-agent")
+        return
+
+    artifact = Artifact(
+        run_id=event.run_id,
+        artifact_type=ArtifactType.COUNTERARGUMENT,
+        branch="trust/skeptic",
+        text_or_summary=_skeptic_feedback_text(result),
+        tags=["trust", "skeptic", "counterargument", "risk", "synthesis"],
+        visibility=VisibilityScope.PUBLIC_VERIFIED,
+        status=ArtifactStatus.VERIFIED,
+        source_refs=sorted(
+            {
+                source
+                for claim in verified_claims
+                for source in claim.sources
+            }
+            | {
+                source
+                for verified_artifact in verified_artifacts
+                for source in verified_artifact.source_refs
+            }
+        ),
+        depends_on_artifact_ids=input_artifact_ids[:12],
+        contradicts_artifact_ids=input_artifact_ids[:12],
+    )
+    await persist_artifact(runtime, artifact, "skeptic-agent")
+    await persist_action(
+        runtime,
+        event.run_id,
+        PrincipalActionType.REQUEST_SKEPTIC_REVIEW,
+        "Created adversarial counterargument artifact for final aggregation.",
+        required_role="skeptic_agent",
+        target_branch="trust/skeptic",
+        expected_information_gain=InformationGain.MEDIUM,
+        priority=6,
+        producer="skeptic-agent",
+    )
+    emit(
+        runtime,
+        EventType.CLAIM_VERIFIED,
+        event.run_id,
+        "skeptic-agent",
+        skeptic_artifact_id=str(artifact.id),
     )
 
 
@@ -959,6 +1227,21 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
         agent_specs=agent_specs or [aggregator_spec],
         artifacts=artifacts,
     )
+    if (
+        _run_state_requests_skeptic_review(run_state)
+        and not event.payload.get("force")
+        and event.producer != "skeptic-agent"
+    ):
+        await request_skeptic_review(
+            runtime,
+            event.run_id,
+            reason=(
+                "Aggregation found enough verified evidence for a preliminary thesis but "
+                "no counterargument artifact; request skeptic review first."
+            ),
+            producer="aggregator-agent",
+        )
+        return
     routed_artifacts = select_context_for_agent(
         agent_spec=aggregator_spec,
         run_state=run_state,
@@ -977,16 +1260,28 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
         }
         for artifact in routed_artifacts
     ]
+    skeptic_context = [
+        {
+            "id": str(artifact.id),
+            "status": artifact.status.value,
+            "confidence": artifact.confidence,
+            "summary": artifact.text_or_summary,
+            "sources": artifact.source_refs,
+        }
+        for artifact in _counterargument_artifacts(artifacts)
+    ]
     result = await runtime.llm.json(
         event.run_id,
         AgentRole.AGGREGATOR,
         "aggregator",
         SYSTEM,
         f"{build_agent_instruction_block(aggregator_spec)}\n\n"
-        f"Answer the investment question using only verified claims. Include risks, opportunities, "
-        f'and limitations. Return {{"answer":"..."}}. Question: {run.question}. Claims: '
+        f"Answer the investment question using verified claims as support. Explicitly "
+        f"consider skeptic/counterargument context when discussing risks, regime changes, "
+        f'calibration, and limitations. Return {{"answer":"..."}}. Question: {run.question}. Claims: '
         f"{json.dumps([value.model_dump(mode='json') for value in verified])}. "
-        f"Routed artifact context: {json.dumps(routed_context)[:12000]}",
+        f"Routed artifact context: {json.dumps(routed_context)[:12000]}. "
+        f"Skeptic/counterargument context: {json.dumps(skeptic_context)[:12000]}",
     )
     final = FinalReport(
         run_id=event.run_id,
@@ -1084,6 +1379,7 @@ HANDLERS = {
     "tool-runner": {EventType.TASK_CREATED: execute_tool},
     "worker-agents": {EventType.OBSERVATION_CREATED: create_claim},
     "verifier-agent": {EventType.CLAIM_CREATED: verify_claim},
+    "skeptic-agent": {EventType.SKEPTIC_REVIEW_REQUESTED: skeptic_review},
     "aggregator-agent": {EventType.CLAIM_VERIFIED: aggregate},
     "judge-agent": {EventType.FINAL_CREATED: judge},
 }
