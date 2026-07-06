@@ -12,6 +12,7 @@ from src.agents.state import (
     title_from_branch,
 )
 from src.agents.knowledge_router import select_context_for_agent
+from src.agents.prompts import build_agent_instruction_block
 from src.common.budget import BudgetExceeded
 from src.common.failures import PermanentEventError, concise_exception, is_transient_failure
 from src.common.models import (
@@ -316,6 +317,37 @@ def role_for_branch(branch: str) -> tuple[str, str, list[str]]:
     return "research agent", "asset_research_agent", ["web_search", "market_data"]
 
 
+def agent_spec_for_branch(
+    run_id: UUID,
+    branch: str,
+    agent_specs: list[AgentSpec],
+    *,
+    task: ResearchTask | None = None,
+) -> AgentSpec:
+    for spec in agent_specs:
+        if spec.branch == branch:
+            return spec
+    name, role_template, tools = role_for_branch(branch)
+    task_text = f"{task.title} {task.question}" if task else branch
+    objective = (
+        f"Research {title_from_branch(branch)} evidence for: {task.question}"
+        if task
+        else f"Research {title_from_branch(branch)} evidence."
+    )
+    return AgentSpec(
+        run_id=run_id,
+        name=name,
+        role_template=role_template,
+        branch=branch,
+        domain=branch.split("/", 1)[0] if "/" in branch else None,
+        objective=objective,
+        allowed_tools=tools,
+        retrieval_tags=tags_for_text(f"{branch} {task_text}"),
+        visibility_scope=VisibilityScope.TEAM,
+        status=AgentStatus.ACTIVE,
+    )
+
+
 def build_organization(run: Run) -> OrganizationPlan:
     root = AgentSpec(
         run_id=run.id,
@@ -561,9 +593,9 @@ async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:
         )
     if task.status != "created":
         return
-    branch = branch_for_task(
-        task, await runtime.blackboard.list_models(event.run_id, "agent_specs", AgentSpec)
-    )
+    agent_specs = await runtime.blackboard.list_models(event.run_id, "agent_specs", AgentSpec)
+    branch = branch_for_task(task, agent_specs)
+    agent_spec = agent_spec_for_branch(event.run_id, branch, agent_specs, task=task)
     stage = "tool_execution"
     try:
         if task.tool == "market_data":
@@ -589,6 +621,7 @@ async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:
             AgentRole.RESEARCH,
             "tool-summary",
             SYSTEM,
+            f"{build_agent_instruction_block(agent_spec)}\n\n"
             f"Summarize the most decision-relevant facts from this tool output. Return "
             f'{{"summary":"..."}}. Output: {json.dumps(raw)[:30000]}',
         )
@@ -949,6 +982,7 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
         AgentRole.AGGREGATOR,
         "aggregator",
         SYSTEM,
+        f"{build_agent_instruction_block(aggregator_spec)}\n\n"
         f"Answer the investment question using only verified claims. Include risks, opportunities, "
         f'and limitations. Return {{"answer":"..."}}. Question: {run.question}. Claims: '
         f"{json.dumps([value.model_dump(mode='json') for value in verified])}. "

@@ -37,6 +37,7 @@ from src.common.models import (
     RunStatus,
     ToolBudget,
     Verification,
+    VisibilityScope,
 )
 
 
@@ -149,8 +150,21 @@ class FakeTools:
 class QueueLLM:
     def __init__(self, *results):
         self.results = list(results)
+        self.calls = []
 
     async def json(self, *_args, **_kwargs):
+        call = {"args": _args, "kwargs": _kwargs}
+        if len(_args) >= 5:
+            call.update(
+                {
+                    "run_id": _args[0],
+                    "role": _args[1],
+                    "name": _args[2],
+                    "system": _args[3],
+                    "prompt": _args[4],
+                }
+            )
+        self.calls.append(call)
         result = self.results.pop(0)
         if isinstance(result, Exception):
             raise result
@@ -374,6 +388,63 @@ def test_execute_tool_dual_writes_observation_artifact() -> None:
     )
 
 
+def test_tool_summary_prompt_includes_gold_agent_spec_context() -> None:
+    run = Run(
+        question="Will gold rise if Fed cuts rates?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="Gold after Fed cuts",
+        question="Find gold evidence after Fed cuts.",
+        tool="web_search",
+    )
+    llm = QueueLLM({"summary": "Gold context kept."})
+    rt = runtime(run, llm)
+    rt.blackboard.tasks.append(task)
+    rt.blackboard.agent_specs.append(
+        AgentSpec(
+            run_id=run.id,
+            name="gold agent",
+            role_template="asset_research_agent",
+            branch="market/gold",
+            domain="market",
+            objective="Research gold evidence relevant to Fed cuts.",
+            allowed_tools=["web_search", "market_data"],
+            retrieval_tags=["market:gold", "macro:rates"],
+            local_budget_usd=0.07,
+            visibility_scope=VisibilityScope.TEAM,
+        )
+    )
+
+    asyncio.run(
+        execute_tool(
+            rt,
+            EventEnvelope(
+                type=EventType.TASK_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"task_id": str(task.id)},
+            ),
+        )
+    )
+
+    prompt = llm.calls[-1]["prompt"]
+    assert llm.calls[-1]["name"] == "tool-summary"
+    assert "branch: market/gold" in prompt
+    assert "domain: market" in prompt
+    assert "objective: Research gold evidence relevant to Fed cuts." in prompt
+    assert "allowed_tools: web_search, market_data" in prompt
+    assert "retrieval_tags: market:gold, macro:rates" in prompt
+    assert "visibility_scope: team" in prompt
+    assert "local_budget_usd: $0.0700" in prompt
+    assert "You own gold evidence for branch market/gold" in prompt
+    assert "do not overreach into equities" in prompt
+    assert 'Return {"summary":"..."}' in prompt
+    assert rt.blackboard.observations[0].summary == "Gold context kept."
+
+
 def test_create_claim_dual_writes_claim_artifact() -> None:
     run = Run(
         question="Should I buy SAP stock?",
@@ -509,6 +580,66 @@ def test_aggregator_stringifies_nested_answer_object_and_dual_writes_final_artif
         for action in rt.blackboard.actions
     )
     assert rt.blackboard.artifacts[-1].artifact_type == ArtifactType.FINAL_REPORT
+
+
+def test_aggregator_prompt_includes_synthesis_role_and_verified_evidence_requirement() -> None:
+    run = Run(
+        question="Should I buy gold or equities after a Fed cut?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="Gold and equities",
+        question="Compare verified gold and equities evidence.",
+        tool="web_search",
+        status="completed",
+    )
+    claim = Claim(
+        run_id=run.id,
+        task_id=task.id,
+        statement="Verified gold evidence is stronger than equities evidence after the cut.",
+        evidence_observation_ids=[uuid4()],
+        confidence=0.8,
+    )
+    verification = Verification(
+        run_id=run.id, claim_id=claim.id, verdict="verified", rationale="Supported.", confidence=0.7
+    )
+    llm = QueueLLM({"answer": "Gold has the cleaner verified setup."})
+    rt = runtime(run, llm)
+    rt.blackboard.tasks.append(task)
+    rt.blackboard.claims.append(claim)
+    rt.blackboard.verifications.append(verification)
+    rt.blackboard.agent_specs.append(
+        AgentSpec(
+            run_id=run.id,
+            name="aggregator",
+            role_template="aggregator_agent",
+            branch="synthesis/aggregator",
+            domain="synthesis",
+            objective="Synthesize trusted claims into a decision-grade final report.",
+            allowed_tools=[],
+            retrieval_tags=["synthesis", "final"],
+            local_budget_usd=0.05,
+            visibility_scope=VisibilityScope.PUBLIC_VERIFIED,
+        )
+    )
+
+    asyncio.run(
+        aggregate(rt, EventEnvelope(type=EventType.CLAIM_VERIFIED, run_id=run.id, producer="test"))
+    )
+
+    prompt = llm.calls[-1]["prompt"]
+    assert llm.calls[-1]["name"] == "aggregator"
+    assert "branch: synthesis/aggregator" in prompt
+    assert "domain: synthesis" in prompt
+    assert "allowed_tools: none" in prompt
+    assert "visibility_scope: public_verified" in prompt
+    assert "Synthesis role: synthesize across verified claims only" in prompt
+    assert "Evidence rule: Use verified claims and public_verified artifacts as final support" in prompt
+    assert "trade-offs" in prompt
+    assert 'Return {"answer":"..."}' in prompt
+    assert rt.blackboard.final.answer == "Gold has the cleaner verified setup."
 
 
 def test_judge_normalizes_score_dual_writes_feedback_artifact_and_stop_action() -> None:
