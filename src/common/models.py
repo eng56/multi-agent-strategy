@@ -315,6 +315,22 @@ class Artifact(BaseModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+class DeadLetterRecord(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    run_id: UUID
+    event_id: UUID
+    event_type: EventType
+    event_producer: str
+    worker_role: str
+    retry_count: int = Field(default=0, ge=0)
+    max_retries: int = Field(default=0, ge=0)
+    classification: Literal["transient", "permanent", "unknown"]
+    error_type: str
+    error_message: str
+    event_payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
 class RunState(BaseModel):
     run_id: UUID
     iteration: int = 0
@@ -334,6 +350,7 @@ class RunState(BaseModel):
     agent_count: int = 0
     last_judge_score: float | None = None
     last_judge_feedback: str | None = None
+    dead_letter_count: int = 0
     stop_reasons: list[str] = Field(default_factory=list)
     next_action_candidates: list[PrincipalAction] = Field(default_factory=list)
 
@@ -349,6 +366,7 @@ class RunDetail(BaseModel):
     principal_actions: list[PrincipalAction] = Field(default_factory=list)
     agent_specs: list[AgentSpec] = Field(default_factory=list)
     artifacts: list[Artifact] = Field(default_factory=list)
+    dead_letters: list[DeadLetterRecord] = Field(default_factory=list)
     organization_plan: OrganizationPlan | None = None
 
 

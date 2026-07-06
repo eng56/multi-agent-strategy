@@ -11,6 +11,7 @@ from src.agents.state import (
     title_from_branch,
 )
 from src.common.budget import BudgetExceeded
+from src.common.failures import PermanentEventError, concise_exception, is_transient_failure
 from src.common.models import (
     ActionStatus,
     AgentRole,
@@ -88,10 +89,6 @@ async def persist_artifact(runtime: Runtime, artifact: Artifact, producer: str) 
         runtime, EventType.ARTIFACT_CREATED, artifact.run_id, producer, artifact_id=str(artifact.id)
     )
     return artifact
-
-
-def concise_exception(exc: Exception, limit: int = 240) -> str:
-    return f"{type(exc).__name__}: {str(exc)[:limit]}"
 
 
 async def fail_task(
@@ -556,7 +553,11 @@ async def plan(runtime: Runtime, event: EventEnvelope) -> None:
 async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:
     tasks = await runtime.blackboard.list_models(event.run_id, "tasks", ResearchTask)
     task = next((value for value in tasks if str(value.id) == event.payload.get("task_id")), None)
-    if not task or task.status != "created":
+    if not task:
+        raise PermanentEventError(
+            f"task.created references missing task_id={event.payload.get('task_id')}"
+        )
+    if task.status != "created":
         return
     branch = branch_for_task(
         task, await runtime.blackboard.list_models(event.run_id, "agent_specs", AgentSpec)
@@ -592,6 +593,8 @@ async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:
     except BudgetExceeded:
         raise
     except Exception as exc:
+        if is_transient_failure(exc):
+            raise
         await fail_task(runtime, task, branch, stage, exc, producer="tool-runner")
         return
     observation = Observation(
@@ -648,7 +651,9 @@ async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
         None,
     )
     if not observation:
-        return
+        raise PermanentEventError(
+            f"observation.created references missing observation_id={event.payload.get('observation_id')}"
+        )
     tasks = await runtime.blackboard.list_models(event.run_id, "tasks", ResearchTask)
     task = next((value for value in tasks if value.id == observation.task_id), None)
     branch = branch_for_task(task) if task else infer_semantic_branch(observation.summary)
@@ -672,6 +677,8 @@ async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
     except BudgetExceeded:
         raise
     except Exception as exc:
+        if is_transient_failure(exc):
+            raise
         if not task:
             raise
         await fail_task(runtime, task, branch, "claim_generation", exc, producer="worker-agents")
@@ -730,7 +737,9 @@ async def verify_claim(runtime: Runtime, event: EventEnvelope) -> None:
         (value for value in claims if str(value.id) == event.payload.get("claim_id")), None
     )
     if not claim:
-        return
+        raise PermanentEventError(
+            f"claim.created references missing claim_id={event.payload.get('claim_id')}"
+        )
     try:
         corroboration = await runtime.tools.web_search(
             event.run_id, verification_search_query(claim.statement)
@@ -738,6 +747,8 @@ async def verify_claim(runtime: Runtime, event: EventEnvelope) -> None:
     except BudgetExceeded:
         raise
     except Exception as exc:
+        if is_transient_failure(exc):
+            raise
         logger.warning(
             "verification search failed run_id=%s claim_id=%s error=%s",
             event.run_id,
@@ -760,6 +771,8 @@ async def verify_claim(runtime: Runtime, event: EventEnvelope) -> None:
         except BudgetExceeded:
             raise
         except Exception as exc:
+            if is_transient_failure(exc):
+                raise
             logger.warning(
                 "verification model failed run_id=%s claim_id=%s error=%s",
                 event.run_id,

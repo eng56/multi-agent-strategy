@@ -40,6 +40,17 @@ type Artifact = {
   supports_artifact_ids: string[];
 };
 
+type DeadLetterRecord = {
+  id: string;
+  event_type: string;
+  worker_role: string;
+  retry_count: number;
+  max_retries: number;
+  classification: string;
+  error_type: string;
+  error_message: string;
+};
+
 type OrganizationPlan = {
   root_agent_id: string;
   branches: string[];
@@ -61,6 +72,7 @@ type RunState = {
   agent_count: number;
   last_judge_score?: number;
   last_judge_feedback?: string;
+  dead_letter_count: number;
   stop_reasons: string[];
   next_action_candidates: PrincipalAction[];
 };
@@ -91,6 +103,7 @@ type Detail = {
   principal_actions: PrincipalAction[];
   agent_specs: AgentSpec[];
   artifacts: Artifact[];
+  dead_letters: DeadLetterRecord[];
   organization_plan?: OrganizationPlan;
 };
 
@@ -128,6 +141,7 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
   const b = detail.run.budget;
   const state = detail.run_state;
   const candidates = state?.next_action_candidates ?? [];
+  const deadLetters = detail.dead_letters ?? [];
 
   return (
     <main className="shell">
@@ -146,7 +160,7 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
         </section>
         <section className="card">
           <h2>Progress</h2>
-          <p>{detail.tasks.length} tasks · {detail.claims.length} claims · {detail.verifications.length} checks</p>
+          <p>{detail.tasks.length} tasks · {detail.claims.length} claims · {detail.verifications.length} checks · {deadLetters.length} dead letters</p>
         </section>
       </div>
 
@@ -154,7 +168,7 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
         <section className="card">
           <h2>RunState</h2>
           <p>Phase <strong>{state.current_phase}</strong> · ${state.budget_remaining.toFixed(2)} remaining · {state.agent_count} agent specs</p>
-          <p>Verified {state.verified_claim_count} · Rejected {state.rejected_claim_count} · Disputed {state.disputed_claim_count}</p>
+          <p>Verified {state.verified_claim_count} · Rejected {state.rejected_claim_count} · Disputed {state.disputed_claim_count} · Dead letters {state.dead_letter_count}</p>
           <p>Branches: {state.active_branches.join(", ") || "none yet"}</p>
           <p>Tools remaining: Tavily {state.tool_budget_remaining.tavily_credits ?? 0} · Market {state.tool_budget_remaining.market_data_requests ?? 0}</p>
           <h3>Open questions</h3>
@@ -168,6 +182,18 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
           <h3>Known facts</h3>
           <ul>{state.known_facts.map((fact) => <li key={fact}>{fact}</li>)}</ul>
           {state.stop_reasons.length > 0 && <p>Stop reasons: {state.stop_reasons.join(" · ")}</p>}
+        </section>
+      )}
+
+      {deadLetters.length > 0 && (
+        <section className="card">
+          <h2>Dead letters</h2>
+          {deadLetters.map((record) => (
+            <article key={record.id}>
+              <strong>{record.event_type}</strong> · {record.worker_role} · {record.classification} · retry {record.retry_count}/{record.max_retries}
+              <p>{record.error_type}: {record.error_message}</p>
+            </article>
+          ))}
         </section>
       )}
 

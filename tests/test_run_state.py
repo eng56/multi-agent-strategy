@@ -8,6 +8,8 @@ from src.common.models import (
     ArtifactType,
     Budget,
     Claim,
+    DeadLetterRecord,
+    EventType,
     FinalReport,
     ModelPolicy,
     OrganizationPlan,
@@ -384,3 +386,25 @@ def test_run_state_verified_count_includes_claim_artifacts() -> None:
     state = build_run_state(current_run, [], [], [], artifacts=[verified_claim])
 
     assert state.verified_claim_count == 1
+
+
+def test_run_state_exposes_dead_letter_count_and_stop_reason() -> None:
+    current_run = run()
+    record = DeadLetterRecord(
+        run_id=current_run.id,
+        event_id=uuid4(),
+        event_type=EventType.TASK_CREATED,
+        event_producer="planner-agent",
+        worker_role="tool-runner",
+        retry_count=2,
+        max_retries=2,
+        classification="transient",
+        error_type="TimeoutError",
+        error_message="temporary tool timeout",
+        event_payload={"task_id": str(uuid4())},
+    )
+
+    state = build_run_state(current_run, [], [], [], dead_letters=[record])
+
+    assert state.dead_letter_count == 1
+    assert state.stop_reasons == ["1 dead-lettered event(s)"]

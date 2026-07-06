@@ -7,6 +7,7 @@ from src.common.models import (
     ArtifactStatus,
     ArtifactType,
     Claim,
+    DeadLetterRecord,
     FinalReport,
     InformationGain,
     OrganizationPlan,
@@ -78,11 +79,13 @@ def build_run_state(
     agent_specs: list[AgentSpec] | None = None,
     artifacts: list[Artifact] | None = None,
     organization_plan: OrganizationPlan | None = None,
+    dead_letters: list[DeadLetterRecord] | None = None,
     iteration: int = 0,
 ) -> RunState:
     """Summarize blackboard contents into the Principal's control-state view."""
     artifacts = artifacts or []
     agent_specs = agent_specs or []
+    dead_letters = dead_letters or []
     verified_ids = {value.claim_id for value in verifications if value.verdict == "verified"}
     rejected_ids = {value.claim_id for value in verifications if value.verdict == "rejected"}
     uncertain_ids = {value.claim_id for value in verifications if value.verdict == "uncertain"}
@@ -129,6 +132,8 @@ def build_run_state(
         stop_reasons.append("partial final report produced before full synthesis")
     if run.status == RunStatus.COMPLETED:
         stop_reasons.append("run completed")
+    if dead_letters:
+        stop_reasons.append(f"{len(dead_letters)} dead-lettered event(s)")
 
     state = RunState(
         run_id=run.id,
@@ -160,6 +165,7 @@ def build_run_state(
         agent_count=len(agent_specs),
         last_judge_score=final.judge_score if final else None,
         last_judge_feedback=final.judge_feedback if final else None,
+        dead_letter_count=len(dead_letters),
         stop_reasons=stop_reasons,
     )
     state.next_action_candidates = _next_actions(
