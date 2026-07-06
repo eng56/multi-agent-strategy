@@ -767,11 +767,8 @@ def create_pr(repo_root: Path, branch_name: str, title: str, body: str) -> tuple
     url = result.stdout.strip()
     if not url:
         raise LoopError("gh pr create did not return a PR URL")
-    number = gh(
-        repo_root,
-        ["pr", "view", "--head", branch_name, "--json", "number", "--jq", ".number"],
-    ).stdout.strip()
-    if not number:
+    number = find_open_pr_number(repo_root, branch_name)
+    if number is None:
         raise LoopError("Could not determine created PR number")
     return number, url
 
