@@ -13,6 +13,7 @@ from src.agents.workflow import (
     semantic_branches,
     verify_claim,
 )
+from src.worker import MAX_HANDLER_RETRIES, dispatch
 from src.integrations.llm import LLMOutputError
 from src.common.models import (
     ActionStatus,
@@ -69,6 +70,7 @@ class FakeBlackboard:
         self.actions: list[PrincipalAction] = []
         self.agent_specs: list[AgentSpec] = []
         self.artifacts: list[Artifact] = []
+        self.dead_letters = []
         self.final: FinalReport | None = None
         self.organization_plan: OrganizationPlan | None = None
 
@@ -105,6 +107,9 @@ class FakeBlackboard:
     async def put_artifact(self, value):
         self.artifacts = [item for item in self.artifacts if item.id != value.id] + [value]
 
+    async def put_dead_letter(self, value):
+        self.dead_letters = [item for item in self.dead_letters if item.id != value.id] + [value]
+
     async def put_organization_plan(self, value):
         self.organization_plan = value
 
@@ -120,6 +125,7 @@ class FakeBlackboard:
             "principal_actions": self.actions,
             "agent_specs": self.agent_specs,
             "artifacts": self.artifacts,
+            "dead_letters": self.dead_letters,
         }.get(kind, [])
 
 
@@ -595,6 +601,125 @@ def test_execute_tool_failure_does_not_record_executed_tool_action() -> None:
         action.action_type == PrincipalActionType.REQUEST_TOOL_CALL
         and action.status == ActionStatus.FAILED
         and "Task failed during tool_execution" in action.reason
+        for action in rt.blackboard.actions
+    )
+
+
+def test_dispatch_retries_transient_tool_failure_with_metadata() -> None:
+    run = Run(
+        question="Should I buy SAP stock?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="SAP stock catalysts",
+        question="SAP stock catalysts",
+        tool="web_search",
+    )
+    rt = runtime(run, QueueLLM({"summary": "unused"}))
+    rt.blackboard.tasks.append(task)
+
+    class TimeoutTools(FakeTools):
+        async def web_search(self, _run_id, _query):
+            raise TimeoutError("temporary tool timeout")
+
+    rt.tools = TimeoutTools()
+
+    asyncio.run(
+        dispatch(
+            rt,
+            "tool-runner",
+            EventEnvelope(
+                type=EventType.TASK_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"task_id": str(task.id)},
+            ),
+        )
+    )
+
+    retry_events = [event for _topic, event in rt.published if event.type == EventType.TASK_CREATED]
+    assert len(retry_events) == 1
+    assert retry_events[0].payload["_retry_count"] == 1
+    assert retry_events[0].payload["_max_retries"] == MAX_HANDLER_RETRIES
+    assert retry_events[0].payload["_suggested_backoff_seconds"] == 1
+    assert retry_events[0].payload["_original_event_id"]
+    assert rt.blackboard.dead_letters == []
+    assert rt.blackboard.tasks[0].status == "created"
+    assert rt.blackboard.observations == []
+
+
+def test_dispatch_dead_letters_permanent_malformed_event_without_retry() -> None:
+    run = Run(
+        question="Should I buy SAP stock?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    rt = runtime(run, QueueLLM())
+
+    asyncio.run(
+        dispatch(
+            rt,
+            "tool-runner",
+            EventEnvelope(type=EventType.TASK_CREATED, run_id=run.id, producer="test"),
+        )
+    )
+
+    retry_events = [event for _topic, event in rt.published if event.type == EventType.TASK_CREATED]
+    assert retry_events == []
+    assert len(rt.blackboard.dead_letters) == 1
+    assert rt.blackboard.dead_letters[0].classification == "permanent"
+    assert rt.blackboard.dead_letters[0].retry_count == 0
+    assert rt.blackboard.run.status == RunStatus.FAILED
+    assert "Dead-lettered task.created" in rt.blackboard.run.failure_reason
+
+
+def test_dispatch_dead_letters_transient_after_max_retries_and_marks_task_failed() -> None:
+    run = Run(
+        question="Should I buy SAP stock?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="SAP stock catalysts",
+        question="SAP stock catalysts",
+        tool="web_search",
+    )
+    rt = runtime(run, QueueLLM({"summary": "unused"}))
+    rt.blackboard.tasks.append(task)
+
+    class TimeoutTools(FakeTools):
+        async def web_search(self, _run_id, _query):
+            raise TimeoutError("temporary tool timeout")
+
+    rt.tools = TimeoutTools()
+
+    asyncio.run(
+        dispatch(
+            rt,
+            "tool-runner",
+            EventEnvelope(
+                type=EventType.TASK_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"task_id": str(task.id), "_retry_count": MAX_HANDLER_RETRIES},
+            ),
+        )
+    )
+
+    retry_events = [event for _topic, event in rt.published if event.type == EventType.TASK_CREATED]
+    assert retry_events == []
+    assert len(rt.blackboard.dead_letters) == 1
+    assert rt.blackboard.dead_letters[0].classification == "transient"
+    assert rt.blackboard.dead_letters[0].retry_count == MAX_HANDLER_RETRIES
+    assert rt.blackboard.tasks[0].status == "failed"
+    assert rt.blackboard.run.status == RunStatus.FAILED
+    assert rt.blackboard.observations == []
+    assert not any(
+        action.action_type == PrincipalActionType.REQUEST_TOOL_CALL
+        and action.status == ActionStatus.EXECUTED
         for action in rt.blackboard.actions
     )
 

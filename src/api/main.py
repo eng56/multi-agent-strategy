@@ -12,6 +12,7 @@ from src.common.models import (
     Artifact,
     Budget,
     Claim,
+    DeadLetterRecord,
     EventEnvelope,
     EventType,
     Observation,
@@ -131,6 +132,7 @@ async def get_run_detail(run_id: str, _: None = Depends(require_api_token)) -> R
         principal_actions = await blackboard.list_models(run.id, "principal_actions", PrincipalAction)
         agent_specs = await blackboard.list_models(run.id, "agent_specs", AgentSpec)
         artifacts = await blackboard.list_models(run.id, "artifacts", Artifact)
+        dead_letters = await blackboard.list_models(run.id, "dead_letters", DeadLetterRecord)
         organization_plan = await blackboard.get_organization_plan(run.id)
         return RunDetail(
             run=run,
@@ -139,10 +141,21 @@ async def get_run_detail(run_id: str, _: None = Depends(require_api_token)) -> R
             claims=claims,
             verifications=verifications,
             final=final,
-            run_state=build_run_state(run, tasks, claims, verifications, final, agent_specs, artifacts, organization_plan),
+            run_state=build_run_state(
+                run,
+                tasks,
+                claims,
+                verifications,
+                final,
+                agent_specs,
+                artifacts,
+                organization_plan,
+                dead_letters,
+            ),
             principal_actions=principal_actions,
             agent_specs=agent_specs,
             artifacts=artifacts,
+            dead_letters=dead_letters,
             organization_plan=organization_plan,
         )
     except Exception as exc:
