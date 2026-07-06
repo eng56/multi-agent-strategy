@@ -32,6 +32,7 @@ BRANCH_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     ("macro/inflation", ("inflation", "cpi", "pce")),
     ("trust/source_verifier", ("verifier", "verification", "source")),
+    ("trust/skeptic", ("skeptic", "counterargument", "contradict", "risk")),
     ("synthesis/aggregator", ("aggregator", "aggregate", "final", "synthesis")),
     ("synthesis/judge", ("judge", "score", "payoff")),
 )

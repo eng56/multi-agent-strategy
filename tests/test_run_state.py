@@ -294,6 +294,23 @@ def test_run_state_suggests_skeptic_candidate_until_counterargument_exists() -> 
     }
 
 
+def test_run_state_does_not_suggest_skeptic_with_insufficient_verified_evidence() -> None:
+    current_run = run()
+    artifact = Artifact(
+        run_id=current_run.id,
+        artifact_type=ArtifactType.CLAIM,
+        branch="market/equities",
+        text_or_summary="Only one verified claim exists.",
+        status=ArtifactStatus.VERIFIED,
+    )
+
+    state = build_run_state(current_run, [], [], [], artifacts=[artifact])
+
+    assert PrincipalActionType.REQUEST_SKEPTIC_REVIEW not in {
+        action.action_type for action in state.next_action_candidates
+    }
+
+
 def test_run_state_rejected_and_disputed_counts_ignore_verification_artifacts() -> None:
     current_run = run()
     rejected_verification = Artifact(

@@ -20,6 +20,10 @@ services:
     <<: *app
     command: python -m src.worker
     environment: {AGENT_ROLE: verifier-agent}
+  skeptic-agent:
+    <<: *app
+    command: python -m src.worker
+    environment: {AGENT_ROLE: skeptic-agent}
   aggregator-agent:
     <<: *app
     command: python -m src.worker
