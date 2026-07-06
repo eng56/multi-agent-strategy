@@ -809,11 +809,41 @@ def prepare_environment(
     loaded = load_env_file(env_file) if env_file is not None else {}
     environment = os.environ.copy()
     environment.update(loaded)
+    venv_bin = repo_root / ".venv" / "bin"
+    if venv_bin.is_dir():
+        current_path = environment.get("PATH", "")
+        environment["PATH"] = f"{venv_bin}{os.pathsep}{current_path}" if current_path else str(venv_bin)
     return environment, list(loaded.values()), env_file
 
 
 def git_publish_enabled(config: dict[str, Any], key: str) -> bool:
     return bool_config(config["git"].get(key), f"git.{key}")
+
+
+def build_codex_input(
+    prompt_body: str,
+    mode: str,
+    env_file: Path | None,
+    repo_root: Path,
+    run_dir: Path,
+) -> str:
+    env_description = repo_relative(env_file, repo_root) if env_file is not None else "none"
+    return "\n".join(
+        [
+            "# Codex loop execution context",
+            "",
+            f"- Loop mode: `{mode}`.",
+            f"- Environment file loaded: `{env_description}`; values are secrets and must never be printed.",
+            f"- Run artifacts directory: `{repo_relative(run_dir, repo_root)}`.",
+            "- If the prompt text mentions a different default environment, this loop mode is authoritative.",
+            "- Do not print, rotate, or modify credentials.",
+            "- Save requested run artifacts in the run artifacts directory above.",
+            "",
+            "# Original prompt",
+            "",
+            prompt_body,
+        ]
+    )
 
 
 def run_one(
@@ -833,7 +863,7 @@ def run_one(
         else validate_checks(config["checks"])
     )
     git_config = config["git"]
-    environment, secrets, _ = prepare_environment(config, metadata, mode, repo_root)
+    environment, secrets, env_file = prepare_environment(config, metadata, mode, repo_root)
     redact_enabled = bool(config["security"].get("redact_env_values_in_logs", True))
 
     started_at = utc_now()
@@ -861,6 +891,8 @@ def run_one(
         "run_dir": run_key,
         "diff_path": repo_relative(diff_path, repo_root),
         "logs_path": repo_relative(codex_log, repo_root),
+        "mode": mode,
+        "env_file": repo_relative(env_file, repo_root) if env_file is not None else None,
     }
     atomic_write_json(result_path, result)
     set_status(state, state_path, prompt_key, "PENDING", run_key)
@@ -883,7 +915,7 @@ def run_one(
         codex_exit_code = execute_codex(
             command,
             codex_config["pass_prompt_as"],
-            prompt_body,
+            build_codex_input(prompt_body, mode, env_file, repo_root, run_dir),
             repo_root,
             environment,
             codex_log,
