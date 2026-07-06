@@ -589,7 +589,7 @@ def test_execute_tool_failure_does_not_record_executed_tool_action() -> None:
     )
 
 
-def test_verify_claim_failure_does_not_record_executed_verification_action() -> None:
+def test_verify_claim_search_failure_marks_claim_uncertain_without_failing_run() -> None:
     run = Run(
         question="Should I buy SAP stock?",
         models=model_policy(),
@@ -602,8 +602,17 @@ def test_verify_claim_failure_does_not_record_executed_verification_action() -> 
         evidence_observation_ids=[uuid4()],
         confidence=0.8,
     )
-    rt = runtime(run, QueueLLM({"verdict": "verified", "rationale": "unused", "confidence": 0.7}))
+    claim_artifact = Artifact(
+        run_id=run.id,
+        artifact_type=ArtifactType.CLAIM,
+        branch="market/equities",
+        text_or_summary=claim.statement,
+        legacy_object_type="claim",
+        legacy_object_id=claim.id,
+    )
+    rt = runtime(run, QueueLLM())
     rt.blackboard.claims.append(claim)
+    rt.blackboard.artifacts.append(claim_artifact)
 
     class FailingTools(FakeTools):
         async def web_search(self, _run_id, _query):
@@ -611,25 +620,27 @@ def test_verify_claim_failure_does_not_record_executed_verification_action() -> 
 
     rt.tools = FailingTools()
 
-    try:
-        asyncio.run(
-            verify_claim(
-                rt,
-                EventEnvelope(
-                    type=EventType.CLAIM_CREATED,
-                    run_id=run.id,
-                    producer="test",
-                    payload={"claim_id": str(claim.id)},
-                ),
-            )
+    asyncio.run(
+        verify_claim(
+            rt,
+            EventEnvelope(
+                type=EventType.CLAIM_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"claim_id": str(claim.id)},
+            ),
         )
-    except RuntimeError:
-        pass
+    )
 
-    assert not any(
+    assert rt.blackboard.verifications[-1].verdict == "uncertain"
+    assert any(
         action.action_type == PrincipalActionType.REQUEST_VERIFICATION
         for action in rt.blackboard.actions
     )
+    promoted = next(item for item in rt.blackboard.artifacts if item.id == claim_artifact.id)
+    assert promoted.status == ArtifactStatus.DISPUTED
+    assert rt.blackboard.artifacts[-1].artifact_type == ArtifactType.VERIFICATION
+    assert rt.blackboard.artifacts[-1].status == ArtifactStatus.DISPUTED
 
 
 def test_aggregate_failure_does_not_record_executed_aggregation_action() -> None:

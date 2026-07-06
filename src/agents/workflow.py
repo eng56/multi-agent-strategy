@@ -604,6 +604,22 @@ async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
     emit(runtime, EventType.CLAIM_CREATED, event.run_id, "worker-agents", claim_id=str(claim.id))
 
 
+def verification_search_query(statement: str) -> str:
+    normalized = " ".join(statement.split())
+    return normalized[:280].rsplit(" ", 1)[0] or normalized[:280]
+
+
+def failed_verification_result(exc: Exception) -> dict[str, Any]:
+    return {
+        "verdict": "uncertain",
+        "rationale": (
+            "Automated corroboration search failed, so this claim remains disputed instead of "
+            f"being treated as verified: {type(exc).__name__}: {str(exc)[:240]}"
+        ),
+        "confidence": 0.0,
+    }
+
+
 async def verify_claim(runtime: Runtime, event: EventEnvelope) -> None:
     claims = await runtime.blackboard.list_models(event.run_id, "claims", Claim)
     claim = next(
@@ -611,16 +627,29 @@ async def verify_claim(runtime: Runtime, event: EventEnvelope) -> None:
     )
     if not claim:
         return
-    corroboration = await runtime.tools.web_search(event.run_id, claim.statement)
-    result = await runtime.llm.json(
-        event.run_id,
-        AgentRole.VERIFIER,
-        "claim-verifier",
-        SYSTEM,
-        f"Verify this claim using the corroborating results. Return "
-        f'{{"verdict":"verified|rejected|uncertain","rationale":"...","confidence":0.0}}. '
-        f"Claim: {claim.statement}. Results: {json.dumps(corroboration)[:30000]}",
-    )
+    try:
+        corroboration = await runtime.tools.web_search(
+            event.run_id, verification_search_query(claim.statement)
+        )
+    except Exception as exc:
+        logger.warning(
+            "verification search failed run_id=%s claim_id=%s error=%s",
+            event.run_id,
+            claim.id,
+            exc,
+        )
+        corroboration = {"results": [], "error": f"{type(exc).__name__}: {str(exc)[:500]}"}
+        result = failed_verification_result(exc)
+    else:
+        result = await runtime.llm.json(
+            event.run_id,
+            AgentRole.VERIFIER,
+            "claim-verifier",
+            SYSTEM,
+            f"Verify this claim using the corroborating results. Return "
+            f'{{"verdict":"verified|rejected|uncertain","rationale":"...","confidence":0.0}}. '
+            f"Claim: {claim.statement}. Results: {json.dumps(corroboration)[:30000]}",
+        )
     sources = [item["url"] for item in corroboration.get("results", []) if item.get("url")]
     artifact_pointer = runtime.artifacts.put_json(
         event.run_id, "verification-search", corroboration

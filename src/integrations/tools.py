@@ -1,4 +1,5 @@
 from datetime import date, timedelta
+import re
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -6,6 +7,14 @@ import httpx
 
 from src.common.budget import PersistentBudget
 from src.integrations.llm import LangfuseRecorder
+
+
+def clean_search_query(query: str, max_chars: int = 360) -> str:
+    cleaned = re.sub(r"\s+", " ", query).strip()
+    cleaned = cleaned.replace("```", "") or "investment research"
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[:max_chars].rsplit(" ", 1)[0] or cleaned[:max_chars]
 
 
 class ResearchTools:
@@ -26,6 +35,7 @@ class ResearchTools:
         self.market_data_base_url = market_data_base_url.rstrip("/")
 
     async def web_search(self, run_id: UUID, query: str) -> dict[str, Any]:
+        query = clean_search_query(query)
         await self.budget.consume_tool(run_id, "tavily", 1)
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(
@@ -52,7 +62,9 @@ class ResearchTools:
         url = f"{self.market_data_base_url}/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}"
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.get(
-                url, params={"adjusted": "true"}, headers={"Authorization": f"Bearer {self.market_data_api_key}"}
+                url,
+                params={"adjusted": "true"},
+                headers={"Authorization": f"Bearer {self.market_data_api_key}"},
             )
             response.raise_for_status()
             result = response.json()
