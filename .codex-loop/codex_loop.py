@@ -11,6 +11,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -25,10 +26,12 @@ STATUSES = {
     "READY_FOR_REVIEW",
     "NO_CHANGES",
     "MERGING",
+    "DEPLOYING",
+    "DEPLOY_FAILED",
     "MERGED",
     "COMPLETED_MANUALLY",
 }
-REVIEW_GATE_STATUSES = {"RUNNING_CODEX", "TESTING", "READY_FOR_REVIEW", "MERGING"}
+REVIEW_GATE_STATUSES = {"RUNNING_CODEX", "TESTING", "READY_FOR_REVIEW", "MERGING", "DEPLOYING"}
 FINAL_STATUSES = {"COMPLETED_MANUALLY", "MERGED", "NO_CHANGES"}
 CONTINUE_SUCCESS_STATUSES = {"MERGED", "NO_CHANGES"}
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -773,6 +776,14 @@ def create_pr(repo_root: Path, branch_name: str, title: str, body: str) -> tuple
     return number, url
 
 
+def gh_json(repo_root: Path, arguments: list[str], label: str) -> Any:
+    result = gh(repo_root, arguments)
+    try:
+        return json.loads(result.stdout or "null")
+    except json.JSONDecodeError as error:
+        raise LoopError(f"Could not parse {label} JSON: {error}") from error
+
+
 def merge_pr(
     repo_root: Path,
     pr_number: str,
@@ -790,6 +801,204 @@ def switch_to_base_branch(repo_root: Path, base_branch: str, sync: bool) -> None
         git(repo_root, ["pull", "--ff-only", "origin", base_branch])
 
 
+def append_log(path: Path, text: str) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(text)
+        if not text.endswith("\n"):
+            handle.write("\n")
+
+
+def wait_for_workflow_head(
+    repo_root: Path,
+    workflow: str,
+    branch: str,
+    head_sha: str,
+    timeout_seconds: int,
+    log_path: Path,
+    label: str,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    append_log(
+        log_path,
+        f"Waiting for {label} workflow={workflow} branch={branch} head_sha={head_sha}",
+    )
+    while True:
+        runs = gh_json(
+            repo_root,
+            [
+                "run",
+                "list",
+                "--workflow",
+                workflow,
+                "--branch",
+                branch,
+                "--limit",
+                "20",
+                "--json",
+                "databaseId,status,conclusion,headSha,url,createdAt,updatedAt",
+            ],
+            f"{label} run list",
+        )
+        if not isinstance(runs, list):
+            raise LoopError(f"{label} run list returned non-list JSON")
+        for run in runs:
+            if not isinstance(run, dict) or run.get("headSha") != head_sha:
+                continue
+            append_log(
+                log_path,
+                (
+                    f"{label} run {run.get('databaseId')} status={run.get('status')} "
+                    f"conclusion={run.get('conclusion')} url={run.get('url')}"
+                ),
+            )
+            if run.get("status") == "completed":
+                if run.get("conclusion") != "success":
+                    raise LoopError(f"{label} workflow failed: {run.get('url')}")
+                return run
+        if time.monotonic() >= deadline:
+            raise LoopError(f"Timed out waiting for {label} workflow for {head_sha}")
+        time.sleep(10)
+
+
+def dispatch_workflow(repo_root: Path, workflow: str, ref: str, log_path: Path) -> str:
+    result = gh(repo_root, ["workflow", "run", workflow, "--ref", ref])
+    append_log(log_path, f"$ gh workflow run {workflow} --ref {ref}")
+    append_log(log_path, result.stdout + result.stderr)
+    match = re.search(r"/runs/(\d+)", result.stdout)
+    if match:
+        return match.group(1)
+
+    deadline = time.monotonic() + 60
+    while True:
+        runs = gh_json(
+            repo_root,
+            [
+                "run",
+                "list",
+                "--workflow",
+                workflow,
+                "--limit",
+                "10",
+                "--json",
+                "databaseId,event,status,conclusion,headBranch,url,createdAt",
+            ],
+            "workflow dispatch run list",
+        )
+        if isinstance(runs, list):
+            for run in runs:
+                if (
+                    isinstance(run, dict)
+                    and run.get("event") == "workflow_dispatch"
+                    and run.get("headBranch") == ref
+                ):
+                    run_id = str(run.get("databaseId") or "")
+                    if run_id:
+                        return run_id
+        if time.monotonic() >= deadline:
+            raise LoopError(f"Could not find dispatched workflow run for {workflow} on {ref}")
+        time.sleep(5)
+
+
+def wait_for_run_id(
+    repo_root: Path,
+    run_id: str,
+    timeout_seconds: int,
+    log_path: Path,
+    label: str,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    append_log(log_path, f"Waiting for {label} run_id={run_id}")
+    while True:
+        run = gh_json(
+            repo_root,
+            [
+                "run",
+                "view",
+                run_id,
+                "--json",
+                "databaseId,status,conclusion,headSha,url,createdAt,updatedAt",
+            ],
+            f"{label} run view",
+        )
+        if not isinstance(run, dict):
+            raise LoopError(f"{label} run view returned non-object JSON")
+        append_log(
+            log_path,
+            (
+                f"{label} run {run.get('databaseId')} status={run.get('status')} "
+                f"conclusion={run.get('conclusion')} url={run.get('url')}"
+            ),
+        )
+        if run.get("status") == "completed":
+            if run.get("conclusion") != "success":
+                raise LoopError(f"{label} workflow failed: {run.get('url')}")
+            return run
+        if time.monotonic() >= deadline:
+            raise LoopError(f"Timed out waiting for {label} workflow run {run_id}")
+        time.sleep(10)
+
+
+def download_smoke_artifact(repo_root: Path, smoke_run_id: str, run_dir: Path, log_path: Path) -> None:
+    result = gh(
+        repo_root,
+        [
+            "run",
+            "download",
+            smoke_run_id,
+            "-n",
+            "deployed-smoke-run-detail",
+            "-D",
+            str(run_dir),
+        ],
+        check=False,
+    )
+    append_log(log_path, f"$ gh run download {smoke_run_id} -n deployed-smoke-run-detail -D {run_dir}")
+    append_log(log_path, result.stdout + result.stderr)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise LoopError(f"Could not download production smoke artifact: {detail}")
+
+
+def validate_prod_deployment(
+    repo_root: Path,
+    base_branch: str,
+    head_sha: str,
+    run_dir: Path,
+    result: dict[str, Any],
+    result_path: Path,
+) -> None:
+    deploy_log = run_dir / "deployment.log"
+    smoke_log = run_dir / "prod-smoke.log"
+
+    deploy_run = wait_for_workflow_head(
+        repo_root,
+        "Deploy GKE Autopilot",
+        base_branch,
+        head_sha,
+        20 * 60,
+        deploy_log,
+        "GKE deploy",
+    )
+    result["deployment"] = {
+        "workflow": "Deploy GKE Autopilot",
+        "run_id": deploy_run.get("databaseId"),
+        "url": deploy_run.get("url"),
+        "head_sha": head_sha,
+    }
+    atomic_write_json(result_path, result)
+
+    smoke_run_id = dispatch_workflow(repo_root, ".github/workflows/prod-smoke.yml", base_branch, smoke_log)
+    smoke_run = wait_for_run_id(repo_root, smoke_run_id, 20 * 60, smoke_log, "production smoke")
+    result["production_smoke"] = {
+        "workflow": ".github/workflows/prod-smoke.yml",
+        "run_id": smoke_run.get("databaseId"),
+        "url": smoke_run.get("url"),
+        "head_sha": smoke_run.get("headSha"),
+    }
+    atomic_write_json(result_path, result)
+    download_smoke_artifact(repo_root, smoke_run_id, run_dir, smoke_log)
+
+
 def unique_run_dir(runs_dir: Path, base_name: str) -> Path:
     candidate = runs_dir / base_name
     counter = 2
@@ -804,9 +1013,14 @@ def prepare_environment(
     metadata: dict[str, Any],
     mode: str,
     repo_root: Path,
+    allow_prompt_secrets_override: bool,
 ) -> tuple[dict[str, str], list[str], Path | None]:
     env_file = env_path_for_mode(config, mode, repo_root)
-    if env_file is not None and metadata.get("allow_secrets") is False:
+    if (
+        env_file is not None
+        and metadata.get("allow_secrets") is False
+        and not allow_prompt_secrets_override
+    ):
         raise LoopError("This prompt sets allow_secrets: false and cannot run in a secrets mode")
     loaded = load_env_file(env_file) if env_file is not None else {}
     environment = os.environ.copy()
@@ -828,6 +1042,7 @@ def build_codex_input(
     env_file: Path | None,
     repo_root: Path,
     run_dir: Path,
+    allow_prompt_secrets_override: bool,
 ) -> str:
     env_description = repo_relative(env_file, repo_root) if env_file is not None else "none"
     return "\n".join(
@@ -836,8 +1051,10 @@ def build_codex_input(
             "",
             f"- Loop mode: `{mode}`.",
             f"- Environment file loaded: `{env_description}`; values are secrets and must never be printed.",
+            f"- Prompt secret safety override: `{allow_prompt_secrets_override}`.",
             f"- Run artifacts directory: `{repo_relative(run_dir, repo_root)}`.",
             "- If the prompt text mentions a different default environment, this loop mode is authoritative.",
+            "- In prod mode, the loop validates deployment after merge using the GitHub Production Smoke Test workflow.",
             "- Do not print, rotate, or modify credentials.",
             "- Save requested run artifacts in the run artifacts directory above.",
             "",
@@ -856,6 +1073,7 @@ def run_one(
     state: dict[str, Any],
     state_path: Path,
     mode: str,
+    allow_prompt_secrets_override: bool,
 ) -> str:
     ensure_clean_worktree(repo_root)
     metadata, prompt_body = parse_prompt(prompt_path)
@@ -865,7 +1083,13 @@ def run_one(
         else validate_checks(config["checks"])
     )
     git_config = config["git"]
-    environment, secrets, env_file = prepare_environment(config, metadata, mode, repo_root)
+    environment, secrets, env_file = prepare_environment(
+        config,
+        metadata,
+        mode,
+        repo_root,
+        allow_prompt_secrets_override,
+    )
     redact_enabled = bool(config["security"].get("redact_env_values_in_logs", True))
 
     started_at = utc_now()
@@ -895,6 +1119,7 @@ def run_one(
         "logs_path": repo_relative(codex_log, repo_root),
         "mode": mode,
         "env_file": repo_relative(env_file, repo_root) if env_file is not None else None,
+        "prompt_secrets_override": allow_prompt_secrets_override,
     }
     atomic_write_json(result_path, result)
     set_status(state, state_path, prompt_key, "PENDING", run_key)
@@ -917,7 +1142,14 @@ def run_one(
         codex_exit_code = execute_codex(
             command,
             codex_config["pass_prompt_as"],
-            build_codex_input(prompt_body, mode, env_file, repo_root, run_dir),
+            build_codex_input(
+                prompt_body,
+                mode,
+                env_file,
+                repo_root,
+                run_dir,
+                allow_prompt_secrets_override,
+            ),
             repo_root,
             environment,
             codex_log,
@@ -979,11 +1211,6 @@ def run_one(
                 run_key,
             )
             if commit_sha is None:
-                result["status"] = "NO_CHANGES"
-                result["completed_at"] = isoformat()
-                result["base_branch"] = base_branch
-                set_status(state, state_path, prompt_key, "NO_CHANGES", run_key)
-                atomic_write_json(result_path, result)
                 switch_to_base_branch(
                     repo_root,
                     base_branch,
@@ -992,6 +1219,25 @@ def run_one(
                         "git.sync_base_branch_after_merge",
                     ),
                 )
+                base_sha = git_stdout(repo_root, ["rev-parse", "HEAD"])
+                result["base_branch"] = base_branch
+                result["deployed_sha"] = base_sha
+                if mode == "prod":
+                    result["status"] = "DEPLOYING"
+                    set_status(state, state_path, prompt_key, "DEPLOYING", run_key)
+                    atomic_write_json(result_path, result)
+                    validate_prod_deployment(
+                        repo_root,
+                        base_branch,
+                        base_sha,
+                        run_dir,
+                        result,
+                        result_path,
+                    )
+                result["status"] = "NO_CHANGES"
+                result["completed_at"] = isoformat()
+                set_status(state, state_path, prompt_key, "NO_CHANGES", run_key)
+                atomic_write_json(result_path, result)
                 return "NO_CHANGES"
             result["commit_sha"] = commit_sha
             atomic_write_json(result_path, result)
@@ -1022,12 +1268,6 @@ def run_one(
                 pr_number,
                 bool_config(git_config.get("delete_branch_on_merge"), "git.delete_branch_on_merge"),
             )
-            result["status"] = "MERGED"
-            result["merged_at"] = isoformat()
-            result["base_branch"] = base_branch
-            set_status(state, state_path, prompt_key, "MERGED", run_key)
-            atomic_write_json(result_path, result)
-
             switch_to_base_branch(
                 repo_root,
                 base_branch,
@@ -1036,14 +1276,35 @@ def run_one(
                     "git.sync_base_branch_after_merge",
                 ),
             )
+            base_sha = git_stdout(repo_root, ["rev-parse", "HEAD"])
+            result["merged_at"] = isoformat()
+            result["base_branch"] = base_branch
+            result["merged_sha"] = base_sha
+            if mode == "prod":
+                result["status"] = "DEPLOYING"
+                set_status(state, state_path, prompt_key, "DEPLOYING", run_key)
+                atomic_write_json(result_path, result)
+                validate_prod_deployment(
+                    repo_root,
+                    base_branch,
+                    base_sha,
+                    run_dir,
+                    result,
+                    result_path,
+                )
+            result["status"] = "MERGED"
+            set_status(state, state_path, prompt_key, "MERGED", run_key)
+            atomic_write_json(result_path, result)
             return "MERGED"
         except LoopError as error:
             codex_log.write_text(
                 codex_log.read_text(encoding="utf-8") + f"\nPublish error: {error}\n",
                 encoding="utf-8",
             )
-            result["status"] = "READY_FOR_REVIEW"
-            set_status(state, state_path, prompt_key, "READY_FOR_REVIEW", run_key)
+            result["status"] = (
+                "DEPLOY_FAILED" if result.get("status") == "DEPLOYING" else "READY_FOR_REVIEW"
+            )
+            set_status(state, state_path, prompt_key, result["status"], run_key)
             atomic_write_json(result_path, result)
             raise
     except LoopError as error:
@@ -1067,6 +1328,7 @@ def print_dry_run(
     config: dict[str, Any],
     config_path: Path,
     mode: str,
+    allow_prompt_secrets_override: bool,
 ) -> None:
     metadata, _ = parse_prompt(prompt_path)
     checks = (
@@ -1075,7 +1337,11 @@ def print_dry_run(
         else validate_checks(config["checks"])
     )
     env_file = env_path_for_mode(config, mode, repo_root)
-    if env_file is not None and metadata.get("allow_secrets") is False:
+    if (
+        env_file is not None
+        and metadata.get("allow_secrets") is False
+        and not allow_prompt_secrets_override
+    ):
         raise LoopError("This prompt sets allow_secrets: false and cannot run in a secrets mode")
     _, branch_name = build_names(prompt_path, utc_now())
     base_branch = default_branch(repo_root)
@@ -1088,6 +1354,7 @@ def print_dry_run(
     print(f"Prompt: {repo_relative(prompt_path, repo_root)}")
     print(f"Branch: {branch_name}")
     print(f"Mode: {mode}")
+    print(f"Prompt secret safety override: {allow_prompt_secrets_override}")
     print(
         "Environment file: "
         + (repo_relative(env_file, repo_root) if env_file is not None else "none")
@@ -1102,6 +1369,9 @@ def print_dry_run(
     print("  - gh pr create (if needed)")
     print("  - gh pr merge --merge --delete-branch")
     print("  - or mark NO_CHANGES when checks pass without a commit-worthy diff")
+    if mode == "prod":
+        print("  - wait for GKE deploy workflow on main")
+        print("  - dispatch and wait for Production Smoke Test workflow")
     print("  - git switch <base-branch> && git pull --ff-only")
     print("Checks:")
     if checks:
@@ -1136,6 +1406,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", help="Use a specific YAML config file")
     parser.add_argument("--mode", choices=("code", "staging", "prod"), default="code")
     parser.add_argument("--allow-prod", action="store_true", help="Required with --mode prod")
+    parser.add_argument(
+        "--allow-prompt-secrets-override",
+        action="store_true",
+        help=(
+            "Allow a secrets mode to run prompts that declare allow_secrets: false. "
+            "Use only when prod verification is intentionally required."
+        ),
+    )
     parser.add_argument(
         "--continue-on-success",
         action="store_true",
@@ -1197,6 +1475,7 @@ def main() -> int:
                     config,
                     config_path,
                     args.mode,
+                    args.allow_prompt_secrets_override,
                 )
                 return 0
 
@@ -1209,6 +1488,7 @@ def main() -> int:
                 state,
                 state_path,
                 args.mode,
+                args.allow_prompt_secrets_override,
             )
             processed.add(prompt_key)
             if status not in CONTINUE_SUCCESS_STATUSES or not args.continue_on_success:
