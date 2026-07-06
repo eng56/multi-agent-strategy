@@ -1,0 +1,27 @@
+codex:
+  command:
+    - codex
+    - exec
+  args:
+    - "--full-auto"
+  pass_prompt_as: "stdin"
+
+checks:
+  - ["ruff", "check", "."]
+  - ["pytest"]
+
+git:
+  create_branch: true
+  commit_on_success: true
+  push_on_success: true
+  create_pr_on_success: true
+  merge_pr_on_success: true
+  delete_branch_on_merge: true
+  sync_base_branch_after_merge: true
+
+security:
+  env_file_by_mode:
+    code: null
+    staging: ".codex-loop/secrets/staging.env"
+    prod: ".codex-loop/secrets/prod.env"
+  redact_env_values_in_logs: true

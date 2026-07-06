@@ -6,3 +6,11 @@ __pycache__/
 *.pyc
 frontend/node_modules/
 frontend/.next/
+
+# Local Codex loop state, output, configuration, and credentials.
+.codex-loop/config.yaml
+.codex-loop/state.json
+.codex-loop/runs/*
+!.codex-loop/runs/.gitkeep
+.codex-loop/secrets/*.env
+!.codex-loop/secrets/runtime.env.example
