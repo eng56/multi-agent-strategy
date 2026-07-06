@@ -60,7 +60,7 @@ jobs:
           sed -i "s|APP_IMAGE|${{ steps.image.outputs.value }}|g; s|GCP_PROJECT_ID|${{ env.GCP_PROJECT_ID }}|g" deploy/gke/base/*.yaml
           kubectl apply -k deploy/gke/base
           failed=0
-          for deployment in orchestrator-api planner-agent worker-agents verifier-agent aggregator-agent judge-agent tool-runner; do
+          for deployment in orchestrator-api planner-agent worker-agents verifier-agent skeptic-agent aggregator-agent judge-agent tool-runner; do
             if ! kubectl rollout status "deployment/$deployment" --timeout=10m; then
               failed=1
               printf '\n--- Diagnostics for %s ---\n' "$deployment" >&2
