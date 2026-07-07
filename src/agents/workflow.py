@@ -905,13 +905,16 @@ def evidence_summary(bundle: EvidenceBundle, branch: str) -> str:
     source_count = len(bundle.items)
     strongest_items = sorted(
         bundle.items,
-        key=lambda item: item.confidence,
+        key=lambda item: (item.quality_score, item.confidence),
         reverse=True,
     )[:MAX_EVIDENCE_SNIPPETS]
     snippets = [
         compact_text(
-            f"{item.source_title}: {item.snippet or 'provider returned no snippet'}",
-            max_chars=220,
+            f"{item.source_title} [{item.source_tier.value}, score "
+            f"{item.quality_score}, {item.domain or 'unknown domain'}; "
+            f"{item.source_quality_reason}]: "
+            f"{item.snippet or 'provider returned no snippet'}",
+            max_chars=320,
         )
         for item in strongest_items
     ]
@@ -934,10 +937,21 @@ def evidence_summary(bundle: EvidenceBundle, branch: str) -> str:
     if bundle.raw_result_artifact_uri is None:
         limitations.append("No raw provider artifact URI was returned by EvidenceEngine.")
 
+    tier_counts = quality.get("source_tiers", {})
+    tier_summary = ", ".join(
+        f"{count} {tier}" for tier, count in tier_counts.items() if count
+    )
+    if not tier_summary:
+        tier_summary = "no classified sources"
+    quality_text = (
+        f"{tier_summary}; average score {quality.get('average_quality_score', 0.0)}; "
+        f"top score {quality.get('top_quality_score', 0)}"
+    )
     limitation_text = "; ".join(limitations) if limitations else "no material limitations flagged"
     return (
         f"EvidenceEngine observation for branch {branch}: {source_count} source(s). "
         f"Strongest evidence snippets: {strongest}. "
+        f"Source quality: {quality_text}. "
         f"Source limitations: {limitation_text}. "
         f"Branch: {branch}."
     )
