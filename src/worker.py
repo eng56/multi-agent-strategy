@@ -10,6 +10,7 @@ from src.agents.workflow import (
     HANDLERS,
     aggregate,
     deterministic_partial,
+    evaluate_principal_policy_safely,
     fail_run_if_all_tasks_failed,
 )
 from src.common.budget import BudgetExceeded
@@ -178,6 +179,9 @@ async def _dead_letter_event(
         f"{type(exc).__name__}: {error_message[:240]}"
     )
     await _mark_affected_state(runtime, event, reason)
+    await evaluate_principal_policy_safely(
+        runtime, event.run_id, trigger="dead_letter.created"
+    )
     logger.error(
         "dead-lettered handler event role=%s event_type=%s run_id=%s classification=%s retry=%s/%s",
         role,
