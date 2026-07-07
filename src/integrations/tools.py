@@ -10,6 +10,8 @@ from src.agents.evidence_engine import (
     EvidenceBundle,
     EvidenceEngine,
     EvidenceRequest,
+    ExaProvider,
+    FirecrawlFetcher,
     TavilyProvider,
 )
 from src.common.budget import PersistentBudget
@@ -35,6 +37,10 @@ class ResearchTools:
         market_data_base_url: str,
         brave_search_api_key: str | None = None,
         brave_search_base_url: str | None = None,
+        exa_api_key: str | None = None,
+        exa_base_url: str | None = None,
+        firecrawl_api_key: str | None = None,
+        firecrawl_base_url: str | None = None,
     ) -> None:
         self.budget = budget
         self.recorder = recorder
@@ -45,6 +51,12 @@ class ResearchTools:
         self.brave_search_api_key = (brave_search_api_key or "").strip()
         self.brave_search_base_url = (
             brave_search_base_url or "https://api.search.brave.com/res/v1/web/search"
+        ).rstrip("/")
+        self.exa_api_key = (exa_api_key or "").strip()
+        self.exa_base_url = (exa_base_url or "https://api.exa.ai/search").rstrip("/")
+        self.firecrawl_api_key = (firecrawl_api_key or "").strip()
+        self.firecrawl_base_url = (
+            firecrawl_base_url or "https://api.firecrawl.dev/v1/scrape"
         ).rstrip("/")
 
     async def web_search(self, run_id: UUID, query: str) -> dict[str, Any]:
@@ -96,6 +108,62 @@ class ResearchTools:
         )
         return result
 
+    async def exa_search(self, run_id: UUID, query: str) -> dict[str, Any]:
+        if not self.exa_api_key:
+            raise RuntimeError("Exa is not configured.")
+        query = clean_search_query(query)
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                self.exa_base_url,
+                json={
+                    "query": query,
+                    "numResults": 10,
+                    "contents": {"text": True, "highlights": True},
+                },
+                headers={
+                    "Accept": "application/json",
+                    "x-api-key": self.exa_api_key,
+                },
+            )
+            response.raise_for_status()
+            result = response.json()
+        results = result.get("results", []) if isinstance(result, dict) else []
+        await self.recorder.span(
+            str(uuid4()),
+            {
+                "traceId": str(run_id),
+                "name": "exa-search",
+                "input": query,
+                "output": {"result_count": len(results) if isinstance(results, list) else 0},
+            },
+        )
+        return result
+
+    async def firecrawl_fetch(self, run_id: UUID, source_url: str) -> dict[str, Any]:
+        if not self.firecrawl_api_key:
+            raise RuntimeError("Firecrawl is not configured.")
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                self.firecrawl_base_url,
+                json={"url": source_url, "formats": ["markdown"]},
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {self.firecrawl_api_key}",
+                },
+            )
+            response.raise_for_status()
+            result = response.json()
+        await self.recorder.span(
+            str(uuid4()),
+            {
+                "traceId": str(run_id),
+                "name": "firecrawl-fetch",
+                "input": source_url,
+                "output": {"fetched": True},
+            },
+        )
+        return result
+
     async def evidence_search(
         self, run_id: UUID, request: EvidenceRequest
     ) -> EvidenceBundle:
@@ -104,7 +172,14 @@ class ResearchTools:
         providers = [TavilyProvider(self.web_search, run_id)]
         if self.brave_search_api_key:
             providers.append(BraveProvider(self.brave_search, run_id))
-        engine = EvidenceEngine(providers=providers)
+        if self.exa_api_key:
+            providers.append(ExaProvider(self.exa_search, run_id))
+        fetcher = (
+            FirecrawlFetcher(self.firecrawl_fetch, run_id, max_urls=1)
+            if self.firecrawl_api_key
+            else None
+        )
+        engine = EvidenceEngine(providers=providers, fetcher=fetcher)
         return await engine.search(request)
 
     async def market_data(self, run_id: UUID, ticker: str) -> dict[str, Any]:

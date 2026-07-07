@@ -45,5 +45,9 @@ def build_runtime() -> Runtime:
             settings.market_data_base_url,
             settings.brave_search_api_key,
             settings.brave_search_base_url,
+            settings.exa_api_key,
+            settings.exa_base_url,
+            settings.firecrawl_api_key,
+            settings.firecrawl_base_url,
         ),
     )

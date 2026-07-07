@@ -6,6 +6,8 @@ from src.agents.evidence_engine import (
     BraveProvider,
     EvidenceEngine,
     EvidenceRequest,
+    ExaProvider,
+    FirecrawlFetcher,
     SearchMode,
     SourceTier,
     TavilyProvider,
@@ -28,6 +30,34 @@ class FakeSearchClient:
                 raise response
             return response
         return {"results": []}
+
+
+class FakeFetchClient:
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.calls: list[tuple[object, str]] = []
+
+    async def fetch(self, run_id, source_url):
+        self.calls.append((run_id, source_url))
+        if self.responses:
+            response = self.responses.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return response
+        return {}
+
+
+class FakeArtifactStore:
+    def __init__(self) -> None:
+        self.payloads: list[tuple[object, str, dict[str, object]]] = []
+
+    def put_json(self, run_id, kind, payload):
+        self.payloads.append((run_id, kind, payload))
+
+        class Pointer:
+            uri = "memory://evidence-search"
+
+        return Pointer()
 
 
 def request(**overrides) -> EvidenceRequest:
@@ -250,6 +280,173 @@ def test_site_query_uses_brave_when_configured() -> None:
     assert bundle.items[0].provider == "brave"
 
 
+def test_exa_provider_selected_for_exploratory_discovery() -> None:
+    run_id = uuid4()
+    tavily = FakeSearchClient({"results": []})
+    exa = FakeSearchClient(
+        {
+            "results": [
+                {
+                    "url": "https://research.example.com/semantic",
+                    "title": "Semantic result",
+                    "text": "Exa semantic discovery content.",
+                    "score": 0.77,
+                }
+            ]
+        }
+    )
+    engine = EvidenceEngine(
+        providers=[
+            TavilyProvider(tavily.search, run_id),
+            ExaProvider(exa.search, run_id),
+        ],
+        clock=lambda: RETRIEVED_AT,
+    )
+
+    bundle = asyncio.run(
+        engine.search(
+            request(run_id=run_id, search_mode=SearchMode.EXPLORATORY, max_sources=1)
+        )
+    )
+
+    assert tavily.calls == []
+    assert len(exa.calls) == 1
+    assert bundle.items[0].provider == "exa"
+    assert bundle.items[0].snippet == "Exa semantic discovery content."
+
+
+def test_disabled_exa_provider_does_not_intercept_search() -> None:
+    run_id = uuid4()
+    tavily = FakeSearchClient(
+        {
+            "results": [
+                {
+                    "url": "https://research.example.com/tavily",
+                    "title": "Tavily result",
+                    "content": "Tavily content.",
+                    "score": 0.7,
+                }
+            ]
+        }
+    )
+    engine = EvidenceEngine(
+        providers=[
+            TavilyProvider(tavily.search, run_id),
+            ExaProvider(None, None),
+        ],
+        clock=lambda: RETRIEVED_AT,
+    )
+
+    bundle = asyncio.run(
+        engine.search(
+            request(run_id=run_id, search_mode=SearchMode.EXPLORATORY, max_sources=1)
+        )
+    )
+
+    assert len(tavily.calls) == 1
+    assert bundle.items[0].provider == "tavily"
+
+
+def test_exa_failure_falls_back_to_tavily_and_records_limitation() -> None:
+    run_id = uuid4()
+    exa = FakeSearchClient(RuntimeError("exa unavailable"))
+    tavily = FakeSearchClient(
+        {
+            "results": [
+                {
+                    "url": "https://www.reuters.com/markets/fallback",
+                    "title": "Fallback result",
+                    "content": "Fallback Tavily evidence after Exa failure.",
+                    "score": 0.82,
+                }
+            ]
+        }
+    )
+    engine = EvidenceEngine(
+        providers=[
+            TavilyProvider(tavily.search, run_id),
+            ExaProvider(exa.search, run_id),
+        ],
+        clock=lambda: RETRIEVED_AT,
+    )
+
+    bundle = asyncio.run(
+        engine.search(
+            request(run_id=run_id, search_mode=SearchMode.EXPLORATORY, max_sources=1)
+        )
+    )
+
+    assert len(exa.calls) == 1
+    assert len(tavily.calls) == 1
+    assert bundle.items[0].provider == "tavily"
+    assert any("exa provider failed" in limitation for limitation in bundle.limitations)
+
+
+def test_firecrawl_fetcher_fetches_top_url_into_raw_artifact() -> None:
+    run_id = uuid4()
+    tavily = FakeSearchClient(
+        {
+            "results": [
+                {
+                    "url": "https://www.sec.gov/report",
+                    "title": "SEC report",
+                    "content": "Search snippet.",
+                    "score": 0.9,
+                }
+            ]
+        }
+    )
+    firecrawl = FakeFetchClient({"markdown": "# Clean fetched markdown"})
+    artifact_store = FakeArtifactStore()
+    engine = EvidenceEngine(
+        tavily.search,
+        fetcher=FirecrawlFetcher(firecrawl.fetch, run_id, max_urls=1),
+        artifact_store=artifact_store,
+        clock=lambda: RETRIEVED_AT,
+    )
+
+    bundle = asyncio.run(engine.search(request(run_id=run_id, max_sources=1)))
+
+    assert bundle.raw_result_artifact_uri == "memory://evidence-search"
+    assert firecrawl.calls == [(run_id, "https://www.sec.gov/report")]
+    _artifact_run_id, kind, payload = artifact_store.payloads[0]
+    assert kind == "evidence-search"
+    fetch_output = payload["raw_outputs"][-1]
+    assert fetch_output["provider"] == "firecrawl"
+    assert fetch_output["operation"] == "fetch"
+    assert fetch_output["responses"][0]["markdown"] == "# Clean fetched markdown"
+
+
+def test_firecrawl_failure_is_recorded_without_failing_request() -> None:
+    run_id = uuid4()
+    tavily = FakeSearchClient(
+        {
+            "results": [
+                {
+                    "url": "https://www.sec.gov/report",
+                    "title": "SEC report",
+                    "content": "Search snippet.",
+                    "score": 0.9,
+                }
+            ]
+        }
+    )
+    firecrawl = FakeFetchClient(RuntimeError("fetch failed"))
+    engine = EvidenceEngine(
+        tavily.search,
+        fetcher=FirecrawlFetcher(firecrawl.fetch, run_id, max_urls=1),
+        clock=lambda: RETRIEVED_AT,
+    )
+
+    bundle = asyncio.run(engine.search(request(run_id=run_id, max_sources=1)))
+
+    assert len(bundle.items) == 1
+    assert bundle.items[0].provider == "tavily"
+    assert any(
+        "firecrawl fetch failed" in limitation for limitation in bundle.limitations
+    )
+
+
 def test_source_quality_classifies_primary_finance_macro_domains() -> None:
     fed = score_source_quality(
         source_url="https://www.federalreserve.gov/monetarypolicy/fomcminutes.htm",
@@ -386,6 +583,8 @@ def test_research_tools_evidence_search_uses_existing_web_search_path() -> None:
         def __init__(self) -> None:
             self.calls: list[tuple[object, str]] = []
             self.brave_search_api_key = ""
+            self.exa_api_key = ""
+            self.firecrawl_api_key = ""
 
         async def web_search(self, run_id, query):
             self.calls.append((run_id, query))
@@ -397,6 +596,12 @@ def test_research_tools_evidence_search_uses_existing_web_search_path() -> None:
                     }
                 ]
             }
+
+        async def exa_search(self, run_id, query):
+            raise AssertionError("Exa should not be called without a configured key")
+
+        async def firecrawl_fetch(self, run_id, source_url):
+            raise AssertionError("Firecrawl should not be called without a configured key")
 
     run_id = uuid4()
     tools = StubResearchTools()
