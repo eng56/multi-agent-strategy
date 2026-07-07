@@ -2164,6 +2164,16 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
         agent_specs=agent_specs or [aggregator_spec],
         artifacts=artifacts,
     )
+    if not verified:
+        await _write_no_verified_evidence_final(
+            runtime,
+            run,
+            tasks=tasks,
+            claims=claims,
+            verifications=verifications,
+            artifacts=artifacts,
+        )
+        return
     if (
         _run_state_requests_skeptic_review(run_state)
         and not event.payload.get("force")
@@ -2333,6 +2343,186 @@ async def judge(runtime: Runtime, event: EventEnvelope) -> None:
     )
     await runtime.blackboard.put_run(run)
     await evaluate_principal_policy_safely(runtime, event.run_id, trigger="judge.completed")
+
+
+async def _write_no_verified_evidence_final(
+    runtime: Runtime,
+    run: Run,
+    *,
+    tasks: list[ResearchTask],
+    claims: list[Claim],
+    verifications: list[Verification],
+    artifacts: list[Artifact],
+) -> None:
+    """Create a deterministic final when research produced no synthesis-safe claims."""
+    answer = _no_verified_evidence_answer(run, tasks, claims, verifications, artifacts)
+    final = FinalReport(
+        run_id=run.id,
+        answer=answer,
+        verified_claim_ids=[],
+        sources=[],
+        partial=True,
+        wave_number=max_task_wave(tasks),
+    )
+    await runtime.blackboard.put_final(final)
+    await persist_artifact(
+        runtime,
+        Artifact(
+            run_id=run.id,
+            artifact_type=ArtifactType.FINAL_REPORT,
+            branch="synthesis/aggregator",
+            text_or_summary=answer,
+            tags=["synthesis", "final", "insufficient_verified_evidence"],
+            visibility=VisibilityScope.PUBLIC_VERIFIED,
+            status=ArtifactStatus.VERIFIED,
+            source_refs=[],
+            legacy_object_type="final_report",
+            legacy_object_id=run.id,
+        ),
+        "aggregator-agent",
+    )
+    await persist_action(
+        runtime,
+        run.id,
+        PrincipalActionType.REQUEST_AGGREGATION,
+        "Produced deterministic final because no claim passed source verification.",
+        required_role="aggregator_agent",
+        target_branch="synthesis/aggregator",
+        expected_information_gain=InformationGain.LOW,
+        priority=5,
+        producer="aggregator-agent",
+    )
+    await persist_action(
+        runtime,
+        run.id,
+        PrincipalActionType.STOP_RUN,
+        "Completed with an evidence-limited final: no synthesis-safe verified claims were available.",
+        required_role="principal_policy",
+        target_branch="synthesis/aggregator",
+        expected_information_gain=InformationGain.LOW,
+        priority=4,
+        producer="aggregator-agent",
+    )
+    run.final_answer = answer
+    run.status = RunStatus.COMPLETED
+    run.failure_reason = None
+    await runtime.blackboard.put_run(run)
+    await evaluate_principal_policy_safely(runtime, run.id, trigger="final.no_verified")
+
+
+def _no_verified_evidence_answer(
+    run: Run,
+    tasks: list[ResearchTask],
+    claims: list[Claim],
+    verifications: list[Verification],
+    artifacts: list[Artifact],
+) -> str:
+    verification_by_claim_id = {
+        verification.claim_id: verification for verification in verifications
+    }
+    rejected_count = sum(1 for value in verifications if value.verdict == "rejected")
+    uncertain_count = sum(1 for value in verifications if value.verdict == "uncertain")
+    completed_count = sum(1 for task in tasks if task.status == "completed")
+    failed_count = sum(1 for task in tasks if task.status == "failed")
+    source_count = len(
+        {
+            source
+            for verification in verifications
+            for source in verification.sources + verification.evidence_item_refs
+        }
+        | {source for artifact in artifacts for source in artifact.source_refs}
+    )
+
+    claim_lines = []
+    for claim in claims[:6]:
+        verification = verification_by_claim_id.get(claim.id)
+        if verification:
+            reason = verification.rationale or "No verifier rationale recorded."
+            claim_lines.append(
+                "- "
+                f"{_compact_text(claim.statement, 220)} "
+                f"(verdict: {verification.verdict}, "
+                f"confidence: {verification.confidence:.0%}; "
+                f"{_compact_text(reason, 180)})"
+            )
+        else:
+            claim_lines.append(
+                f"- {_compact_text(claim.statement, 220)} (verdict: not verified yet)"
+            )
+    if len(claims) > 6:
+        claim_lines.append(f"- {len(claims) - 6} additional candidate claim(s) omitted.")
+    if not claim_lines:
+        claim_lines.append("- No candidate claims were produced.")
+
+    caveats = _verification_caveats(verifications)
+    if not caveats:
+        caveats = [
+            "No claim reached verified status, so disputed or unverified material cannot be used as final support.",
+            "A follow-up run should gather dated primary sources and re-check any missing market-data feeds.",
+        ]
+
+    return "\n".join(
+        [
+            "# Evidence-limited research result",
+            "",
+            f'Question: "{run.question}"',
+            "",
+            "No decision-grade final forecast was produced because no candidate claim passed "
+            "source verification. This is a completed partial result, not a supported "
+            "investment recommendation.",
+            "",
+            "## Run evidence status",
+            "",
+            f"- Research tasks completed: {completed_count}",
+            f"- Research tasks failed: {failed_count}",
+            f"- Candidate claims assessed: {len(claims)}",
+            "- Verified claims available for synthesis: 0",
+            f"- Rejected claims: {rejected_count}",
+            f"- Disputed / uncertain claims: {uncertain_count}",
+            f"- Distinct source references inspected: {source_count}",
+            "",
+            "## Candidate claims not accepted as final support",
+            "",
+            *claim_lines,
+            "",
+            "## Main evidence gaps",
+            "",
+            *[f"- {_compact_text(caveat, 240)}" for caveat in caveats[:8]],
+            "",
+            "## Minimum next steps for a decision-grade answer",
+            "",
+            "- Re-run failed or zero-result market-data lookups with a verified fallback source.",
+            "- Prefer dated primary sources for Fed policy expectations, rates, FX, gold, and duration evidence.",
+            "- Split broad portfolio-positioning statements into narrower asset-class claims before verification.",
+            "- Re-aggregate only after at least one material claim is verified.",
+            "",
+            "No personalized investment advice.",
+        ]
+    )
+
+
+def _verification_caveats(verifications: list[Verification]) -> list[str]:
+    caveats: list[str] = []
+    for verification in verifications:
+        caveats.extend(verification.required_caveats)
+        caveats.extend(verification.unsupported_parts)
+        if verification.verdict != "verified" and verification.rationale:
+            caveats.append(verification.rationale)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for caveat in caveats:
+        compact = " ".join(caveat.split())
+        if compact and compact not in seen:
+            deduped.append(compact)
+            seen.add(compact)
+    return deduped
+
+
+def _compact_text(value: str, limit: int) -> str:
+    text = " ".join(value.split())
+    if len(text) <= limit:
+        return text
+    return f"{text[: max(0, limit - 1)].rstrip()}…"
 
 
 HANDLERS = {
