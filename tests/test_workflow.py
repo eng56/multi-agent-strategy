@@ -37,6 +37,7 @@ from src.common.models import (
     EventType,
     FinalReport,
     ModelPolicy,
+    Observation,
     OrganizationPlan,
     PrincipalAction,
     PrincipalActionType,
@@ -154,7 +155,17 @@ class FakeArtifacts:
 
 class FakeTools:
     async def web_search(self, _run_id, query):
-        return {"results": [{"url": f"https://example.com/{query[:8]}"}]}
+        return {
+            "results": [
+                {
+                    "url": "https://www.sec.gov/Archives/edgar/data/sap",
+                    "title": "SAP filing",
+                    "content": f"Primary-source evidence for {query[:80]}.",
+                    "published_date": "2026-07-01",
+                    "score": 0.91,
+                }
+            ]
+        }
 
     async def market_data(self, _run_id, ticker):
         return {"ticker": ticker, "price": 123}
@@ -1011,6 +1022,279 @@ def test_verify_claim_dual_writes_verification_artifact() -> None:
     assert artifact.artifact_type == ArtifactType.VERIFICATION
     assert artifact.status == ArtifactStatus.VERIFIED
     assert artifact.supports_artifact_ids
+    verification = rt.blackboard.verifications[-1]
+    assert verification.evidence_item_refs == ["https://www.sec.gov/Archives/edgar/data/sap"]
+    assert "primary" in verification.source_quality_summary
+
+
+def test_verify_claim_prompt_includes_linked_observations_and_evidence_items() -> None:
+    run = Run(
+        question="Should I buy SAP stock?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    observation_id = uuid4()
+    claim = Claim(
+        run_id=run.id,
+        task_id=uuid4(),
+        statement="SAP cloud backlog is rising.",
+        evidence_observation_ids=[observation_id],
+        confidence=0.8,
+    )
+    rt = runtime(
+        run,
+        QueueLLM(
+            {
+                "verdict": "verified",
+                "rationale": "The filing supports backlog growth.",
+                "confidence": 0.83,
+                "supported_parts": ["SAP cloud backlog is rising."],
+                "unsupported_parts": [],
+                "contradictions": [],
+                "required_caveats": [],
+                "source_quality_summary": "Primary filing support; Reuters risk context.",
+            }
+        ),
+    )
+    rt.blackboard.claims.append(claim)
+    rt.blackboard.observations.append(
+        Observation(
+            id=observation_id,
+            run_id=run.id,
+            task_id=claim.task_id,
+            tool="web_search",
+            summary="Linked observation says SAP cloud backlog expanded year over year.",
+            artifact=ArtifactPointer(
+                uri="gs://bucket/observation.json",
+                size_bytes=2,
+                sha256="0" * 64,
+            ),
+            sources=["https://www.sap.com/investors"],
+        )
+    )
+
+    class EvidenceTools(FakeTools):
+        async def web_search(self, _run_id, query):
+            if "risk counterargument" in query:
+                return {
+                    "results": [
+                        {
+                            "url": "https://www.reuters.com/markets/sap-risk",
+                            "title": "SAP risk context",
+                            "content": "Some customers delayed cloud migrations.",
+                            "published_date": "2026-07-02",
+                            "score": 0.72,
+                        }
+                    ]
+                }
+            return {
+                "results": [
+                    {
+                        "url": "https://www.sec.gov/Archives/edgar/data/sap",
+                        "title": "SAP annual filing",
+                        "content": "SAP reported cloud backlog rose 27%.",
+                        "published_date": "2026-07-01",
+                        "score": 0.95,
+                    }
+                ]
+            }
+
+    rt.tools = EvidenceTools()
+
+    asyncio.run(
+        verify_claim(
+            rt,
+            EventEnvelope(
+                type=EventType.CLAIM_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"claim_id": str(claim.id)},
+            ),
+        )
+    )
+
+    prompt = rt.llm.calls[0]["prompt"]
+    assert '"claim_text": "SAP cloud backlog is rising."' in prompt
+    assert "Linked observation says SAP cloud backlog expanded" in prompt
+    assert "SAP reported cloud backlog rose 27%" in prompt
+    assert "https://www.sec.gov/Archives/edgar/data/sap" in prompt
+    assert "source_quality_reason" in prompt
+    assert "contradictory_or_contextual_evidence" in prompt
+    assert "https://www.reuters.com/markets/sap-risk" in prompt
+
+
+def test_verify_claim_weak_source_only_becomes_uncertain_and_disputed() -> None:
+    run = Run(
+        question="Should I buy SAP stock?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    claim = Claim(
+        run_id=run.id,
+        task_id=uuid4(),
+        statement="SAP backlog is rising.",
+        evidence_observation_ids=[uuid4()],
+        confidence=0.8,
+    )
+    claim_artifact = Artifact(
+        run_id=run.id,
+        artifact_type=ArtifactType.CLAIM,
+        branch="market/equities",
+        text_or_summary=claim.statement,
+        legacy_object_type="claim",
+        legacy_object_id=claim.id,
+    )
+    rt = runtime(
+        run,
+        QueueLLM({"verdict": "verified", "rationale": "A forum says so.", "confidence": 0.8}),
+    )
+    rt.blackboard.claims.append(claim)
+    rt.blackboard.artifacts.append(claim_artifact)
+
+    class WeakTools(FakeTools):
+        async def web_search(self, _run_id, _query):
+            return {
+                "results": [
+                    {
+                        "url": "https://www.quora.com/sap-backlog",
+                        "title": "SAP backlog rumor",
+                        "content": "A user claims SAP backlog is rising.",
+                        "score": 0.8,
+                    }
+                ]
+            }
+
+    rt.tools = WeakTools()
+
+    asyncio.run(
+        verify_claim(
+            rt,
+            EventEnvelope(
+                type=EventType.CLAIM_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"claim_id": str(claim.id)},
+            ),
+        )
+    )
+
+    verification = rt.blackboard.verifications[-1]
+    assert verification.verdict == "uncertain"
+    assert "weak, unknown, or missing" in verification.required_caveats[-1]
+    promoted = next(item for item in rt.blackboard.artifacts if item.id == claim_artifact.id)
+    assert promoted.status == ArtifactStatus.DISPUTED
+    assert promoted.visibility == VisibilityScope.PUBLIC_UNVERIFIED
+
+
+def test_verify_claim_contradiction_downgrades_verified_result_to_uncertain() -> None:
+    run = Run(
+        question="Should I buy SAP stock?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    claim = Claim(
+        run_id=run.id,
+        task_id=uuid4(),
+        statement="SAP backlog is rising.",
+        evidence_observation_ids=[uuid4()],
+        confidence=0.8,
+    )
+    claim_artifact = Artifact(
+        run_id=run.id,
+        artifact_type=ArtifactType.CLAIM,
+        branch="market/equities",
+        text_or_summary=claim.statement,
+        legacy_object_type="claim",
+        legacy_object_id=claim.id,
+    )
+    rt = runtime(
+        run,
+        QueueLLM(
+            {
+                "verdict": "verified",
+                "rationale": "Support exists but conflicts remain.",
+                "confidence": 0.78,
+                "supported_parts": ["The filing suggests backlog growth."],
+                "unsupported_parts": [],
+                "contradictions": ["A high-quality source reports backlog contraction."],
+                "required_caveats": [],
+                "source_quality_summary": "Primary and news sources conflict.",
+            }
+        ),
+    )
+    rt.blackboard.claims.append(claim)
+    rt.blackboard.artifacts.append(claim_artifact)
+
+    asyncio.run(
+        verify_claim(
+            rt,
+            EventEnvelope(
+                type=EventType.CLAIM_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"claim_id": str(claim.id)},
+            ),
+        )
+    )
+
+    verification = rt.blackboard.verifications[-1]
+    assert verification.verdict == "uncertain"
+    assert verification.confidence == 0.55
+    assert verification.contradictions == ["A high-quality source reports backlog contraction."]
+    promoted = next(item for item in rt.blackboard.artifacts if item.id == claim_artifact.id)
+    assert promoted.status == ArtifactStatus.DISPUTED
+
+
+def test_verify_claim_partial_support_adds_required_caveat() -> None:
+    run = Run(
+        question="Should I buy SAP stock?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    claim = Claim(
+        run_id=run.id,
+        task_id=uuid4(),
+        statement="SAP backlog is rising and valuation is attractive.",
+        evidence_observation_ids=[uuid4()],
+        confidence=0.8,
+    )
+    rt = runtime(
+        run,
+        QueueLLM(
+            {
+                "verdict": "verified",
+                "rationale": "Backlog growth is supported; valuation is not covered.",
+                "confidence": 0.74,
+                "supported_parts": ["SAP backlog is rising."],
+                "unsupported_parts": ["The evidence does not establish attractive valuation."],
+                "contradictions": [],
+                "required_caveats": [],
+                "source_quality_summary": "Primary filing supports backlog only.",
+            }
+        ),
+    )
+    rt.blackboard.claims.append(claim)
+
+    asyncio.run(
+        verify_claim(
+            rt,
+            EventEnvelope(
+                type=EventType.CLAIM_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"claim_id": str(claim.id)},
+            ),
+        )
+    )
+
+    verification = rt.blackboard.verifications[-1]
+    assert verification.supported_parts == ["SAP backlog is rising."]
+    assert verification.unsupported_parts == [
+        "The evidence does not establish attractive valuation."
+    ]
+    assert verification.required_caveats
+    artifact = rt.blackboard.artifacts[-1]
+    assert "Required caveats:" in artifact.text_or_summary
 
 
 def test_verify_claim_requests_skeptic_when_second_verified_claim_exists() -> None:

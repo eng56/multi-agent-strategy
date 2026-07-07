@@ -19,8 +19,10 @@ from src.agents.state import (
 from src.agents.evidence_engine import (
     EvidenceBundle,
     EvidenceEngine,
+    EvidenceItem,
     EvidenceRequest,
     SearchMode,
+    SourceTier,
 )
 from src.agents.knowledge_router import select_context_for_agent
 from src.agents.principal_runtime import evaluate_principal_policy
@@ -1255,7 +1257,380 @@ def failed_verification_result(exc: Exception) -> dict[str, Any]:
             f"being treated as verified: {type(exc).__name__}: {str(exc)[:240]}"
         ),
         "confidence": 0.0,
+        "supported_parts": [],
+        "unsupported_parts": ["Automated verification did not complete."],
+        "contradictions": [],
+        "required_caveats": ["Verification failed; do not treat this claim as verified."],
+        "source_quality_summary": "No verifier-reviewed source-quality summary was available.",
     }
+
+
+STRONG_VERIFICATION_SOURCE_TIERS = {
+    SourceTier.PRIMARY,
+    SourceTier.HIGH_QUALITY_SECONDARY,
+    SourceTier.NEWS,
+}
+
+
+def _claim_artifacts_for_claim(artifacts: list[Artifact], claim: Claim) -> list[Artifact]:
+    return [
+        value
+        for value in artifacts
+        if value.artifact_type == ArtifactType.CLAIM
+        and value.legacy_object_type == "claim"
+        and value.legacy_object_id == claim.id
+    ]
+
+
+def _verification_branch_for_claim(claim: Claim, claim_artifacts: list[Artifact]) -> str:
+    for artifact in claim_artifacts:
+        if artifact.branch:
+            return artifact.branch
+    return infer_semantic_branch(claim.statement)
+
+
+def build_claim_verification_evidence_request(
+    runtime: Runtime,
+    claim: Claim,
+    branch: str,
+    search_mode: SearchMode,
+) -> EvidenceRequest:
+    max_sources = evidence_max_sources(runtime)
+    if search_mode == SearchMode.CONTRADICTION:
+        max_sources = min(max_sources, 3)
+    return EvidenceRequest(
+        run_id=claim.run_id,
+        task_id=claim.task_id,
+        branch=branch,
+        objective=claim.statement,
+        claim_id=claim.id,
+        claim_text=claim.statement,
+        search_mode=search_mode,
+        max_sources=max_sources,
+    )
+
+
+def _unique_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for value in values:
+        cleaned = value.strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        unique.append(cleaned)
+    return unique
+
+
+def _linked_observations_for_claim(
+    observations: list[Observation], claim: Claim
+) -> list[Observation]:
+    linked_ids = set(claim.evidence_observation_ids)
+    return [observation for observation in observations if observation.id in linked_ids]
+
+
+def _linked_observation_payload(observations: list[Observation]) -> list[dict[str, Any]]:
+    return [
+        {
+            "observation_id": str(observation.id),
+            "summary": compact_text(observation.summary, max_chars=1200),
+            "sources": observation.sources,
+        }
+        for observation in observations
+    ]
+
+
+def _evidence_item_prompt_payload(item: EvidenceItem) -> dict[str, Any]:
+    return {
+        "ref": item.source_url,
+        "url": item.source_url,
+        "title": item.source_title,
+        "snippet": compact_text(item.snippet or "provider returned no snippet", max_chars=1000),
+        "support_type": item.support_type,
+        "source_tier": item.source_tier.value,
+        "quality_score": item.quality_score,
+        "source_quality_reason": item.source_quality_reason,
+        "publisher": item.publisher,
+        "domain": item.domain,
+        "published_at": item.published_at,
+        "retrieval_confidence": item.confidence,
+        "limitations": item.limitations[:5],
+    }
+
+
+def _evidence_items_prompt_payload(bundle: EvidenceBundle | None) -> list[dict[str, Any]]:
+    if bundle is None:
+        return []
+    return [_evidence_item_prompt_payload(item) for item in bundle.items[:10]]
+
+
+def _source_quality_summary_text(
+    support_bundle: EvidenceBundle | None,
+    contradiction_bundle: EvidenceBundle | None,
+    contradiction_error: Exception | None = None,
+) -> str:
+    parts: list[str] = []
+    for label, bundle in (
+        ("support", support_bundle),
+        ("contradiction/context", contradiction_bundle),
+    ):
+        if bundle is None:
+            continue
+        summary = bundle.source_quality_summary
+        tiers = summary.get("source_tiers", {})
+        tier_text = ", ".join(
+            f"{count} {tier}" for tier, count in tiers.items() if count
+        )
+        if not tier_text:
+            tier_text = "no classified sources"
+        parts.append(
+            f"{label}: {summary.get('item_count', len(bundle.items))} item(s), "
+            f"{tier_text}, average score {summary.get('average_quality_score', 0.0)}, "
+            f"top score {summary.get('top_quality_score', 0)}, "
+            f"{summary.get('missing_published_at_count', 0)} missing publication date(s)"
+        )
+    if contradiction_error is not None:
+        parts.append(
+            "contradiction/context search unavailable: "
+            f"{concise_exception(contradiction_error)}"
+        )
+    if not parts:
+        return "No EvidenceEngine source-quality summary was available."
+    return "; ".join(parts)
+
+
+def _verification_evidence_item_refs(
+    support_bundle: EvidenceBundle | None,
+    contradiction_bundle: EvidenceBundle | None,
+) -> list[str]:
+    refs: list[str] = []
+    for bundle in (support_bundle, contradiction_bundle):
+        if bundle is None:
+            continue
+        refs.extend(item.source_url for item in bundle.items)
+    return _unique_strings(refs)
+
+
+def _verification_source_refs(
+    linked_observations: list[Observation],
+    support_bundle: EvidenceBundle | None,
+    contradiction_bundle: EvidenceBundle | None,
+) -> list[str]:
+    refs = _verification_evidence_item_refs(support_bundle, contradiction_bundle)
+    for observation in linked_observations:
+        refs.extend(observation.sources)
+    return _unique_strings(refs)
+
+
+def _verification_prompt(
+    claim: Claim,
+    linked_observations: list[Observation],
+    support_bundle: EvidenceBundle,
+    contradiction_bundle: EvidenceBundle | None,
+    contradiction_error: Exception | None = None,
+) -> str:
+    payload = {
+        "claim_text": claim.statement,
+        "linked_observation_summaries": _linked_observation_payload(linked_observations),
+        "evidence_items": _evidence_items_prompt_payload(support_bundle),
+        "contradictory_or_contextual_evidence": _evidence_items_prompt_payload(
+            contradiction_bundle
+        ),
+        "source_quality_summary": _source_quality_summary_text(
+            support_bundle, contradiction_bundle, contradiction_error
+        ),
+    }
+    if contradiction_error is not None:
+        payload["contradictory_or_contextual_evidence_error"] = concise_exception(
+            contradiction_error
+        )
+    return (
+        "Verify the claim using the linked observations and EvidenceEngine evidence items. "
+        "Do not treat search results as generic support: support_type is inferred from the "
+        "query mode, so reason over the actual snippets, URLs, source quality, "
+        "contradictions, and limitations.\n\n"
+        "Rules:\n"
+        "- A claim cannot be verified based only on weak or unknown sources unless it is "
+        "low-stakes contextual background.\n"
+        "- If evidence supports only part of the claim, return uncertain or include "
+        "required caveats.\n"
+        "- If sources conflict, return uncertain or rejected depending on source strength.\n"
+        "- Include material limitations in required_caveats.\n\n"
+        "Return strict JSON with exactly this shape and no markdown: "
+        '{"verdict":"verified|rejected|uncertain","rationale":"...",'
+        '"confidence":0.0,"supported_parts":["..."],"unsupported_parts":["..."],'
+        '"contradictions":["..."],"required_caveats":["..."],'
+        '"source_quality_summary":"..."}.\n\n'
+        f"Input: {json.dumps(payload, ensure_ascii=False, sort_keys=True)[:30000]}"
+    )
+
+
+def _empty_list_marker(value: str) -> bool:
+    normalized = value.strip().strip(".").lower()
+    if normalized in {
+        "",
+        "n/a",
+        "na",
+        "none",
+        "not applicable",
+        "not provided",
+        "no caveats",
+        "no contradictions",
+        "no unsupported parts",
+    }:
+        return True
+    return normalized.startswith("no material ") and any(
+        token in normalized for token in ("caveat", "contradiction", "unsupported")
+    )
+
+
+def _string_list_from_model_field(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        strings = [compact_text(text_from_model_field(item), max_chars=700) for item in value]
+    else:
+        strings = [compact_text(text_from_model_field(value), max_chars=700)]
+    return _unique_strings([item for item in strings if not _empty_list_marker(item)])
+
+
+def _has_strong_supporting_evidence(bundle: EvidenceBundle | None) -> bool:
+    if bundle is None:
+        return False
+    return any(
+        item.source_tier in STRONG_VERIFICATION_SOURCE_TIERS and item.quality_score >= 50
+        for item in bundle.items
+    )
+
+
+def _append_unique(values: list[str], value: str) -> None:
+    if value not in values:
+        values.append(value)
+
+
+def normalize_verification_result(
+    raw_result: dict[str, Any],
+    support_bundle: EvidenceBundle | None,
+    contradiction_bundle: EvidenceBundle | None,
+    contradiction_error: Exception | None = None,
+) -> dict[str, Any]:
+    verdict = str(raw_result.get("verdict", "uncertain")).strip().lower()
+    if verdict not in {"verified", "rejected", "uncertain"}:
+        verdict = "uncertain"
+    rationale = compact_text(
+        text_from_model_field(
+            raw_result.get("rationale", "Verifier did not provide a rationale.")
+        ),
+        max_chars=4000,
+    )
+    try:
+        confidence = score_from_model_field(raw_result.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+
+    source_quality_summary = raw_result.get("source_quality_summary")
+    if isinstance(source_quality_summary, str) and source_quality_summary.strip():
+        quality_text = compact_text(source_quality_summary, max_chars=1200)
+    else:
+        quality_text = _source_quality_summary_text(
+            support_bundle, contradiction_bundle, contradiction_error
+        )
+
+    result = {
+        "verdict": verdict,
+        "rationale": rationale,
+        "confidence": confidence,
+        "supported_parts": _string_list_from_model_field(
+            raw_result.get("supported_parts", [])
+        ),
+        "unsupported_parts": _string_list_from_model_field(
+            raw_result.get("unsupported_parts", [])
+        ),
+        "contradictions": _string_list_from_model_field(
+            raw_result.get("contradictions", [])
+        ),
+        "required_caveats": _string_list_from_model_field(
+            raw_result.get("required_caveats", [])
+        ),
+        "source_quality_summary": quality_text,
+    }
+
+    if contradiction_error is not None:
+        _append_unique(
+            result["required_caveats"],
+            "Contradictory/contextual evidence search was unavailable.",
+        )
+    if result["unsupported_parts"] and not result["required_caveats"]:
+        _append_unique(
+            result["required_caveats"],
+            "Evidence supports only part of the claim; unsupported parts remain caveated.",
+        )
+    if result["verdict"] == "verified" and result["contradictions"]:
+        result["verdict"] = "uncertain"
+        result["confidence"] = min(result["confidence"], 0.55)
+        _append_unique(
+            result["required_caveats"],
+            "Verifier identified contradictions, so the claim cannot be public-verified.",
+        )
+    if result["verdict"] == "verified" and not _has_strong_supporting_evidence(
+        support_bundle
+    ):
+        result["verdict"] = "uncertain"
+        result["confidence"] = min(result["confidence"], 0.49)
+        _append_unique(
+            result["required_caveats"],
+            "EvidenceEngine returned only weak, unknown, or missing supporting sources.",
+        )
+        result["rationale"] = compact_text(
+            result["rationale"]
+            + " Verification downgraded because source quality was insufficient.",
+            max_chars=4000,
+        )
+    return result
+
+
+def verification_search_payload(
+    claim: Claim,
+    linked_observations: list[Observation],
+    support_bundle: EvidenceBundle | None,
+    contradiction_bundle: EvidenceBundle | None,
+    result: dict[str, Any],
+    *,
+    search_error: Exception | None = None,
+    contradiction_error: Exception | None = None,
+) -> dict[str, Any]:
+    return {
+        "claim_text": claim.statement,
+        "linked_observations": _linked_observation_payload(linked_observations),
+        "support_evidence_bundle": support_bundle.model_dump(mode="json")
+        if support_bundle is not None
+        else None,
+        "contradictory_or_contextual_evidence_bundle": (
+            contradiction_bundle.model_dump(mode="json")
+            if contradiction_bundle is not None
+            else None
+        ),
+        "search_error": concise_exception(search_error) if search_error else None,
+        "contradiction_error": concise_exception(contradiction_error)
+        if contradiction_error
+        else None,
+        "verifier_result": result,
+    }
+
+
+def verification_artifact_summary(verification: Verification) -> str:
+    parts = [verification.rationale]
+    if verification.supported_parts:
+        parts.append("Supported parts: " + "; ".join(verification.supported_parts))
+    if verification.unsupported_parts:
+        parts.append("Unsupported parts: " + "; ".join(verification.unsupported_parts))
+    if verification.contradictions:
+        parts.append("Contradictions: " + "; ".join(verification.contradictions))
+    if verification.required_caveats:
+        parts.append("Required caveats: " + "; ".join(verification.required_caveats))
+    if verification.source_quality_summary:
+        parts.append("Source quality: " + verification.source_quality_summary)
+    return compact_text("\n\n".join(parts), max_chars=4000)
 
 
 def _run_state_requests_skeptic_review(run_state) -> bool:
@@ -1387,33 +1762,89 @@ async def verify_claim(runtime: Runtime, event: EventEnvelope) -> None:
         raise PermanentEventError(
             f"claim.created references missing claim_id={event.payload.get('claim_id')}"
         )
+    observations = await runtime.blackboard.list_models(event.run_id, "observations", Observation)
+    linked_observations = _linked_observations_for_claim(observations, claim)
+    artifacts = await runtime.blackboard.list_models(event.run_id, "artifacts", Artifact)
+    claim_artifacts = _claim_artifacts_for_claim(artifacts, claim)
+    branch = _verification_branch_for_claim(claim, claim_artifacts)
+    support_bundle: EvidenceBundle | None = None
+    contradiction_bundle: EvidenceBundle | None = None
+    search_error: Exception | None = None
+    contradiction_error: Exception | None = None
     try:
-        corroboration = await runtime.tools.web_search(
-            event.run_id, verification_search_query(claim.statement)
+        support_bundle = await search_evidence(
+            runtime,
+            build_claim_verification_evidence_request(
+                runtime, claim, branch, SearchMode.VERIFICATION
+            ),
         )
     except BudgetExceeded:
         raise
+    except EvidenceProviderError as exc:
+        if is_transient_failure(exc.original):
+            raise exc.original
+        logger.warning(
+            "verification evidence search failed run_id=%s claim_id=%s error=%s",
+            event.run_id,
+            claim.id,
+            concise_exception(exc.original),
+        )
+        search_error = exc.original
+        raw_result = failed_verification_result(exc.original)
     except Exception as exc:
         if is_transient_failure(exc):
             raise
         logger.warning(
-            "verification search failed run_id=%s claim_id=%s error=%s",
+            "verification evidence search failed run_id=%s claim_id=%s error=%s",
             event.run_id,
             claim.id,
-            exc,
+            concise_exception(exc),
         )
-        corroboration = {"results": [], "error": f"{type(exc).__name__}: {str(exc)[:500]}"}
-        result = failed_verification_result(exc)
+        search_error = exc
+        raw_result = failed_verification_result(exc)
     else:
         try:
-            result = await runtime.llm.json(
+            contradiction_bundle = await search_evidence(
+                runtime,
+                build_claim_verification_evidence_request(
+                    runtime, claim, branch, SearchMode.CONTRADICTION
+                ),
+            )
+        except BudgetExceeded:
+            raise
+        except EvidenceProviderError as exc:
+            if is_transient_failure(exc.original):
+                raise exc.original
+            logger.warning(
+                "verification contradiction search failed run_id=%s claim_id=%s error=%s",
+                event.run_id,
+                claim.id,
+                concise_exception(exc.original),
+            )
+            contradiction_error = exc.original
+        except Exception as exc:
+            if is_transient_failure(exc):
+                raise
+            logger.warning(
+                "verification contradiction search failed run_id=%s claim_id=%s error=%s",
+                event.run_id,
+                claim.id,
+                concise_exception(exc),
+            )
+            contradiction_error = exc
+        try:
+            raw_result = await runtime.llm.json(
                 event.run_id,
                 AgentRole.VERIFIER,
                 "claim-verifier",
                 SYSTEM,
-                f"Verify this claim using the corroborating results. Return "
-                f'{{"verdict":"verified|rejected|uncertain","rationale":"...","confidence":0.0}}. '
-                f"Claim: {claim.statement}. Results: {json.dumps(corroboration)[:30000]}",
+                _verification_prompt(
+                    claim,
+                    linked_observations,
+                    support_bundle,
+                    contradiction_bundle,
+                    contradiction_error,
+                ),
             )
         except BudgetExceeded:
             raise
@@ -1426,10 +1857,25 @@ async def verify_claim(runtime: Runtime, event: EventEnvelope) -> None:
                 claim.id,
                 concise_exception(exc),
             )
-            result = failed_verification_result(exc)
-    sources = [item["url"] for item in corroboration.get("results", []) if item.get("url")]
+            raw_result = failed_verification_result(exc)
+    result = normalize_verification_result(
+        raw_result, support_bundle, contradiction_bundle, contradiction_error
+    )
+    evidence_item_refs = _verification_evidence_item_refs(support_bundle, contradiction_bundle)
+    result["evidence_item_refs"] = evidence_item_refs
+    sources = _verification_source_refs(linked_observations, support_bundle, contradiction_bundle)
     artifact_pointer = runtime.artifacts.put_json(
-        event.run_id, "verification-search", corroboration
+        event.run_id,
+        "verification-search",
+        verification_search_payload(
+            claim,
+            linked_observations,
+            support_bundle,
+            contradiction_bundle,
+            result,
+            search_error=search_error,
+            contradiction_error=contradiction_error,
+        ),
     )
     observation = Observation(
         run_id=event.run_id,
@@ -1458,14 +1904,6 @@ async def verify_claim(runtime: Runtime, event: EventEnvelope) -> None:
         ),
         "verifier-agent",
     )
-    artifacts = await runtime.blackboard.list_models(event.run_id, "artifacts", Artifact)
-    claim_artifacts = [
-        value
-        for value in artifacts
-        if value.artifact_type == ArtifactType.CLAIM
-        and value.legacy_object_type == "claim"
-        and value.legacy_object_id == claim.id
-    ]
     status = {
         "verified": ArtifactStatus.VERIFIED,
         "rejected": ArtifactStatus.REJECTED,
@@ -1475,16 +1913,19 @@ async def verify_claim(runtime: Runtime, event: EventEnvelope) -> None:
         claim_artifact.status = status
         if verification.verdict == "verified":
             claim_artifact.visibility = VisibilityScope.PUBLIC_VERIFIED
+        elif claim_artifact.visibility == VisibilityScope.PUBLIC_VERIFIED:
+            claim_artifact.visibility = VisibilityScope.PUBLIC_UNVERIFIED
         await runtime.blackboard.put_artifact(claim_artifact)
     claim_artifact_ids = [value.id for value in claim_artifacts]
+    verification_summary = verification_artifact_summary(verification)
     await persist_artifact(
         runtime,
         Artifact(
             run_id=event.run_id,
             artifact_type=ArtifactType.VERIFICATION,
             branch="trust/source_verifier",
-            text_or_summary=verification.rationale,
-            tags=tags_for_text(verification.rationale),
+            text_or_summary=verification_summary,
+            tags=tags_for_text(verification_summary),
             visibility=VisibilityScope.PUBLIC_VERIFIED
             if verification.verdict == "verified"
             else VisibilityScope.PUBLIC_UNVERIFIED,
