@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 
 import httpx
 
+from src.agents.evidence_engine import EvidenceBundle, EvidenceEngine, EvidenceRequest
 from src.common.budget import PersistentBudget
 from src.integrations.llm import LangfuseRecorder
 
@@ -54,6 +55,14 @@ class ResearchTools:
             },
         )
         return result
+
+    async def evidence_search(
+        self, run_id: UUID, request: EvidenceRequest
+    ) -> EvidenceBundle:
+        if request.run_id != run_id:
+            request = request.model_copy(update={"run_id": run_id})
+        engine = EvidenceEngine(self.web_search)
+        return await engine.search(request)
 
     async def market_data(self, run_id: UUID, ticker: str) -> dict[str, Any]:
         await self.budget.consume_tool(run_id, "market_data", 1)
