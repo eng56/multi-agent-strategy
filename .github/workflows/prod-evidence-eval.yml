@@ -62,11 +62,11 @@ jobs:
             fi
           done
           python - <<'PY'
-import os
-budget = float(os.environ["EVAL_BUDGET"])
-if budget <= 0:
-    raise SystemExit("EVAL_BUDGET must be > 0")
-PY
+          import os
+          budget = float(os.environ["EVAL_BUDGET"])
+          if budget <= 0:
+              raise SystemExit("EVAL_BUDGET must be > 0")
+          PY
 
       - uses: google-github-actions/auth@v3
         with: {workload_identity_provider: "${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}", service_account: "${{ env.GCP_DEPLOY_SERVICE_ACCOUNT }}"}
