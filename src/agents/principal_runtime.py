@@ -11,6 +11,7 @@ from src.agents.principal_policy import (
 )
 from src.agents.state import (
     FOLLOWUP_JUDGE_SCORE_THRESHOLD,
+    MAX_FOLLOWUP_WAVES,
     branch_for_task,
     build_run_state,
     max_task_wave,
@@ -504,7 +505,21 @@ def should_dispatch_aggregation(snapshot: PrincipalSnapshot) -> bool:
         for verification in snapshot.verifications
         if verification.verdict == "verified"
     }
-    return bool(verified_claim_ids)
+    if verified_claim_ids:
+        return True
+    return zero_verified_terminal_aggregation_ready(snapshot)
+
+
+def zero_verified_terminal_aggregation_ready(snapshot: PrincipalSnapshot) -> bool:
+    if snapshot.final is not None:
+        return False
+    if max_task_wave(snapshot.tasks) < MAX_FOLLOWUP_WAVES:
+        return False
+    if any(verification.verdict == "verified" for verification in snapshot.verifications):
+        return False
+    verified_or_checked_claim_ids = {verification.claim_id for verification in snapshot.verifications}
+    claim_ids = {claim.id for claim in snapshot.claims}
+    return claim_ids <= verified_or_checked_claim_ids
 
 
 def should_reaggregate_after_followup_snapshot(snapshot: PrincipalSnapshot) -> bool:
@@ -523,7 +538,12 @@ def useful_action_remains(snapshot: PrincipalSnapshot) -> bool:
         return True
     if should_dispatch_aggregation(snapshot):
         return True
-    return bool(snapshot.final and snapshot.run.models.judge and snapshot.final.judge_score is None)
+    return bool(
+        snapshot.final
+        and not snapshot.final.partial
+        and snapshot.run.models.judge
+        and snapshot.final.judge_score is None
+    )
 
 
 def dispatch_already_executed(snapshot: PrincipalSnapshot, action: PrincipalAction) -> bool:

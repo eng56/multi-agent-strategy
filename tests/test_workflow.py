@@ -1766,11 +1766,14 @@ def test_aggregator_prompt_includes_synthesis_role_and_verified_evidence_require
     assert rt.blackboard.final.answer == "Gold has the cleaner verified setup."
 
 
-def test_aggregator_writes_deterministic_final_when_no_claims_verify() -> None:
+def test_aggregator_requests_zero_verified_followup_before_deterministic_final() -> None:
     run = Run(
         question="What happens if the Fed cuts faster than expected?",
         models=model_policy(),
-        budget=Budget(limit_usd=1, tools=ToolBudget()),
+        budget=Budget(
+            limit_usd=5,
+            tools=ToolBudget(tavily_max_credits=20, tavily_credits_used=9),
+        ),
     )
     task = ResearchTask(
         run_id=run.id,
@@ -1778,6 +1781,14 @@ def test_aggregator_writes_deterministic_final_when_no_claims_verify() -> None:
         question="Find evidence for faster Fed cuts.",
         tool="web_search",
         status="completed",
+    )
+    failed_task = ResearchTask(
+        run_id=run.id,
+        title="Equity impact",
+        question="Find evidence for equity impact.",
+        tool="web_search",
+        status="failed",
+        reason="Task failed during claim_generation: Equity impact (LLMOutputError)",
     )
     claim = Claim(
         run_id=run.id,
@@ -1801,8 +1812,100 @@ def test_aggregator_writes_deterministic_final_when_no_claims_verify() -> None:
     llm = QueueLLM({"answer": "This should not be called."})
     rt = runtime(run, llm)
     rt.blackboard.tasks.append(task)
+    rt.blackboard.tasks.append(failed_task)
     rt.blackboard.claims.append(claim)
     rt.blackboard.verifications.append(verification)
+
+    asyncio.run(
+        aggregate(rt, EventEnvelope(type=EventType.CLAIM_VERIFIED, run_id=run.id, producer="test"))
+    )
+
+    assert llm.calls == []
+    assert rt.blackboard.final is None
+    followups = [task for task in rt.blackboard.tasks if task.wave_number == 1]
+    assert len(followups) == 4
+    followup_titles = {task.title for task in followups}
+    assert "Follow-up: atomic disputed claims" in followup_titles
+    assert "Follow-up: primary dated sources" in followup_titles
+    assert "Follow-up: contradiction search" in followup_titles
+    assert "Follow-up: retry failed claim generation" in followup_titles
+    assert any(
+        action.action_type == PrincipalActionType.REQUEST_FOLLOWUP
+        and action.status == ActionStatus.EXECUTED
+        and "Zero claims passed verification" in action.reason
+        for action in rt.blackboard.actions
+    )
+    assert not any(
+        action.action_type == PrincipalActionType.STOP_RUN for action in rt.blackboard.actions
+    )
+    published_types = [event.type for _topic, event in rt.published]
+    assert EventType.FOLLOWUP_REQUESTED in published_types
+    assert published_types.count(EventType.TASK_CREATED) >= len(followups)
+
+
+def test_aggregator_writes_deterministic_final_after_zero_verified_followup_wave() -> None:
+    run = Run(
+        question="What happens if the Fed cuts faster than expected?",
+        models=model_policy(),
+        budget=Budget(
+            limit_usd=5,
+            tools=ToolBudget(tavily_max_credits=20, tavily_credits_used=9),
+        ),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="Follow-up: primary dated sources",
+        question="Find dated primary evidence for faster Fed cuts.",
+        tool="web_search",
+        status="completed",
+        wave_number=1,
+    )
+    claim = Claim(
+        run_id=run.id,
+        task_id=task.id,
+        statement="A faster Fed cutting path guarantees a bullish cross-asset outcome.",
+        evidence_observation_ids=[uuid4()],
+        sources=["https://example.com/claim-source"],
+        confidence=0.8,
+    )
+    verification = Verification(
+        run_id=run.id,
+        claim_id=claim.id,
+        verdict="uncertain",
+        rationale="The evidence supports directionality but not the absolute guarantee.",
+        confidence=0.52,
+        supported_parts=["Fed rate cuts can support some rate-sensitive assets."],
+        unsupported_parts=["The guaranteed bullish outcome is not supported."],
+        required_caveats=["The result depends on whether cuts reflect disinflation or recession."],
+        sources=["https://example.com/verifier-source"],
+        evidence_item_refs=["https://example.com/evidence-item"],
+    )
+    claim_artifact = Artifact(
+        run_id=run.id,
+        artifact_type=ArtifactType.CLAIM,
+        branch="macro/rates",
+        text_or_summary=claim.statement,
+        status=ArtifactStatus.DISPUTED,
+        source_refs=claim.sources,
+        legacy_object_type="claim",
+        legacy_object_id=claim.id,
+    )
+    verification_artifact = Artifact(
+        run_id=run.id,
+        artifact_type=ArtifactType.VERIFICATION,
+        branch="trust/source_verifier",
+        text_or_summary=verification.rationale,
+        status=ArtifactStatus.DISPUTED,
+        source_refs=verification.sources,
+        legacy_object_type="verification",
+        legacy_object_id=verification.id,
+    )
+    llm = QueueLLM({"answer": "This should not be called."})
+    rt = runtime(run, llm)
+    rt.blackboard.tasks.append(task)
+    rt.blackboard.claims.append(claim)
+    rt.blackboard.verifications.append(verification)
+    rt.blackboard.artifacts.extend([claim_artifact, verification_artifact])
 
     asyncio.run(
         aggregate(rt, EventEnvelope(type=EventType.CLAIM_VERIFIED, run_id=run.id, producer="test"))
@@ -1812,6 +1915,11 @@ def test_aggregator_writes_deterministic_final_when_no_claims_verify() -> None:
     assert rt.blackboard.final is not None
     assert rt.blackboard.final.partial is True
     assert rt.blackboard.final.verified_claim_ids == []
+    assert rt.blackboard.final.sources == [
+        "https://example.com/verifier-source",
+        "https://example.com/evidence-item",
+        "https://example.com/claim-source",
+    ]
     assert "Evidence-limited research result" in rt.blackboard.final.answer
     assert "Verified claims available for synthesis: 0" in rt.blackboard.final.answer
     assert "Verifier-supported facts below public-verified threshold" in rt.blackboard.final.answer
@@ -1824,6 +1932,19 @@ def test_aggregator_writes_deterministic_final_when_no_claims_verify() -> None:
         and "no synthesis-safe verified claims" in action.reason
         for action in rt.blackboard.actions
     )
+    assert not any(
+        action.action_type == PrincipalActionType.REQUEST_FOLLOWUP for action in rt.blackboard.actions
+    )
+    final_artifact = next(
+        artifact
+        for artifact in rt.blackboard.artifacts
+        if artifact.artifact_type == ArtifactType.FINAL_REPORT
+    )
+    assert final_artifact.source_refs == rt.blackboard.final.sources
+    assert set(final_artifact.depends_on_artifact_ids) == {
+        claim_artifact.id,
+        verification_artifact.id,
+    }
 
 
 def test_aggregation_prompt_consumes_skeptic_counterargument_artifact() -> None:

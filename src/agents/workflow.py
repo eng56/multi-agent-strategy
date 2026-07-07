@@ -834,6 +834,199 @@ async def request_followup_wave(
     return created
 
 
+def _has_zero_verified_recovery_capacity(run: Run) -> bool:
+    budget_remaining = run.budget.limit_usd - run.budget.spent_usd - run.budget.reserved_usd
+    tavily_remaining = run.budget.tools.tavily_max_credits - run.budget.tools.tavily_credits_used
+    return budget_remaining > 0.05 and tavily_remaining > 0
+
+
+def _disputed_claim_texts(claims: list[Claim], verifications: list[Verification]) -> list[str]:
+    disputed_ids = {
+        verification.claim_id for verification in verifications if verification.verdict != "verified"
+    }
+    return [claim.statement for claim in claims if claim.id in disputed_ids][:5]
+
+
+def _failed_claim_generation_tasks(tasks: list[ResearchTask]) -> list[ResearchTask]:
+    return [
+        task
+        for task in tasks
+        if task.status == "failed"
+        and task.reason
+        and "claim_generation" in task.reason.lower()
+    ]
+
+
+def _claim_generation_recovery_candidates(tasks: list[ResearchTask]) -> list[ResearchTask]:
+    failed_claim_tasks = _failed_claim_generation_tasks(tasks)
+    if failed_claim_tasks:
+        return failed_claim_tasks
+    return [task for task in tasks if task.status == "failed"]
+
+
+def zero_verified_followup_task_items(
+    run: Run,
+    tasks: list[ResearchTask],
+    claims: list[Claim],
+    verifications: list[Verification],
+    wave_number: int,
+) -> list[dict[str, Any]]:
+    disputed_text = "\n".join(f"- {text}" for text in _disputed_claim_texts(claims, verifications))
+    if not disputed_text:
+        disputed_text = "- No disputed claim text was available; use observations and the original question."
+    base_context = f"Original question: {run.question}\nDisputed candidate claims:\n{disputed_text}"
+    items = [
+        {
+            "title": "Follow-up: atomic disputed claims",
+            "question": (
+                "Split the broad disputed claims into narrow, source-verifiable atomic "
+                "claims. Avoid portfolio advice and causal overreach. "
+                f"{base_context}"
+            )[:1000].rstrip(),
+            "tool": "web_search",
+            "wave_number": wave_number,
+            "reason": (
+                "Zero claims passed verification; split broad disputed claims into "
+                "atomic claims before retrying verification."
+            ),
+        },
+        {
+            "title": "Follow-up: primary dated sources",
+            "question": (
+                "Find primary or clearly date-bearing sources for Fed policy expectations, "
+                "CME/Fed/FRED/Treasury/rates evidence, USD, gold, U.S. equities, and "
+                "long-duration bonds. Prefer official, exchange, central-bank, filing, "
+                f"or dated major-news sources. {base_context}"
+            )[:1000].rstrip(),
+            "tool": "web_search",
+            "wave_number": wave_number,
+            "reason": (
+                "Zero claims passed verification; search primary and date-bearing sources "
+                "to resolve temporal ambiguity."
+            ),
+        },
+        {
+            "title": "Follow-up: contradiction search",
+            "question": (
+                "Search for contradiction and counterargument evidence against the disputed "
+                "claims, including recession-vs-disinflation regimes, conflicting USD "
+                "signals, real-yield/gold caveats, and long-duration bond risks. "
+                f"{base_context}"
+            )[:1000].rstrip(),
+            "tool": "web_search",
+            "wave_number": wave_number,
+            "reason": (
+                "Zero claims passed verification; run targeted contradiction search before "
+                "any terminal synthesis."
+            ),
+        },
+    ]
+    retry_targets = _claim_generation_recovery_candidates(tasks)
+    if retry_targets:
+        target_text = "; ".join(f"{task.title}: {task.question}" for task in retry_targets[:3])
+        items.append(
+            {
+                "title": "Follow-up: retry failed claim generation",
+                "question": (
+                    "Retry failed claim-generation coverage with conservative, narrow, "
+                    "source-grounded claims. If source evidence remains weak, state only "
+                    f"the factual observation and caveats. Failed task context: {target_text}. "
+                    f"Original question: {run.question}"
+                )[:1000].rstrip(),
+                "tool": "web_search",
+                "wave_number": wave_number,
+                "reason": (
+                    "Zero claims passed verification and at least one task failed claim "
+                    "generation; retry with deterministic conservative fallback behavior."
+                ),
+            }
+        )
+    return items
+
+
+async def request_zero_verified_followup_wave(
+    runtime: Runtime,
+    run: Run,
+    *,
+    tasks: list[ResearchTask],
+    claims: list[Claim],
+    verifications: list[Verification],
+) -> int:
+    if max_task_wave(tasks) >= MAX_FOLLOWUP_WAVES:
+        return 0
+    if not _has_zero_verified_recovery_capacity(run):
+        return 0
+    if any(task.status == "created" for task in tasks):
+        return 0
+    if any(
+        action.action_type == PrincipalActionType.REQUEST_FOLLOWUP
+        and action.status == ActionStatus.EXECUTED
+        for action in await runtime.blackboard.list_models(run.id, "principal_actions", PrincipalAction)
+    ):
+        return 0
+
+    wave_number = min(max_task_wave(tasks) + 1, MAX_FOLLOWUP_WAVES)
+    await persist_action(
+        runtime,
+        run.id,
+        PrincipalActionType.REQUEST_FOLLOWUP,
+        (
+            "Zero claims passed verification while budget/tool capacity remains; "
+            f"requesting targeted evidence recovery wave {wave_number} before terminal synthesis."
+        ),
+        required_role="principal_policy",
+        target_branch="research/recovery",
+        expected_information_gain=InformationGain.HIGH,
+        priority=9,
+        producer="aggregator-agent",
+    )
+    emit(
+        runtime,
+        EventType.FOLLOWUP_REQUESTED,
+        run.id,
+        "aggregator-agent",
+        wave_number=wave_number,
+        zero_verified_recovery=True,
+    )
+
+    created = 0
+    for item in zero_verified_followup_task_items(run, tasks, claims, verifications, wave_number):
+        task = ResearchTask(run_id=run.id, **item)
+        await runtime.blackboard.put_task(task)
+        await persist_action(
+            runtime,
+            run.id,
+            PrincipalActionType.ASSIGN_TASK,
+            f"Zero-verified follow-up wave {wave_number}: {task.reason or task.title}",
+            required_role="research_agent",
+            target_branch=branch_for_task(task),
+            expected_information_gain=InformationGain.HIGH,
+            priority=8,
+            producer="aggregator-agent",
+        )
+        emit(
+            runtime,
+            EventType.TASK_CREATED,
+            run.id,
+            "aggregator-agent",
+            task_id=str(task.id),
+            wave_number=wave_number,
+            followup=True,
+            zero_verified_recovery=True,
+        )
+        created += 1
+    if created:
+        await evaluate_principal_policy_safely(
+            runtime, run.id, trigger="zero_verified.followup_requested"
+        )
+    return created
+
+
+def zero_verified_recovery_exhausted(tasks: list[ResearchTask]) -> bool:
+    retry_targets = _claim_generation_recovery_candidates(tasks)
+    return bool(retry_targets) and all(task.status == "failed" for task in retry_targets)
+
+
 DEFAULT_EVIDENCE_MAX_SOURCES = 5
 MAX_EVIDENCE_SNIPPETS = 3
 
@@ -2311,24 +2504,19 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
     verifications = await runtime.blackboard.list_models(
         event.run_id, "verifications", Verification
     )
-    completed_tasks = [task for task in tasks if task.status == "completed"]
     pending_tasks = [task for task in tasks if task.status == "created"]
     existing_final = await runtime.blackboard.get_final(event.run_id)
+    claims = await runtime.blackboard.list_models(event.run_id, "claims", Claim)
+    checked_claim_ids = {verification.claim_id for verification in verifications}
+    unchecked_claims = [claim for claim in claims if claim.id not in checked_claim_ids]
     if (
         not tasks
-        or (
-            not event.payload.get("force")
-            and (pending_tasks or len(verifications) < len(completed_tasks))
-        )
+        or (not event.payload.get("force") and (pending_tasks or unchecked_claims))
         or (existing_final and not should_reaggregate_after_followup(existing_final, tasks))
     ):
         return
-    claims = await runtime.blackboard.list_models(event.run_id, "claims", Claim)
     verified_ids = {value.claim_id for value in verifications if value.verdict == "verified"}
     verified = [claim for claim in claims if claim.id in verified_ids]
-    if not verified and all(task.status == "failed" for task in tasks):
-        await fail_run_if_all_tasks_failed(runtime, event.run_id)
-        return
     run = await runtime.blackboard.get_run(event.run_id)
     if not run:
         return
@@ -2357,6 +2545,14 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
         artifacts=artifacts,
     )
     if not verified:
+        if await request_zero_verified_followup_wave(
+            runtime,
+            run,
+            tasks=tasks,
+            claims=claims,
+            verifications=verifications,
+        ):
+            return
         await _write_no_verified_evidence_final(
             runtime,
             run,
@@ -2548,11 +2744,13 @@ async def _write_no_verified_evidence_final(
 ) -> None:
     """Create a deterministic final when research produced no synthesis-safe claims."""
     answer = _no_verified_evidence_answer(run, tasks, claims, verifications, artifacts)
+    caveated_sources = _caveated_evidence_sources(verifications, artifacts)
+    caveated_dependencies = _caveated_evidence_artifact_ids(verifications, artifacts)
     final = FinalReport(
         run_id=run.id,
         answer=answer,
         verified_claim_ids=[],
-        sources=[],
+        sources=caveated_sources,
         partial=True,
         wave_number=max_task_wave(tasks),
     )
@@ -2564,12 +2762,13 @@ async def _write_no_verified_evidence_final(
             artifact_type=ArtifactType.FINAL_REPORT,
             branch="synthesis/aggregator",
             text_or_summary=answer,
-            tags=["synthesis", "final", "insufficient_verified_evidence"],
+            tags=["synthesis", "final", "insufficient_verified_evidence", "caveated_evidence"],
             visibility=VisibilityScope.PUBLIC_VERIFIED,
             status=ArtifactStatus.VERIFIED,
-            source_refs=[],
+            source_refs=final.sources,
             legacy_object_type="final_report",
             legacy_object_id=run.id,
+            depends_on_artifact_ids=caveated_dependencies[:24],
         ),
         "aggregator-agent",
     )
@@ -2600,6 +2799,72 @@ async def _write_no_verified_evidence_final(
     run.failure_reason = None
     await runtime.blackboard.put_run(run)
     await evaluate_principal_policy_safely(runtime, run.id, trigger="final.no_verified")
+
+
+def _unique_nonempty_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        normalized = value.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
+
+
+def _caveated_evidence_sources(
+    verifications: list[Verification],
+    artifacts: list[Artifact],
+) -> list[str]:
+    non_verified_claim_ids = {
+        verification.claim_id for verification in verifications if verification.verdict != "verified"
+    }
+    source_refs: list[str] = []
+    for verification in verifications:
+        if verification.verdict == "verified":
+            continue
+        source_refs.extend(verification.sources)
+        source_refs.extend(verification.evidence_item_refs)
+    for artifact in artifacts:
+        if _is_caveated_evidence_artifact(artifact, non_verified_claim_ids):
+            source_refs.extend(artifact.source_refs)
+    return _unique_nonempty_strings(source_refs)
+
+
+def _caveated_evidence_artifact_ids(
+    verifications: list[Verification],
+    artifacts: list[Artifact],
+) -> list[UUID]:
+    non_verified_claim_ids = {
+        verification.claim_id for verification in verifications if verification.verdict != "verified"
+    }
+    ids: list[UUID] = []
+    for artifact in artifacts:
+        if _is_caveated_evidence_artifact(artifact, non_verified_claim_ids):
+            ids.append(artifact.id)
+    seen: set[UUID] = set()
+    result: list[UUID] = []
+    for artifact_id in ids:
+        if artifact_id in seen:
+            continue
+        seen.add(artifact_id)
+        result.append(artifact_id)
+    return result
+
+
+def _is_caveated_evidence_artifact(
+    artifact: Artifact,
+    non_verified_claim_ids: set[UUID],
+) -> bool:
+    if artifact.artifact_type not in {ArtifactType.CLAIM, ArtifactType.VERIFICATION}:
+        return False
+    if artifact.status in {ArtifactStatus.DISPUTED, ArtifactStatus.REJECTED}:
+        return True
+    return bool(
+        artifact.legacy_object_type == "claim"
+        and artifact.legacy_object_id in non_verified_claim_ids
+    )
 
 
 def _no_verified_evidence_answer(

@@ -272,6 +272,7 @@ def _candidate_rules(snapshot: PrincipalSnapshot) -> list[PrincipalActionCandida
         )
 
     needs_followup_aggregation = _should_reaggregate_after_followup(snapshot)
+    zero_verified_terminal_aggregation = _zero_verified_terminal_aggregation_ready(snapshot)
     if has_verified_knowledge and has_counterargument:
         candidates.append(_aggregation_candidate(snapshot, PolicyDecisionReason.REQUEST_AGGREGATION))
     elif (
@@ -282,8 +283,17 @@ def _candidate_rules(snapshot: PrincipalSnapshot) -> list[PrincipalActionCandida
         and not snapshot.final
     ) or needs_followup_aggregation:
         candidates.append(_aggregation_candidate(snapshot, PolicyDecisionReason.REQUEST_AGGREGATION))
+    elif zero_verified_terminal_aggregation:
+        candidates.append(_aggregation_candidate(snapshot, PolicyDecisionReason.PARTIAL_AGGREGATION))
 
-    if snapshot.final and snapshot.run.models.judge and snapshot.final.judge_score is None:
+    if snapshot.final and snapshot.final.partial:
+        candidates.append(
+            _stop_candidate(
+                snapshot,
+                "Evidence-limited partial final is terminal; judge is suppressed for partial finals.",
+            )
+        )
+    elif snapshot.final and snapshot.run.models.judge and snapshot.final.judge_score is None:
         candidates.append(
             PrincipalActionCandidate(
                 action_type=PrincipalActionType.REQUEST_TOOL_CALL,
@@ -446,7 +456,12 @@ def _aggregation_candidate(
     snapshot: PrincipalSnapshot, decision_reason: PolicyDecisionReason
 ) -> PrincipalActionCandidate:
     reason = "Verified knowledge and counterargument context are available; synthesize a report."
-    if _should_reaggregate_after_followup(snapshot):
+    if decision_reason == PolicyDecisionReason.PARTIAL_AGGREGATION:
+        reason = (
+            "Follow-up evidence recovery is complete with no verified claims; "
+            "produce an evidence-limited final with caveated evidence links."
+        )
+    elif _should_reaggregate_after_followup(snapshot):
         reason = "Follow-up evidence is complete; refresh synthesis before the next judge pass."
     elif snapshot.final is None:
         reason = "Trusted evidence is available and no final report exists; synthesize a report."
@@ -569,6 +584,20 @@ def _should_reaggregate_after_followup(snapshot: PrincipalSnapshot) -> bool:
         and snapshot.final.judge_score < LOW_JUDGE_SCORE_THRESHOLD
         and _max_task_wave(snapshot.tasks) > snapshot.final.wave_number
     )
+
+
+def _zero_verified_terminal_aggregation_ready(snapshot: PrincipalSnapshot) -> bool:
+    if snapshot.final is not None:
+        return False
+    if not snapshot.tasks or any(task.status == "created" for task in snapshot.tasks):
+        return False
+    if _max_task_wave(snapshot.tasks) < MAX_FOLLOWUP_WAVES:
+        return False
+    if any(verification.verdict == "verified" for verification in snapshot.verifications):
+        return False
+    checked_claim_ids = {verification.claim_id for verification in snapshot.verifications}
+    claim_ids = {claim.id for claim in snapshot.claims}
+    return claim_ids <= checked_claim_ids
 
 
 def _max_task_wave(tasks: list[ResearchTask]) -> int:

@@ -274,6 +274,28 @@ def test_low_judge_score_run_state_requests_first_followup_wave() -> None:
     }
 
 
+def test_partial_evidence_limited_final_run_state_does_not_request_judge() -> None:
+    current_run = run()
+    final = FinalReport(
+        run_id=current_run.id,
+        answer="Evidence-limited result.",
+        verified_claim_ids=[],
+        sources=["https://example.com/caveated-source"],
+        partial=True,
+    )
+
+    state = build_run_state(current_run, [], [], [], final)
+
+    assert state.current_phase == RunPhase.COMPLETED
+    assert PrincipalActionType.REQUEST_TOOL_CALL not in {
+        action.action_type for action in state.next_action_candidates
+    }
+    assert all(action.required_role != "judge_agent" for action in state.next_action_candidates)
+    assert PrincipalActionType.STOP_RUN in {
+        action.action_type for action in state.next_action_candidates
+    }
+
+
 def test_followup_run_state_requests_aggregation_then_stop_after_second_low_score() -> None:
     current_run = run()
     task = ResearchTask(

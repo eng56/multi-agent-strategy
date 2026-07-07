@@ -346,6 +346,8 @@ def _phase(
         return RunPhase.COMPLETED
     pending_tasks = [task for task in tasks if task.status == "created"]
     completed_tasks = [task for task in tasks if task.status == "completed"]
+    if final and final.partial:
+        return RunPhase.COMPLETED
     if final and judge_score_needs_followup(final):
         if can_request_followup_wave(final, tasks):
             return RunPhase.JUDGING
@@ -357,6 +359,11 @@ def _phase(
         return RunPhase.JUDGING
     if final:
         return RunPhase.COMPLETED
+    if tasks and not pending_tasks and max_task_wave(tasks) >= MAX_FOLLOWUP_WAVES:
+        checked_claim_ids = {verification.claim_id for verification in verifications}
+        claim_ids = {claim.id for claim in claims}
+        if claim_ids <= checked_claim_ids:
+            return RunPhase.SYNTHESIZING
     if tasks and all(task.status == "failed" for task in tasks):
         return RunPhase.FAILED
     if verifications and not pending_tasks and len(verifications) >= max(1, len(completed_tasks)):

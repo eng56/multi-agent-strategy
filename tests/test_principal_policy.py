@@ -240,6 +240,58 @@ def test_low_judge_score_without_followup_requests_followup() -> None:
     assert selected.action_type == PrincipalActionType.REQUEST_FOLLOWUP
 
 
+def test_partial_evidence_limited_final_suppresses_judge_candidate() -> None:
+    current_run = run()
+    final = FinalReport(
+        run_id=current_run.id,
+        answer="Evidence-limited result.",
+        verified_claim_ids=[],
+        sources=["https://example.com/caveated-source"],
+        partial=True,
+    )
+    _, policy_snapshot = snapshot(current_run, final=final)
+
+    actions = propose_principal_actions(policy_snapshot)
+
+    assert PrincipalActionType.REQUEST_TOOL_CALL not in {
+        action.action_type for action in actions
+    }
+    assert all(action.required_role != "judge_agent" for action in actions)
+    assert PrincipalActionType.STOP_RUN in {action.action_type for action in actions}
+
+
+def test_zero_verified_followup_completion_requests_partial_aggregation() -> None:
+    current_run = run()
+    current_task = task(current_run, status="completed")
+    current_task.wave_number = 1
+    claim = Claim(
+        run_id=current_run.id,
+        task_id=current_task.id,
+        statement="A broad cross-asset claim remains uncertain.",
+        evidence_observation_ids=[uuid4()],
+        confidence=0.7,
+    )
+    verification = Verification(
+        run_id=current_run.id,
+        claim_id=claim.id,
+        verdict="uncertain",
+        rationale="Partly supported but not synthesis-safe.",
+        confidence=0.6,
+    )
+    _, policy_snapshot = snapshot(
+        current_run,
+        tasks=[current_task],
+        claims=[claim],
+        verifications=[verification],
+    )
+
+    selected = select_principal_action(policy_snapshot)
+
+    assert selected is not None
+    assert selected.action_type == PrincipalActionType.REQUEST_AGGREGATION
+    assert "evidence-limited final" in selected.reason
+
+
 def test_terminal_run_produces_no_actions() -> None:
     current_run = run(RunStatus.COMPLETED)
     _, policy_snapshot = snapshot(current_run)
