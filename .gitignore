@@ -6,6 +6,7 @@ __pycache__/
 *.pyc
 frontend/node_modules/
 frontend/.next/
+evals/output/
 
 # Local Codex loop state, output, configuration, and credentials.
 .codex-loop/config.yaml
