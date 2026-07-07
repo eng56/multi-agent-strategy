@@ -11,10 +11,9 @@ from src.common.models import (
     Claim,
     DeadLetterRecord,
     FinalReport,
-    InformationGain,
     OrganizationPlan,
+    Observation,
     PrincipalAction,
-    PrincipalActionType,
     ResearchTask,
     Run,
     RunPhase,
@@ -94,11 +93,15 @@ def build_run_state(
     organization_plan: OrganizationPlan | None = None,
     dead_letters: list[DeadLetterRecord] | None = None,
     iteration: int = 0,
+    principal_actions: list[PrincipalAction] | None = None,
+    observations: list[Observation] | None = None,
 ) -> RunState:
     """Summarize blackboard contents into the Principal's control-state view."""
     artifacts = artifacts or []
     agent_specs = agent_specs or []
     dead_letters = dead_letters or []
+    principal_actions = principal_actions or []
+    observations = observations or []
     verified_ids = {value.claim_id for value in verifications if value.verdict == "verified"}
     rejected_ids = {value.claim_id for value in verifications if value.verdict == "rejected"}
     uncertain_ids = {value.claim_id for value in verifications if value.verdict == "uncertain"}
@@ -180,7 +183,18 @@ def build_run_state(
         stop_reasons=stop_reasons,
     )
     state.next_action_candidates = _next_actions(
-        state, run, tasks, claims, verifications, final, artifacts
+        state,
+        run,
+        tasks,
+        claims,
+        verifications,
+        final,
+        artifacts,
+        agent_specs,
+        organization_plan,
+        dead_letters,
+        principal_actions,
+        observations,
     )
     return state
 
@@ -362,120 +376,29 @@ def _next_actions(
     verifications: list[Verification],
     final: FinalReport | None,
     artifacts: list[Artifact],
+    agent_specs: list[AgentSpec] | None = None,
+    organization_plan: OrganizationPlan | None = None,
+    dead_letters: list[DeadLetterRecord] | None = None,
+    principal_actions: list[PrincipalAction] | None = None,
+    observations: list[Observation] | None = None,
 ) -> list[PrincipalAction]:
-    if run.status in {RunStatus.COMPLETED, RunStatus.PARTIAL_BUDGET_EXHAUSTED, RunStatus.FAILED}:
-        return []
-    actions: list[PrincipalAction] = []
-    pending_tasks = [task for task in tasks if task.status == "created"]
-    completed_tasks = [task for task in tasks if task.status == "completed"]
-    if not tasks:
-        actions.append(
-            PrincipalAction(
-                run_id=run.id,
-                action_type=PrincipalActionType.ASSIGN_TASK,
-                reason="No research tasks exist yet; the Principal should decompose the objective.",
-                expected_information_gain=InformationGain.HIGH,
-                required_role="principal_policy",
-                priority=9,
-            )
-        )
-    elif pending_tasks:
-        actions.append(
-            PrincipalAction(
-                run_id=run.id,
-                action_type=PrincipalActionType.REQUEST_TOOL_CALL,
-                reason=f"{len(pending_tasks)} planned task(s) still need tool evidence.",
-                expected_information_gain=InformationGain.HIGH,
-                target_branch=branch_for_task(pending_tasks[0]),
-                required_role="tool_runner",
-                priority=8,
-            )
-        )
-    unverified_claim_ids = {claim.id for claim in claims} - {
-        verification.claim_id for verification in verifications
-    }
-    if unverified_claim_ids:
-        actions.append(
-            PrincipalAction(
-                run_id=run.id,
-                action_type=PrincipalActionType.REQUEST_VERIFICATION,
-                reason=f"{len(unverified_claim_ids)} claim(s) need trust-layer review before synthesis.",
-                expected_information_gain=InformationGain.MEDIUM,
-                required_role="source_verifier_agent",
-                target_branch="trust/source_verifier",
-                priority=7,
-            )
-        )
-    has_counterargument = any(
-        value.artifact_type == ArtifactType.COUNTERARGUMENT for value in artifacts
+    from src.agents.principal_policy import build_principal_snapshot, propose_principal_actions
+
+    snapshot = build_principal_snapshot(
+        run,
+        state,
+        organization_plan,
+        agent_specs=agent_specs,
+        tasks=tasks,
+        observations=observations,
+        claims=claims,
+        verifications=verifications,
+        artifacts=artifacts,
+        principal_actions=principal_actions,
+        dead_letters=dead_letters,
+        final=final,
     )
-    if state.verified_claim_count >= 2 and not has_counterargument and state.budget_remaining > 0:
-        actions.append(
-            PrincipalAction(
-                run_id=run.id,
-                action_type=PrincipalActionType.REQUEST_SKEPTIC_REVIEW,
-                reason="Multiple claims have been verified but no adversarial counterargument has been produced yet.",
-                expected_information_gain=InformationGain.MEDIUM,
-                required_role="skeptic_agent",
-                target_branch="trust/skeptic",
-                priority=6,
-            )
-        )
-    needs_followup_aggregation = should_reaggregate_after_followup(final, tasks)
-    if (
-        tasks
-        and not pending_tasks
-        and (not final or needs_followup_aggregation)
-        and (completed_tasks or state.verified_claim_count)
-    ):
-        actions.append(
-            PrincipalAction(
-                run_id=run.id,
-                action_type=PrincipalActionType.REQUEST_AGGREGATION,
-                reason=(
-                    "Follow-up tasks have reached a terminal state; refresh synthesis with "
-                    "the new evidence."
-                    if needs_followup_aggregation
-                    else "All planned tasks have reached a terminal state; synthesize "
-                    "trusted artifacts that are available."
-                ),
-                expected_information_gain=InformationGain.MEDIUM,
-                required_role="aggregator_agent",
-                target_branch="synthesis/aggregator",
-                priority=5,
-            )
-        )
-    if final and final.judge_score is not None:
-        if can_request_followup_wave(final, tasks):
-            actions.append(
-                PrincipalAction(
-                    run_id=run.id,
-                    action_type=PrincipalActionType.REQUEST_FOLLOWUP,
-                    reason=(
-                        f"Judge score {final.judge_score:.2f} is below "
-                        f"{FOLLOWUP_JUDGE_SCORE_THRESHOLD:.2f}; request one targeted follow-up wave."
-                    ),
-                    expected_information_gain=InformationGain.MEDIUM,
-                    target_branch="synthesis/judge",
-                    required_role="principal_policy",
-                    priority=7,
-                )
-            )
-        elif not should_reaggregate_after_followup(final, tasks):
-            actions.append(
-                PrincipalAction(
-                    run_id=run.id,
-                    action_type=PrincipalActionType.STOP_RUN,
-                    reason=(
-                        "The payoff layer scored the final report and no further follow-up "
-                        "wave is available."
-                    ),
-                    expected_information_gain=InformationGain.LOW,
-                    target_branch="synthesis/judge",
-                    priority=3,
-                )
-            )
-    return actions
+    return propose_principal_actions(snapshot)
 
 
 def title_from_branch(branch: str) -> str:
