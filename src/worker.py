@@ -197,12 +197,27 @@ async def dispatch(runtime, role, event) -> None:
         _require_uuid_payload(event)
         await handler(runtime, event)
     except BudgetExceeded as exc:
+        logger.warning(
+            "budget blocked handler action role=%s event_type=%s run_id=%s reason=%s",
+            role,
+            event.type,
+            event.run_id,
+            concise_exception(exc),
+        )
         if role not in {"aggregator-agent", "judge-agent"}:
             try:
                 event.payload["force"] = True
                 await aggregate(runtime, event)
                 return
-            except BudgetExceeded:
+            except BudgetExceeded as aggregate_exc:
+                logger.warning(
+                    "budget blocked forced aggregation role=%s event_type=%s run_id=%s "
+                    "reason=%s",
+                    role,
+                    event.type,
+                    event.run_id,
+                    concise_exception(aggregate_exc),
+                )
                 pass
         await deterministic_partial(runtime, event.run_id, str(exc))
     except Exception as exc:

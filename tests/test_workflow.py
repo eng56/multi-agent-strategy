@@ -2,6 +2,8 @@ import asyncio
 from types import SimpleNamespace
 from uuid import uuid4
 
+import pytest
+
 from src.agents.workflow import (
     HANDLERS,
     aggregate,
@@ -14,8 +16,9 @@ from src.agents.workflow import (
     skeptic_review,
     verify_claim,
 )
-from src.worker import MAX_HANDLER_RETRIES, dispatch
+from src.common.budget import BudgetExceeded
 from src.integrations.llm import LLMOutputError
+from src.worker import MAX_HANDLER_RETRIES, dispatch
 from src.common.models import (
     ActionStatus,
     AgentSpec,
@@ -1095,6 +1098,56 @@ def test_deterministic_partial_records_executed_aggregation_action() -> None:
         action.action_type == PrincipalActionType.REQUEST_AGGREGATION
         for action in rt.blackboard.actions
     )
+    assert any(action.action_type == PrincipalActionType.STOP_RUN for action in rt.blackboard.actions)
+    assert rt.blackboard.run.failure_reason == "budget exhausted"
+
+
+def test_execute_tool_budget_block_marks_task_skipped_and_logs(caplog) -> None:
+    run = Run(
+        question="Should I buy SAP stock?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget(tavily_max_credits=1)),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="SAP stock catalysts",
+        question="SAP stock catalysts",
+        tool="web_search",
+    )
+    rt = runtime(run, QueueLLM())
+    rt.blackboard.tasks.append(task)
+
+    class BudgetBlockedTools(FakeTools):
+        async def web_search(self, _run_id, _query):
+            raise BudgetExceeded(
+                "Tavily credit budget reached: requested=1, used=1, max=1",
+                budget_type="tool",
+                provider="tavily",
+            )
+
+    rt.tools = BudgetBlockedTools()
+
+    with caplog.at_level("WARNING"), pytest.raises(BudgetExceeded):
+        asyncio.run(
+            execute_tool(
+                rt,
+                EventEnvelope(
+                    type=EventType.TASK_CREATED,
+                    run_id=run.id,
+                    producer="test",
+                    payload={"task_id": str(task.id)},
+                ),
+            )
+        )
+
+    assert rt.blackboard.tasks[0].status == "skipped_budget"
+    assert "Budget blocked tool_execution" in (rt.blackboard.tasks[0].reason or "")
+    assert any(
+        action.status == ActionStatus.REJECTED
+        and action.action_type == PrincipalActionType.REQUEST_TOOL_CALL
+        for action in rt.blackboard.actions
+    )
+    assert "budget skipped task" in caplog.text
 
 
 def test_execute_tool_failure_does_not_record_executed_tool_action() -> None:

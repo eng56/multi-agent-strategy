@@ -335,6 +335,26 @@ class DeadLetterRecord(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+class ToolUsageSummary(BaseModel):
+    used: int = Field(ge=0)
+    max: int = Field(ge=0)
+    remaining: int = Field(ge=0)
+
+
+class BudgetSummary(BaseModel):
+    total_limit_usd: float = Field(ge=0)
+    spent_usd: float = Field(ge=0)
+    reserved_usd: float = Field(ge=0)
+    remaining_usd: float = Field(ge=0)
+    role_spent_usd: dict[str, float] = Field(default_factory=dict)
+    role_reserved_usd: dict[str, float] = Field(default_factory=dict)
+    role_protected_usd: dict[str, float] = Field(default_factory=dict)
+    protected_usd: float = Field(default=0, ge=0)
+    protected_remaining_usd: float = Field(default=0, ge=0)
+    tool_usage: dict[str, ToolUsageSummary] = Field(default_factory=dict)
+    stop_reasons: list[str] = Field(default_factory=list)
+
+
 class RunState(BaseModel):
     run_id: UUID
     iteration: int = 0
@@ -349,6 +369,7 @@ class RunState(BaseModel):
     rejected_claim_count: int = 0
     disputed_claim_count: int = 0
     coverage_by_topic: dict[str, str] = Field(default_factory=dict)
+    budget_summary: BudgetSummary | None = None
     budget_remaining: float = 0
     tool_budget_remaining: dict[str, int] = Field(default_factory=dict)
     agent_count: int = 0

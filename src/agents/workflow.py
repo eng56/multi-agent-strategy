@@ -142,6 +142,41 @@ async def fail_task(
     await fail_run_if_all_tasks_failed(runtime, task.run_id)
 
 
+async def skip_task_due_to_budget(
+    runtime: Runtime,
+    task: ResearchTask,
+    branch: str,
+    stage: str,
+    exc: BudgetExceeded,
+    *,
+    producer: str,
+) -> None:
+    reason = f"Budget blocked {stage} for task: {task.title} ({concise_exception(exc)})"
+    logger.warning(
+        "budget skipped task run_id=%s task_id=%s branch=%s stage=%s reason=%s",
+        task.run_id,
+        task.id,
+        branch,
+        stage,
+        concise_exception(exc),
+    )
+    task.status = "skipped_budget"
+    task.reason = reason
+    await runtime.blackboard.put_task(task)
+    await persist_action(
+        runtime,
+        task.run_id,
+        PrincipalActionType.REQUEST_TOOL_CALL,
+        reason,
+        required_role="tool_runner" if producer == "tool-runner" else "research_agent",
+        target_branch=branch,
+        expected_information_gain=InformationGain.LOW,
+        priority=6,
+        status=ActionStatus.REJECTED,
+        producer=producer,
+    )
+
+
 async def fail_run_if_all_tasks_failed(runtime: Runtime, run_id: UUID) -> None:
     tasks = await runtime.blackboard.list_models(run_id, "tasks", ResearchTask)
     if not tasks or any(task.status != "failed" for task in tasks):
@@ -796,7 +831,8 @@ async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:
             f"Summarize the most decision-relevant facts from this tool output. Return "
             f'{{"summary":"..."}}. Output: {json.dumps(raw)[:30000]}',
         )
-    except BudgetExceeded:
+    except BudgetExceeded as exc:
+        await skip_task_due_to_budget(runtime, task, branch, stage, exc, producer="tool-runner")
         raise
     except Exception as exc:
         if is_transient_failure(exc):
@@ -1587,6 +1623,7 @@ async def deterministic_partial(runtime: Runtime, run_id: UUID, reason: str) -> 
     )
     run.final_answer = answer
     run.status = RunStatus.PARTIAL_BUDGET_EXHAUSTED
+    run.failure_reason = reason
     await runtime.blackboard.put_final(final)
     await persist_artifact(
         runtime,
@@ -1611,6 +1648,17 @@ async def deterministic_partial(runtime: Runtime, run_id: UUID, reason: str) -> 
         f"Produced deterministic partial final report: {reason}",
         required_role="aggregator_agent",
         target_branch="synthesis/aggregator",
+        expected_information_gain=InformationGain.LOW,
+        priority=4,
+        producer="aggregator-agent",
+    )
+    await persist_action(
+        runtime,
+        run_id,
+        PrincipalActionType.STOP_RUN,
+        f"Stopped after budget block: {reason}",
+        required_role="principal_policy",
+        target_branch="root",
         expected_information_gain=InformationGain.LOW,
         priority=4,
         producer="aggregator-agent",
