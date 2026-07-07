@@ -46,3 +46,19 @@ def test_principal_policy_mode_defaults_to_shadow() -> None:
     settings = Settings(**required_settings(), LANGFUSE_BASE_URL="https://cloud.langfuse.com")
 
     assert settings.principal_policy_mode == "shadow"
+
+
+def test_evidence_max_sources_is_bounded() -> None:
+    settings = Settings(
+        **required_settings(),
+        LANGFUSE_BASE_URL="https://cloud.langfuse.com",
+        evidence_max_sources=7,
+    )
+    assert settings.evidence_max_sources == 7
+
+    with pytest.raises(ValidationError, match="evidence_max_sources"):
+        Settings(
+            **required_settings(),
+            LANGFUSE_BASE_URL="https://cloud.langfuse.com",
+            evidence_max_sources=26,
+        )
