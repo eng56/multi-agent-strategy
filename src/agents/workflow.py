@@ -17,6 +17,7 @@ from src.agents.state import (
     title_from_branch,
 )
 from src.agents.knowledge_router import select_context_for_agent
+from src.agents.principal_runtime import evaluate_principal_policy
 from src.agents.prompts import build_agent_instruction_block
 from src.common.budget import BudgetExceeded
 from src.common.failures import PermanentEventError, concise_exception, is_transient_failure
@@ -61,6 +62,19 @@ def emit(
     )
 
 
+async def evaluate_principal_policy_safely(
+    runtime: Runtime, run_id: UUID, *, trigger: str
+) -> None:
+    try:
+        await evaluate_principal_policy(runtime, run_id, trigger=trigger)
+    except Exception:
+        logger.exception(
+            "principal policy evaluation failed run_id=%s trigger=%s",
+            run_id,
+            trigger,
+        )
+
+
 async def persist_action(
     runtime: Runtime,
     run_id: UUID,
@@ -85,6 +99,7 @@ async def persist_action(
         estimated_cost=estimated_cost,
         priority=priority,
         status=status,
+        producer=producer,
     )
     await runtime.blackboard.put_principal_action(action)
     emit(runtime, EventType.PRINCIPAL_ACTION_CREATED, run_id, producer, action_id=str(action.id))
@@ -140,6 +155,9 @@ async def fail_task(
         reason=reason,
     )
     await fail_run_if_all_tasks_failed(runtime, task.run_id)
+    await evaluate_principal_policy_safely(
+        runtime, task.run_id, trigger=f"task.failed:{stage}"
+    )
 
 
 async def skip_task_due_to_budget(
@@ -174,6 +192,9 @@ async def skip_task_due_to_budget(
         priority=6,
         status=ActionStatus.REJECTED,
         producer=producer,
+    )
+    await evaluate_principal_policy_safely(
+        runtime, task.run_id, trigger=f"task.skipped_budget:{stage}"
     )
 
 
@@ -741,6 +762,7 @@ async def plan(runtime: Runtime, event: EventEnvelope) -> None:
             run.id,
             planner_failure_reason(last_error, retry_used=retry_used, fallback_used=fallback_used),
         )
+    await evaluate_principal_policy_safely(runtime, run.id, trigger="plan.finished")
 
 
 async def request_followup_wave(
@@ -897,6 +919,9 @@ async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:
         "tool-runner",
         observation_id=str(observation.id),
     )
+    await evaluate_principal_policy_safely(
+        runtime, task.run_id, trigger="observation.created"
+    )
 
 
 async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
@@ -968,6 +993,7 @@ async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
         "worker-agents",
     )
     emit(runtime, EventType.CLAIM_CREATED, event.run_id, "worker-agents", claim_id=str(claim.id))
+    await evaluate_principal_policy_safely(runtime, event.run_id, trigger="claim.created")
 
 
 def verification_search_query(statement: str) -> str:
@@ -1270,6 +1296,9 @@ async def verify_claim(runtime: Runtime, event: EventEnvelope) -> None:
                 ),
                 producer="verifier-agent",
             )
+            await evaluate_principal_policy_safely(
+                runtime, event.run_id, trigger=f"claim.{verification.verdict}"
+            )
             return
     emit(
         runtime,
@@ -1277,6 +1306,9 @@ async def verify_claim(runtime: Runtime, event: EventEnvelope) -> None:
         event.run_id,
         "verifier-agent",
         verification_id=str(verification.id),
+    )
+    await evaluate_principal_policy_safely(
+        runtime, event.run_id, trigger=f"claim.{verification.verdict}"
     )
 
 
@@ -1343,6 +1375,9 @@ async def skeptic_review(runtime: Runtime, event: EventEnvelope) -> None:
     except Exception as exc:
         await _persist_skeptic_failure_artifact(runtime, event.run_id, exc)
         emit(runtime, EventType.CLAIM_VERIFIED, event.run_id, "skeptic-agent")
+        await evaluate_principal_policy_safely(
+            runtime, event.run_id, trigger="skeptic.artifact.failed"
+        )
         return
 
     artifact = Artifact(
@@ -1386,6 +1421,9 @@ async def skeptic_review(runtime: Runtime, event: EventEnvelope) -> None:
         event.run_id,
         "skeptic-agent",
         skeptic_artifact_id=str(artifact.id),
+    )
+    await evaluate_principal_policy_safely(
+        runtime, event.run_id, trigger="skeptic.artifact.created"
     )
 
 
@@ -1536,6 +1574,7 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
         run.final_answer = final.answer
         run.status = RunStatus.COMPLETED
         await runtime.blackboard.put_run(run)
+    await evaluate_principal_policy_safely(runtime, event.run_id, trigger="final.created")
 
 
 async def judge(runtime: Runtime, event: EventEnvelope) -> None:
@@ -1581,10 +1620,16 @@ async def judge(runtime: Runtime, event: EventEnvelope) -> None:
             run.status = RunStatus.RUNNING
             await runtime.blackboard.put_run(run)
             await request_followup_wave(runtime, run, final, tasks)
+            await evaluate_principal_policy_safely(
+                runtime, event.run_id, trigger="judge.completed"
+            )
             return
         if should_reaggregate_after_followup(final, tasks):
             run.status = RunStatus.RUNNING
             await runtime.blackboard.put_run(run)
+            await evaluate_principal_policy_safely(
+                runtime, event.run_id, trigger="judge.completed"
+            )
             return
 
     run.status = RunStatus.COMPLETED
@@ -1600,6 +1645,7 @@ async def judge(runtime: Runtime, event: EventEnvelope) -> None:
         producer="judge-agent",
     )
     await runtime.blackboard.put_run(run)
+    await evaluate_principal_policy_safely(runtime, event.run_id, trigger="judge.completed")
 
 
 HANDLERS = {
@@ -1677,3 +1723,4 @@ async def deterministic_partial(runtime: Runtime, run_id: UUID, reason: str) -> 
         producer="aggregator-agent",
     )
     await runtime.blackboard.put_run(run)
+    await evaluate_principal_policy_safely(runtime, run_id, trigger="final.partial")

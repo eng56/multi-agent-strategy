@@ -16,6 +16,10 @@ from src.agents.workflow import (
     skeptic_review,
     verify_claim,
 )
+from src.agents.principal_runtime import (
+    SHADOW_POLICY_PRODUCER,
+    evaluate_principal_policy,
+)
 from src.common.budget import BudgetExceeded
 from src.integrations.llm import LLMOutputError
 from src.worker import MAX_HANDLER_RETRIES, dispatch
@@ -175,7 +179,9 @@ class QueueLLM:
         return result
 
 
-def runtime(run: Run, llm: QueueLLM | None = None):
+def runtime(
+    run: Run, llm: QueueLLM | None = None, *, principal_policy_mode: str = "shadow"
+):
     published = []
     blackboard = FakeBlackboard(run)
     return SimpleNamespace(
@@ -183,10 +189,118 @@ def runtime(run: Run, llm: QueueLLM | None = None):
         llm=llm or QueueLLM(),
         tools=FakeTools(),
         artifacts=FakeArtifacts(),
-        settings=SimpleNamespace(runtime_topic="agent-runtime"),
+        settings=SimpleNamespace(
+            runtime_topic="agent-runtime", principal_policy_mode=principal_policy_mode
+        ),
         events=SimpleNamespace(publish=lambda topic, event: published.append((topic, event))),
         published=published,
     )
+
+
+def pending_policy_runtime(
+    *, principal_policy_mode: str = "shadow", run_status: RunStatus = RunStatus.RUNNING
+):
+    run = Run(
+        question="Should I buy SAP stock?",
+        status=run_status,
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="SAP stock catalysts",
+        question="SAP stock catalysts",
+        tool="web_search",
+    )
+    rt = runtime(run, QueueLLM(), principal_policy_mode=principal_policy_mode)
+    rt.blackboard.tasks.append(task)
+    return run, task, rt
+
+
+def test_shadow_policy_persists_proposed_action_without_side_effect_event() -> None:
+    run, _task, rt = pending_policy_runtime()
+
+    selected = asyncio.run(evaluate_principal_policy(rt, run.id, trigger="test"))
+
+    assert selected is not None
+    assert len(rt.blackboard.actions) == 1
+    action = rt.blackboard.actions[0]
+    assert action.status == ActionStatus.PROPOSED
+    assert action.producer == SHADOW_POLICY_PRODUCER
+    assert action.reason.startswith("shadow policy proposed:")
+    assert action.action_type == PrincipalActionType.REQUEST_TOOL_CALL
+    assert action.idempotency_key
+    assert rt.published == []
+
+
+def test_principal_policy_off_mode_persists_nothing() -> None:
+    run, _task, rt = pending_policy_runtime(principal_policy_mode="off")
+
+    selected = asyncio.run(evaluate_principal_policy(rt, run.id, trigger="test"))
+
+    assert selected is None
+    assert rt.blackboard.actions == []
+    assert rt.published == []
+
+
+def test_shadow_policy_does_not_write_duplicate_proposals() -> None:
+    run, _task, rt = pending_policy_runtime()
+
+    first = asyncio.run(evaluate_principal_policy(rt, run.id, trigger="first"))
+    second = asyncio.run(evaluate_principal_policy(rt, run.id, trigger="second"))
+
+    assert first is not None
+    assert second is None
+    assert len(rt.blackboard.actions) == 1
+
+
+def test_terminal_run_writes_no_shadow_policy_proposal() -> None:
+    run, _task, rt = pending_policy_runtime(run_status=RunStatus.COMPLETED)
+
+    selected = asyncio.run(evaluate_principal_policy(rt, run.id, trigger="test"))
+
+    assert selected is None
+    assert rt.blackboard.actions == []
+    assert rt.published == []
+
+
+def test_plan_hook_writes_shadow_policy_action_without_action_created_event() -> None:
+    run = Run(
+        question="Should I buy SAP stock?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    rt = runtime(
+        run,
+        QueueLLM(
+            {
+                "tasks": [
+                    {
+                        "title": "SAP stock catalysts",
+                        "question": "SAP stock catalysts",
+                        "tool": "web_search",
+                    }
+                ]
+            }
+        ),
+    )
+
+    asyncio.run(plan(rt, EventEnvelope(type=EventType.RUN_CREATED, run_id=run.id, producer="test")))
+
+    shadow_actions = [
+        action
+        for action in rt.blackboard.actions
+        if action.producer == SHADOW_POLICY_PRODUCER
+    ]
+    assert len(shadow_actions) == 1
+    assert shadow_actions[0].status == ActionStatus.PROPOSED
+    assert shadow_actions[0].action_type == PrincipalActionType.REQUEST_TOOL_CALL
+    published_action_ids = {
+        event.payload.get("action_id")
+        for _topic, event in rt.published
+        if event.type == EventType.PRINCIPAL_ACTION_CREATED
+    }
+    assert str(shadow_actions[0].id) not in published_action_ids
 
 
 def test_every_workflow_stage_has_an_event_handler() -> None:

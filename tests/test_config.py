@@ -40,3 +40,9 @@ def test_polygon_base_url_is_accepted_as_legacy_market_data_alias() -> None:
         POLYGON_BASE_URL="https://api.polygon.io",
     )
     assert settings.market_data_base_url == "https://api.polygon.io"
+
+
+def test_principal_policy_mode_defaults_to_shadow() -> None:
+    settings = Settings(**required_settings(), LANGFUSE_BASE_URL="https://cloud.langfuse.com")
+
+    assert settings.principal_policy_mode == "shadow"

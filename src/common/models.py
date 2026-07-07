@@ -260,6 +260,10 @@ class PrincipalAction(BaseModel):
     required_role: str | None = None
     priority: int = Field(default=5, ge=1, le=10)
     status: ActionStatus = ActionStatus.PROPOSED
+    producer: str | None = None
+    policy_phase: RunPhase | None = None
+    policy_wave_number: int | None = Field(default=None, ge=0)
+    idempotency_key: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
