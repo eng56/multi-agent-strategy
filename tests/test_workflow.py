@@ -17,6 +17,7 @@ from src.agents.workflow import (
     verify_claim,
 )
 from src.agents.principal_runtime import (
+    ACTIVE_POLICY_PRODUCER,
     SHADOW_POLICY_PRODUCER,
     evaluate_principal_policy,
 )
@@ -241,6 +242,168 @@ def test_principal_policy_off_mode_persists_nothing() -> None:
     assert selected is None
     assert rt.blackboard.actions == []
     assert rt.published == []
+
+
+def test_active_assign_task_creates_deterministic_tasks_and_events() -> None:
+    run = Run(
+        question="Will gold and USD move if Fed cuts rates?",
+        status=RunStatus.RUNNING,
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    rt = runtime(run, QueueLLM(), principal_policy_mode="active")
+
+    selected = asyncio.run(evaluate_principal_policy(rt, run.id, trigger="test"))
+
+    assert selected is not None
+    assert selected.action_type == PrincipalActionType.ASSIGN_TASK
+    assert selected.status == ActionStatus.EXECUTED
+    assert selected.producer == ACTIVE_POLICY_PRODUCER
+    assert {task.title for task in rt.blackboard.tasks} >= {
+        "Gold reaction to surprise Fed cut",
+        "US dollar reaction to surprise Fed cut",
+    }
+    published_types = [event.type for _topic, event in rt.published]
+    assert published_types.count(EventType.TASK_CREATED) == len(rt.blackboard.tasks)
+    assert EventType.PRINCIPAL_ACTION_CREATED in published_types
+
+
+def test_active_request_verification_emits_claim_created() -> None:
+    run = Run(
+        question="Should I buy SAP stock?",
+        status=RunStatus.RUNNING,
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="SAP stock catalysts",
+        question="SAP stock catalysts",
+        tool="web_search",
+        status="completed",
+    )
+    claim = Claim(
+        run_id=run.id,
+        task_id=task.id,
+        statement="SAP backlog is rising.",
+        evidence_observation_ids=[uuid4()],
+        confidence=0.8,
+    )
+    rt = runtime(run, QueueLLM(), principal_policy_mode="active")
+    rt.blackboard.tasks.append(task)
+    rt.blackboard.claims.append(claim)
+
+    selected = asyncio.run(evaluate_principal_policy(rt, run.id, trigger="test"))
+
+    assert selected is not None
+    assert selected.action_type == PrincipalActionType.REQUEST_VERIFICATION
+    assert selected.status == ActionStatus.EXECUTED
+    claim_events = [event for _topic, event in rt.published if event.type == EventType.CLAIM_CREATED]
+    assert len(claim_events) == 1
+    assert claim_events[0].payload["claim_id"] == str(claim.id)
+
+
+def test_active_request_aggregation_does_not_double_dispatch() -> None:
+    run = Run(
+        question="Should I buy SAP?",
+        status=RunStatus.RUNNING,
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="SAP",
+        question="SAP stock",
+        tool="web_search",
+        status="completed",
+    )
+    claim = Claim(
+        run_id=run.id,
+        task_id=task.id,
+        statement="SAP has positive momentum.",
+        evidence_observation_ids=[uuid4()],
+        confidence=0.8,
+    )
+    verification = Verification(
+        run_id=run.id,
+        claim_id=claim.id,
+        verdict="verified",
+        rationale="Supported.",
+        confidence=0.7,
+    )
+    rt = runtime(run, QueueLLM(), principal_policy_mode="active")
+    rt.blackboard.tasks.append(task)
+    rt.blackboard.claims.append(claim)
+    rt.blackboard.verifications.append(verification)
+    rt.blackboard.organization_plan = OrganizationPlan(
+        run_id=run.id,
+        root_agent_id=uuid4(),
+        branches=["market/equities", "synthesis/aggregator"],
+    )
+
+    first = asyncio.run(evaluate_principal_policy(rt, run.id, trigger="first"))
+    second = asyncio.run(evaluate_principal_policy(rt, run.id, trigger="second"))
+
+    assert first is not None
+    assert first.action_type == PrincipalActionType.REQUEST_AGGREGATION
+    assert second is None
+    aggregation_events = [
+        event for _topic, event in rt.published if event.type == EventType.CLAIM_VERIFIED
+    ]
+    assert len(aggregation_events) == 1
+    assert aggregation_events[0].payload["force"] is True
+
+
+def test_active_request_followup_creates_at_most_one_wave() -> None:
+    run = Run(
+        question="Should I buy SAP?",
+        status=RunStatus.RUNNING,
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    final = FinalReport(
+        run_id=run.id,
+        answer="Buy with caution.",
+        verified_claim_ids=[],
+        sources=[],
+        judge_score=0.62,
+        judge_feedback="Needs stronger valuation evidence. Address downside risks.",
+    )
+    rt = runtime(run, QueueLLM(), principal_policy_mode="active")
+    rt.blackboard.final = final
+
+    first = asyncio.run(evaluate_principal_policy(rt, run.id, trigger="first"))
+    second = asyncio.run(evaluate_principal_policy(rt, run.id, trigger="second"))
+
+    assert first is not None
+    assert first.action_type == PrincipalActionType.REQUEST_FOLLOWUP
+    assert second is None or second.action_type != PrincipalActionType.REQUEST_FOLLOWUP
+    followups = [task for task in rt.blackboard.tasks if task.wave_number == 1]
+    assert 1 <= len(followups) <= 3
+    assert max(task.wave_number for task in rt.blackboard.tasks) == 1
+    followup_events = [
+        event for _topic, event in rt.published if event.type == EventType.FOLLOWUP_REQUESTED
+    ]
+    assert len(followup_events) == 1
+
+
+def test_active_idempotency_prevents_duplicate_tool_dispatch() -> None:
+    run, task, rt = pending_policy_runtime(principal_policy_mode="active")
+    rt.blackboard.organization_plan = OrganizationPlan(
+        run_id=run.id,
+        root_agent_id=uuid4(),
+        branches=["market/equities"],
+    )
+
+    first = asyncio.run(evaluate_principal_policy(rt, run.id, trigger="first"))
+    second = asyncio.run(evaluate_principal_policy(rt, run.id, trigger="second"))
+
+    assert first is not None
+    assert first.action_type == PrincipalActionType.REQUEST_TOOL_CALL
+    assert second is None
+    task_events = [event for _topic, event in rt.published if event.type == EventType.TASK_CREATED]
+    assert len(task_events) == 1
+    assert task_events[0].payload["task_id"] == str(task.id)
 
 
 def test_shadow_policy_does_not_write_duplicate_proposals() -> None:

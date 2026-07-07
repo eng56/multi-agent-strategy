@@ -9,11 +9,17 @@ from src.agents.principal_policy import (
     build_principal_snapshot,
     select_principal_action,
 )
-from src.agents.state import branch_for_task, build_run_state, max_task_wave
+from src.agents.state import (
+    FOLLOWUP_JUDGE_SCORE_THRESHOLD,
+    branch_for_task,
+    build_run_state,
+    max_task_wave,
+)
 from src.common.models import (
     ActionStatus,
     AgentSpec,
     Artifact,
+    ArtifactType,
     Claim,
     DeadLetterRecord,
     EventEnvelope,
@@ -23,6 +29,7 @@ from src.common.models import (
     PrincipalActionType,
     ResearchTask,
     RunPhase,
+    RunStatus,
     Verification,
 )
 from src.runtime import Runtime
@@ -33,6 +40,15 @@ SHADOW_POLICY_PRODUCER = "principal-policy-shadow"
 ACTIVE_POLICY_PRODUCER = "principal-policy-active"
 SHADOW_REASON_PREFIX = "shadow policy proposed:"
 ACTIVE_REASON_PREFIX = "active policy selected:"
+ACTIVE_EXECUTOR_ACTIONS = {
+    PrincipalActionType.ASSIGN_TASK,
+    PrincipalActionType.REQUEST_TOOL_CALL,
+    PrincipalActionType.REQUEST_VERIFICATION,
+    PrincipalActionType.REQUEST_SKEPTIC_REVIEW,
+    PrincipalActionType.REQUEST_AGGREGATION,
+    PrincipalActionType.REQUEST_FOLLOWUP,
+    PrincipalActionType.STOP_RUN,
+}
 
 
 @dataclass(frozen=True)
@@ -263,7 +279,7 @@ async def persist_active_action(
     wave_number: int | None,
     idempotency_key: str,
 ) -> PrincipalAction:
-    dispatched = execute_active_action(runtime, snapshot, selected)
+    dispatched = await execute_principal_decision(runtime, snapshot, selected)
     active_action = copy_policy_action(
         selected,
         reason=f"{ACTIVE_REASON_PREFIX} {selected.reason}",
@@ -286,15 +302,26 @@ async def persist_active_action(
     return active_action
 
 
-def execute_active_action(
+async def execute_principal_decision(
     runtime: Runtime, snapshot: PrincipalSnapshot, action: PrincipalAction
 ) -> bool:
+    if action.action_type not in ACTIVE_EXECUTOR_ACTIONS:
+        return False
+
+    if dispatch_already_executed(snapshot, action):
+        return False
+
+    if action.action_type == PrincipalActionType.ASSIGN_TASK:
+        return await execute_assign_task(runtime, snapshot, action)
+
     if (
         action.action_type == PrincipalActionType.REQUEST_TOOL_CALL
         and action.required_role == "tool_runner"
     ):
         task = matching_pending_task(snapshot, action)
         if not task:
+            return False
+        if task_dispatch_already_executed(snapshot, task, action):
             return False
         publish(runtime, EventType.TASK_CREATED, action.run_id, task_id=str(task.id))
         return True
@@ -303,6 +330,10 @@ def execute_active_action(
         action.action_type == PrincipalActionType.REQUEST_TOOL_CALL
         and action.required_role == "judge_agent"
     ):
+        if not snapshot.final or snapshot.final.judge_score is not None:
+            return False
+        if dispatch_already_executed(snapshot, action):
+            return False
         publish(runtime, EventType.FINAL_CREATED, action.run_id)
         return True
 
@@ -310,18 +341,128 @@ def execute_active_action(
         claim = first_unverified_claim(snapshot)
         if not claim:
             return False
+        if dispatch_already_executed(snapshot, action):
+            return False
         publish(runtime, EventType.CLAIM_CREATED, action.run_id, claim_id=str(claim.id))
         return True
 
     if action.action_type == PrincipalActionType.REQUEST_SKEPTIC_REVIEW:
+        if has_counterargument(snapshot):
+            return False
+        if dispatch_already_executed(snapshot, action):
+            return False
         publish(runtime, EventType.SKEPTIC_REVIEW_REQUESTED, action.run_id)
         return True
 
     if action.action_type == PrincipalActionType.REQUEST_AGGREGATION:
+        if not should_dispatch_aggregation(snapshot):
+            return False
+        if dispatch_already_executed(snapshot, action):
+            return False
         publish(runtime, EventType.CLAIM_VERIFIED, action.run_id, force=True)
         return True
 
+    if action.action_type == PrincipalActionType.REQUEST_FOLLOWUP:
+        return await execute_followup(runtime, snapshot, action)
+
+    if action.action_type == PrincipalActionType.STOP_RUN:
+        return await execute_stop_run(runtime, snapshot, action)
+
     return False
+
+
+async def execute_assign_task(
+    runtime: Runtime, snapshot: PrincipalSnapshot, action: PrincipalAction
+) -> bool:
+    if snapshot.tasks:
+        return False
+    if dispatch_already_executed(snapshot, action):
+        return False
+
+    from src.agents.workflow import deterministic_task_items
+
+    created = 0
+    for item in deterministic_task_items(snapshot.run.question, snapshot.organization_plan):
+        task = ResearchTask(run_id=snapshot.run.id, **item)
+        await runtime.blackboard.put_task(task)
+        publish(
+            runtime,
+            EventType.TASK_CREATED,
+            snapshot.run.id,
+            task_id=str(task.id),
+        )
+        created += 1
+    return created > 0
+
+
+async def execute_followup(
+    runtime: Runtime, snapshot: PrincipalSnapshot, action: PrincipalAction
+) -> bool:
+    if not snapshot.final:
+        return False
+    if dispatch_already_executed(snapshot, action):
+        return False
+
+    from src.agents.workflow import (
+        followup_already_requested,
+        followup_task_items,
+    )
+
+    score = snapshot.final.judge_score
+    if score is None or score >= FOLLOWUP_JUDGE_SCORE_THRESHOLD:
+        return False
+    if followup_already_requested(snapshot.tasks, snapshot.principal_actions):
+        return False
+
+    wave_number = max_task_wave(snapshot.tasks) + 1
+    created = 0
+    publish(
+        runtime,
+        EventType.FOLLOWUP_REQUESTED,
+        snapshot.run.id,
+        wave_number=wave_number,
+        judge_score=score,
+    )
+    for item in followup_task_items(snapshot.run, snapshot.final, wave_number):
+        task = ResearchTask(run_id=snapshot.run.id, **item)
+        await runtime.blackboard.put_task(task)
+        publish(
+            runtime,
+            EventType.TASK_CREATED,
+            snapshot.run.id,
+            task_id=str(task.id),
+            wave_number=wave_number,
+            followup=True,
+        )
+        created += 1
+    return created > 0
+
+
+async def execute_stop_run(
+    runtime: Runtime, snapshot: PrincipalSnapshot, action: PrincipalAction
+) -> bool:
+    if snapshot.run.status in {
+        RunStatus.COMPLETED,
+        RunStatus.PARTIAL_BUDGET_EXHAUSTED,
+        RunStatus.FAILED,
+    }:
+        return False
+    if useful_action_remains(snapshot):
+        return False
+    if dispatch_already_executed(snapshot, action):
+        return False
+
+    run = snapshot.run
+    if snapshot.final:
+        run.status = RunStatus.COMPLETED
+        run.final_answer = snapshot.final.answer
+        run.failure_reason = None
+    else:
+        run.status = RunStatus.FAILED
+        run.failure_reason = action.reason
+        run.final_answer = None
+    await runtime.blackboard.put_run(run)
+    return True
 
 
 def matching_pending_task(
@@ -341,6 +482,73 @@ def first_unverified_claim(snapshot: PrincipalSnapshot) -> Claim | None:
     return next(
         (claim for claim in snapshot.claims if claim.id not in verified_claim_ids),
         None,
+    )
+
+
+def has_counterargument(snapshot: PrincipalSnapshot) -> bool:
+    return any(
+        artifact.artifact_type == ArtifactType.COUNTERARGUMENT
+        for artifact in snapshot.artifacts
+    )
+
+
+def should_dispatch_aggregation(snapshot: PrincipalSnapshot) -> bool:
+    if not snapshot.tasks:
+        return False
+    if any(task.status == "created" for task in snapshot.tasks):
+        return False
+    if snapshot.final and not should_reaggregate_after_followup_snapshot(snapshot):
+        return False
+    verified_claim_ids = {
+        verification.claim_id
+        for verification in snapshot.verifications
+        if verification.verdict == "verified"
+    }
+    return bool(verified_claim_ids)
+
+
+def should_reaggregate_after_followup_snapshot(snapshot: PrincipalSnapshot) -> bool:
+    return bool(
+        snapshot.final
+        and snapshot.final.judge_score is not None
+        and snapshot.final.judge_score < FOLLOWUP_JUDGE_SCORE_THRESHOLD
+        and max_task_wave(snapshot.tasks) > snapshot.final.wave_number
+    )
+
+
+def useful_action_remains(snapshot: PrincipalSnapshot) -> bool:
+    if any(task.status == "created" for task in snapshot.tasks):
+        return True
+    if first_unverified_claim(snapshot):
+        return True
+    if should_dispatch_aggregation(snapshot):
+        return True
+    return bool(snapshot.final and snapshot.run.models.judge and snapshot.final.judge_score is None)
+
+
+def dispatch_already_executed(snapshot: PrincipalSnapshot, action: PrincipalAction) -> bool:
+    return any(actions_match(existing, action) for existing in snapshot.principal_actions)
+
+
+def task_dispatch_already_executed(
+    snapshot: PrincipalSnapshot, task: ResearchTask, action: PrincipalAction
+) -> bool:
+    branch = branch_for_task(task, snapshot.agent_specs)
+    return any(
+        existing.status == ActionStatus.EXECUTED
+        and existing.action_type == action.action_type
+        and existing.required_role == action.required_role
+        and existing.target_branch == branch
+        for existing in snapshot.principal_actions
+    )
+
+
+def actions_match(existing: PrincipalAction, action: PrincipalAction) -> bool:
+    return bool(
+        existing.status == ActionStatus.EXECUTED
+        and existing.action_type == action.action_type
+        and existing.required_role == action.required_role
+        and existing.target_branch == action.target_branch
     )
 
 
