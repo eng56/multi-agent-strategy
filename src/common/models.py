@@ -235,6 +235,12 @@ class Verification(BaseModel):
     verdict: Literal["verified", "rejected", "uncertain"]
     rationale: str
     confidence: float = Field(ge=0, le=1)
+    supported_parts: list[str] = Field(default_factory=list)
+    unsupported_parts: list[str] = Field(default_factory=list)
+    contradictions: list[str] = Field(default_factory=list)
+    required_caveats: list[str] = Field(default_factory=list)
+    source_quality_summary: str = ""
+    evidence_item_refs: list[str] = Field(default_factory=list)
     sources: list[str] = Field(default_factory=list)
 
 
