@@ -831,7 +831,7 @@ def test_execute_tool_web_search_empty_evidence_bundle_still_observes() -> None:
     assert rt.blackboard.artifacts[-1].source_refs == []
 
 
-def test_execute_tool_market_data_path_still_uses_legacy_summary() -> None:
+def test_execute_tool_market_data_path_uses_deterministic_snapshot() -> None:
     run = Run(
         question="Should I buy SAP stock?",
         models=model_policy(),
@@ -843,7 +843,7 @@ def test_execute_tool_market_data_path_still_uses_legacy_summary() -> None:
         question="Get SAP ticker market data",
         tool="market_data",
     )
-    llm = QueueLLM({"ticker": "SAP"}, {"summary": "SAP price data is available."})
+    llm = QueueLLM()
     rt = runtime(run, llm)
     rt.blackboard.tasks.append(task)
 
@@ -859,11 +859,67 @@ def test_execute_tool_market_data_path_still_uses_legacy_summary() -> None:
         )
     )
 
-    assert [call["name"] for call in llm.calls] == ["ticker-extractor", "tool-summary"]
+    assert llm.calls == []
     observation = rt.blackboard.observations[0]
-    assert observation.summary == "SAP price data is available."
+    assert "MarketSnapshot for market/equities SAP market data" in observation.summary
+    assert "selected SAP" in observation.summary
     assert observation.sources == ["https://massive.com/stocks/SAP"]
     assert rt.blackboard.artifacts[-1].source_refs == observation.sources
+    assert {"market_snapshot", "tool:market_data", "market:equities"}.issubset(
+        set(rt.blackboard.artifacts[-1].tags)
+    )
+
+
+def test_execute_tool_market_data_gap_creates_artifact_without_observation_event() -> None:
+    run = Run(
+        question="Will gold rise if the Fed cuts rates?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="Gold market data",
+        question="Get GC=F gold market data",
+        tool="market_data",
+    )
+    rt = runtime(run, QueueLLM())
+    rt.blackboard.tasks.append(task)
+
+    class EmptyMarketDataTools(FakeTools):
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def market_data(self, _run_id, ticker):
+            self.calls.append(ticker)
+            return {"ticker": ticker, "results": [], "resultsCount": 0}
+
+    tools = EmptyMarketDataTools()
+    rt.tools = tools
+
+    asyncio.run(
+        execute_tool(
+            rt,
+            EventEnvelope(
+                type=EventType.TASK_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"task_id": str(task.id)},
+            ),
+        )
+    )
+
+    assert tools.calls == ["GLD"]
+    assert rt.blackboard.observations == []
+    assert rt.blackboard.claims == []
+    assert rt.blackboard.tasks[0].status == "failed"
+    assert not any(event.type == EventType.OBSERVATION_CREATED for _topic, event in rt.published)
+    artifact = rt.blackboard.artifacts[-1]
+    assert artifact.artifact_type == ArtifactType.DATA_GAP
+    assert "market data gap" in artifact.text_or_summary.lower()
+    assert "investment thesis" in artifact.text_or_summary
+    assert {"data_gap", "market_data_gap", "tool:market_data", "market:gold"}.issubset(
+        set(artifact.tags)
+    )
 
 
 def test_execute_tool_web_search_creates_evidence_observation_with_agent_branch() -> None:
@@ -975,6 +1031,65 @@ def test_create_claim_dual_writes_claim_artifact() -> None:
     artifact = rt.blackboard.artifacts[-1]
     assert artifact.artifact_type == ArtifactType.CLAIM
     assert artifact.depends_on_artifact_ids
+
+
+def test_create_claim_skips_data_gap_observation() -> None:
+    run = Run(
+        question="Will gold rise if the Fed cuts rates?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="Gold market data",
+        question="Get GC=F gold market data",
+        tool="market_data",
+    )
+    observation_id = uuid4()
+    observation = Observation(
+        id=observation_id,
+        run_id=run.id,
+        task_id=task.id,
+        tool="market_data",
+        summary="Market data gap for gold: GLD returned zero results.",
+        artifact=ArtifactPointer(uri="gs://bucket/gap.json", size_bytes=2, sha256="0" * 64),
+        sources=[],
+    )
+    llm = QueueLLM({"statement": "Gold data is unavailable.", "confidence": 0.8})
+    rt = runtime(run, llm)
+    rt.blackboard.tasks.append(task)
+    rt.blackboard.observations.append(observation)
+    rt.blackboard.artifacts.append(
+        Artifact(
+            run_id=run.id,
+            artifact_type=ArtifactType.DATA_GAP,
+            branch="market/gold",
+            text_or_summary="Market data gap for gold.",
+            tags=["data_gap", "market_data_gap"],
+            legacy_object_type="observation",
+            legacy_object_id=observation_id,
+        )
+    )
+
+    asyncio.run(
+        create_claim(
+            rt,
+            EventEnvelope(
+                type=EventType.OBSERVATION_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"observation_id": str(observation_id)},
+            ),
+        )
+    )
+
+    assert llm.calls == []
+    assert rt.blackboard.claims == []
+    assert any(
+        action.action_type == PrincipalActionType.REQUEST_VERIFICATION
+        and "Skipped claim extraction for data-gap" in action.reason
+        for action in rt.blackboard.actions
+    )
 
 
 def test_verify_claim_dual_writes_verification_artifact() -> None:
