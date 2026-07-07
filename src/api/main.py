@@ -172,6 +172,8 @@ async def get_run_detail(run_id: str, _: None = Depends(require_api_token)) -> R
                 artifacts,
                 organization_plan,
                 dead_letters,
+                principal_actions=principal_actions,
+                observations=observations,
             ),
             principal_actions=principal_actions,
             agent_specs=agent_specs,
