@@ -4,6 +4,9 @@ A password-locked managed-services-only demo. GKE Autopilot runs the application
 hosts the private UI, and all infrastructure is consumed as managed APIs. See [ARCHITECTURE.md](ARCHITECTURE.md).
 For day-to-day runbooks, smoke tests, run inspection, and recovery steps, see
 [docs/OPERATING_DEMO.md](docs/OPERATING_DEMO.md).
+For the current control-loop and research-quality internals, see
+[docs/PRINCIPAL_POLICY.md](docs/PRINCIPAL_POLICY.md) and
+[docs/EVIDENCE_ENGINE.md](docs/EVIDENCE_ENGINE.md).
 
 ## Demo access and model policy
 
