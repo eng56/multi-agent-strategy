@@ -93,3 +93,22 @@ def test_plain_stock_ticker_can_use_stocks_endpoint() -> None:
     assert candidates[0].asset_class == AssetClass.STOCK
     assert is_valid_for_stocks_endpoint(candidates[0])
 
+
+def test_global_long_duration_bond_question_does_not_force_tlt_for_other_branches() -> None:
+    question = (
+        "If the Fed signals faster rate cuts, compare U.S. equities, the U.S. dollar, "
+        "gold, and long-duration bonds."
+    )
+
+    equities = resolve_instruments("market/equities Equity market impact", question)
+    fx = resolve_instruments("market/fx U.S. dollar impact", question)
+    gold = resolve_instruments("market/gold Gold impact", question)
+    bonds = resolve_instruments("market/bonds Long-duration bond impact", question)
+
+    assert symbols(equities)[0] == "SPY"
+    assert symbols(fx) == ["UUP"]
+    assert symbols(gold) == ["GLD"]
+    assert symbols(bonds) == ["TLT"]
+    assert "TLT" not in symbols(equities)
+    assert "TLT" not in symbols(fx)
+    assert "TLT" not in symbols(gold)

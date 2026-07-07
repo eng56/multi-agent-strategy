@@ -922,6 +922,76 @@ def test_execute_tool_market_data_gap_creates_artifact_without_observation_event
     )
 
 
+def test_market_data_tasks_use_branch_grounded_symbols_despite_global_bond_question() -> None:
+    run = Run(
+        question=(
+            "If the Fed signals faster rate cuts, compare U.S. equities, the U.S. dollar, "
+            "gold, and long-duration bonds."
+        ),
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget(market_data_max_requests=4)),
+    )
+    tasks = [
+        ResearchTask(
+            run_id=run.id,
+            title="U.S. equities market data",
+            question="Fetch market data for U.S. equities.",
+            tool="market_data",
+        ),
+        ResearchTask(
+            run_id=run.id,
+            title="U.S. dollar market data",
+            question="Fetch market data for the U.S. dollar.",
+            tool="market_data",
+        ),
+        ResearchTask(
+            run_id=run.id,
+            title="Gold market data",
+            question="Fetch market data for gold.",
+            tool="market_data",
+        ),
+        ResearchTask(
+            run_id=run.id,
+            title="Long-duration bond market data",
+            question="Fetch market data for long-duration bonds.",
+            tool="market_data",
+        ),
+    ]
+    rt = runtime(run, QueueLLM())
+    rt.blackboard.tasks.extend(tasks)
+
+    class RecordingMarketDataTools(FakeTools):
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def market_data(self, _run_id, ticker):
+            self.calls.append(ticker)
+            return {"ticker": ticker, "results": [{"c": 1}], "resultsCount": 1}
+
+    tools = RecordingMarketDataTools()
+    rt.tools = tools
+
+    for task in tasks:
+        asyncio.run(
+            execute_tool(
+                rt,
+                EventEnvelope(
+                    type=EventType.TASK_CREATED,
+                    run_id=run.id,
+                    producer="test",
+                    payload={"task_id": str(task.id)},
+                ),
+            )
+        )
+
+    assert tools.calls == ["SPY", "UUP", "GLD", "TLT"]
+    summaries = [observation.summary for observation in rt.blackboard.observations]
+    assert any("selected SPY" in summary for summary in summaries)
+    assert any("selected UUP" in summary for summary in summaries)
+    assert any("selected GLD" in summary for summary in summaries)
+    assert any("selected TLT" in summary for summary in summaries)
+
+
 def test_execute_tool_web_search_creates_evidence_observation_with_agent_branch() -> None:
     run = Run(
         question="Will gold rise if Fed cuts rates?",

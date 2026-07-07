@@ -127,3 +127,32 @@ def test_rates_return_data_gap_without_stock_endpoint_attempt() -> None:
     assert calls == []
     assert "FRED, Treasury, CME" in result.summary()
 
+
+def test_global_long_duration_question_keeps_snapshot_grounded_to_task_branch() -> None:
+    question = (
+        "If the Fed signals faster rate cuts, compare U.S. equities, the U.S. dollar, "
+        "gold, and long-duration bonds."
+    )
+
+    async def fetch(candidate):
+        return {"results": [{"c": 1}], "resultsCount": 1}
+
+    equities = asyncio.run(
+        get_market_snapshot("market/equities Equity impact", question, fetch_market_data=fetch)
+    )
+    fx = asyncio.run(get_market_snapshot("market/fx USD impact", question, fetch_market_data=fetch))
+    gold = asyncio.run(
+        get_market_snapshot("market/gold Gold impact", question, fetch_market_data=fetch)
+    )
+    bonds = asyncio.run(
+        get_market_snapshot("market/bonds Long-duration bond impact", question, fetch_market_data=fetch)
+    )
+
+    assert isinstance(equities, MarketSnapshot)
+    assert isinstance(fx, MarketSnapshot)
+    assert isinstance(gold, MarketSnapshot)
+    assert isinstance(bonds, MarketSnapshot)
+    assert equities.candidate.symbol == "SPY"
+    assert fx.candidate.symbol == "UUP"
+    assert gold.candidate.symbol == "GLD"
+    assert bonds.candidate.symbol == "TLT"

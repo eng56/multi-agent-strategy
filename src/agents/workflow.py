@@ -360,7 +360,20 @@ def semantic_branches(question: str) -> list[str]:
     branches: list[str] = []
     checks = [
         ("market/gold", ("gold", "xau")),
-        ("market/fx", ("usd", "dxy", "fx", "eur/usd", "eurusd", "usdjpy", "usd/jpy")),
+        (
+            "market/fx",
+            (
+                "usd",
+                "dxy",
+                "fx",
+                "eur/usd",
+                "eurusd",
+                "usdjpy",
+                "usd/jpy",
+                "u.s. dollar",
+                "us dollar",
+            ),
+        ),
         ("market/oil", ("oil", "crude", "wti", "brent")),
         (
             "market/equities",

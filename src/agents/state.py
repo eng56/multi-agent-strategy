@@ -25,9 +25,24 @@ from src.common.models import (
 
 BRANCH_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("market/gold", ("gold", "xau")),
-    ("market/fx", ("usd", "dxy", "fx", "eur/usd", "eurusd", "usdjpy", "usd/jpy", "currency")),
+    (
+        "market/fx",
+        (
+            "usd",
+            "dxy",
+            "fx",
+            "eur/usd",
+            "eurusd",
+            "usdjpy",
+            "usd/jpy",
+            "currency",
+            "u.s. dollar",
+            "us dollar",
+        ),
+    ),
     ("market/oil", ("oil", "crude", "wti", "brent")),
     ("market/equities", ("equities", "equity", "stocks", "stock", "spx", "s&p", "nasdaq", "sap")),
+    ("market/bonds", ("bond", "bonds", "duration", "long-duration", "long duration", "tlt")),
     (
         "macro/rates",
         ("rates", "fed", "cut", "cuts", "hike", "hikes", "yield", "yields", "treasury"),

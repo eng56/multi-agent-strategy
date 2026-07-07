@@ -6,6 +6,11 @@ codex:
     - "--full-auto"
   pass_prompt_as: "stdin"
 
+context:
+  files:
+    - ".codex-loop/context/PAPER_CONTEXT.md"
+  prepend_to_prompt: true
+
 checks:
   - ["ruff", "check", "."]
   - ["pytest"]

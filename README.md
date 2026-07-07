@@ -8,6 +8,16 @@ For the current control-loop and research-quality internals, see
 [docs/PRINCIPAL_POLICY.md](docs/PRINCIPAL_POLICY.md) and
 [docs/EVIDENCE_ENGINE.md](docs/EVIDENCE_ENGINE.md).
 
+## Paper alignment
+
+This project is inspired by the Principal / environment / observation / payoff loop from the
+AI policymaking papers. It is not a full implementation of those papers. See:
+
+- [docs/PAPER_ALIGNMENT.md](docs/PAPER_ALIGNMENT.md)
+- [docs/DEMO_TALK_TRACK.md](docs/DEMO_TALK_TRACK.md)
+
+EvidenceEngine is an engineering adaptation of the observation layer, not a named paper component.
+
 ## Demo access and model policy
 
 This first version does **not** use bring-your-own provider keys. The deployment owner stores the

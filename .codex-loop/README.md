@@ -22,6 +22,26 @@ dependency is required.
 The worktree must be clean before a real run. This prevents existing local changes
 from leaking into a new task branch.
 
+## Global project context
+
+The default config prepends `.codex-loop/context/PAPER_CONTEXT.md` to every prompt
+passed to Codex. This keeps future agents aligned with the original
+Principal / environment / observation / payoff research framing.
+
+Configure one or more context files with:
+
+```yaml
+context:
+  files:
+    - ".codex-loop/context/PAPER_CONTEXT.md"
+  prepend_to_prompt: true
+```
+
+For each real run, the loop still copies the original task prompt to `prompt.md`
+and also writes the exact context-injected prompt to `composed_prompt.md`. Dry runs
+show which context files would be prepended. A missing context file fails the run
+before Codex starts.
+
 ## Add and run prompts
 
 Add normal markdown files to `.codex-loop/prompts/`. The loop uses
@@ -83,6 +103,7 @@ Each real run writes:
 ```text
 .codex-loop/runs/<prompt-stem>-<UTC-timestamp>/
   prompt.md
+  composed_prompt.md
   codex.log
   checks.log
   git.diff

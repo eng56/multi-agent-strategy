@@ -104,7 +104,7 @@ def resolve_instruments(
     ):
         return [_stock_candidate(explicit_stock_symbol, capabilities, priority=5)]
 
-    asset_key = _classify_asset(text)
+    asset_key = _classify_branch(asset_or_branch) or _classify_asset(text)
 
     if asset_key == "gold":
         return _gold_candidates(capabilities)
@@ -387,6 +387,26 @@ def _classify_asset(text: str) -> str:
     ):
         return "rates"
     return "unknown"
+
+
+def _classify_branch(asset_or_branch: str) -> str | None:
+    """Classify explicit semantic branches before scanning the global question.
+
+    Market-data tasks receive both a task/branch string and the original user question.
+    The global question can mention several assets at once. A long-duration-bonds mention
+    in that global text must not override a task already grounded to market/equities,
+    market/fx, or market/gold.
+    """
+    normalized = _normalize(asset_or_branch)
+    if "market/equities" in normalized:
+        return "us_equities"
+    if "market/fx" in normalized:
+        return "usd"
+    if "market/gold" in normalized:
+        return "gold"
+    if "market/bonds" in normalized:
+        return "long_duration_bonds"
+    return None
 
 
 def _extract_stock_symbol(text: str) -> str | None:
