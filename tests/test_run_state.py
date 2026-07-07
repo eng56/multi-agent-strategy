@@ -412,13 +412,22 @@ def test_run_state_derives_counts_and_facts_from_artifacts() -> None:
         branch="market/gold",
         text_or_summary="Are ETF flows confirming the move?",
     )
+    data_gap = Artifact(
+        run_id=current_run.id,
+        artifact_type=ArtifactType.DATA_GAP,
+        branch="market/gold",
+        text_or_summary="Gold spot data requires a configured spot or futures provider.",
+    )
 
     state = build_run_state(
-        current_run, [], [], [], artifacts=[verified, rejected, disputed, question]
+        current_run, [], [], [], artifacts=[verified, rejected, disputed, question, data_gap]
     )
 
     assert state.known_facts == ["Gold has upside if real yields fall."]
-    assert state.open_questions == ["Are ETF flows confirming the move?"]
+    assert state.open_questions == [
+        "Are ETF flows confirming the move?",
+        "Gold spot data requires a configured spot or futures provider.",
+    ]
     assert state.verified_claim_count == 1
     assert state.rejected_claim_count == 1
     assert state.disputed_claim_count == 1

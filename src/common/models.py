@@ -82,6 +82,7 @@ class VisibilityScope(StrEnum):
 class ArtifactType(StrEnum):
     CLAIM = "claim"
     OBSERVATION = "observation"
+    DATA_GAP = "data_gap"
     FORECAST = "forecast"
     COUNTERARGUMENT = "counterargument"
     OPEN_QUESTION = "open_question"

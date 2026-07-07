@@ -132,7 +132,9 @@ def build_run_state(
     rejected_artifact_ids = {value.legacy_object_id or value.id for value in rejected_artifacts}
     disputed_artifact_ids = {value.legacy_object_id or value.id for value in disputed_artifacts}
     open_question_artifacts = [
-        value for value in artifacts if value.artifact_type == ArtifactType.OPEN_QUESTION
+        value
+        for value in artifacts
+        if value.artifact_type in {ArtifactType.OPEN_QUESTION, ArtifactType.DATA_GAP}
     ]
     coverage_by_topic = {task.title: branch_for_task(task, agent_specs) for task in tasks}
     for artifact in artifacts:

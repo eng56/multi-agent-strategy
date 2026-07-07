@@ -53,6 +53,7 @@ from src.common.models import (
     VisibilityScope,
 )
 from src.integrations.llm import LLMOutputError
+from src.markets.snapshot import MarketDataGap, MarketSnapshot, get_market_snapshot
 from src.runtime import Runtime
 
 SYSTEM = (
@@ -999,6 +1000,62 @@ async def legacy_tool_observation(
     return summary, artifact_pointer, sources
 
 
+async def persist_market_data_gap(
+    runtime: Runtime,
+    task: ResearchTask,
+    branch: str,
+    gap: MarketDataGap,
+) -> None:
+    runtime.artifacts.put_json(task.run_id, "market_data_gap", gap.to_payload())
+    await persist_artifact(
+        runtime,
+        Artifact(
+            run_id=task.run_id,
+            artifact_type=ArtifactType.DATA_GAP,
+            branch=branch,
+            text_or_summary=compact_text(gap.summary()),
+            tags=sorted(
+                set(
+                    tags_for_text(f"{task.title} {task.question}")
+                    + [
+                        "data_gap",
+                        "market_data_gap",
+                        "tool:market_data",
+                        branch.replace("/", ":"),
+                    ]
+                )
+            ),
+            visibility=VisibilityScope.PUBLIC_UNVERIFIED,
+            status=ArtifactStatus.UNVERIFIED,
+            source_refs=[],
+            legacy_object_type="market_data_gap",
+            legacy_object_id=task.id,
+        ),
+        "tool-runner",
+    )
+    task.status = "failed"
+    await runtime.blackboard.put_task(task)
+    await persist_action(
+        runtime,
+        task.run_id,
+        PrincipalActionType.REQUEST_TOOL_CALL,
+        (
+            f"Recorded market data gap for task: {task.title}. "
+            "No endpoint-valid candidate returned data, so no observation or claim "
+            "extraction event was emitted."
+        ),
+        required_role="tool_runner",
+        target_branch=branch,
+        expected_information_gain=InformationGain.LOW,
+        priority=6,
+        status=ActionStatus.EXECUTED,
+        producer="tool-runner",
+    )
+    await evaluate_principal_policy_safely(
+        runtime, task.run_id, trigger="market_data.gap"
+    )
+
+
 async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:
     tasks = await runtime.blackboard.list_models(event.run_id, "tasks", ResearchTask)
     task = next((value for value in tasks if str(value.id) == event.payload.get("task_id")), None)
@@ -1015,30 +1072,26 @@ async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:
     evidence_error: Exception | None = None
     try:
         if task.tool == "market_data":
-            stage = "ticker_extraction"
-            ticker_result = await runtime.llm.json(
-                task.run_id,
-                AgentRole.UTILITY,
-                "ticker-extractor",
-                SYSTEM,
-                f'Extract the primary ticker from: {task.question}. Return {{"ticker":"..."}}.',
+            stage = "market_snapshot_resolution"
+            run = await runtime.blackboard.get_run(event.run_id)
+
+            async def fetch_candidate(candidate):
+                return await runtime.tools.market_data(task.run_id, candidate.symbol)
+
+            snapshot_result = await get_market_snapshot(
+                f"{branch} {task.title}",
+                f"{run.question if run else ''} {task.question}",
+                fetch_market_data=fetch_candidate,
             )
-            stage = "tool_execution"
-            raw = await runtime.tools.market_data(task.run_id, ticker_result["ticker"])
-            sources = [f"https://massive.com/stocks/{ticker_result['ticker']}"]
+            if isinstance(snapshot_result, MarketDataGap):
+                await persist_market_data_gap(runtime, task, branch, snapshot_result)
+                return
+            snapshot: MarketSnapshot = snapshot_result
+            raw = snapshot.to_payload()
+            sources = snapshot.sources
             stage = "raw_artifact_persistence"
             artifact_pointer = runtime.artifacts.put_json(task.run_id, task.tool, raw)
-            stage = "tool_summary"
-            summary_result = await runtime.llm.json(
-                task.run_id,
-                AgentRole.RESEARCH,
-                "tool-summary",
-                SYSTEM,
-                f"{build_agent_instruction_block(agent_spec)}\n\n"
-                f"Summarize the most decision-relevant facts from this tool output. Return "
-                f'{{"summary":"..."}}. Output: {json.dumps(raw)[:30000]}',
-            )
-            summary = summary_result["summary"]
+            summary = snapshot.summary()
         else:
             stage = "evidence_request"
             evidence_request = build_evidence_request(runtime, task, branch)
@@ -1124,6 +1177,10 @@ async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:
                 ]
             )
         )
+    elif task.tool == "market_data":
+        artifact_tags = sorted(
+            set(artifact_tags + ["market_snapshot", "tool:market_data", branch.replace("/", ":")])
+        )
     await persist_artifact(
         runtime,
         Artifact(
@@ -1172,6 +1229,23 @@ async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:
     )
 
 
+def is_data_gap_observation(observation: Observation, artifacts: list[Artifact]) -> bool:
+    summary = observation.summary.casefold()
+    if "market data gap" in summary or "tool failure" in summary:
+        return True
+    return any(
+        artifact.legacy_object_type == "observation"
+        and artifact.legacy_object_id == observation.id
+        and (
+            artifact.artifact_type == ArtifactType.DATA_GAP
+            or "data_gap" in artifact.tags
+            or "market_data_gap" in artifact.tags
+            or "tool_failure" in artifact.tags
+        )
+        for artifact in artifacts
+    )
+
+
 async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
     observations = await runtime.blackboard.list_models(event.run_id, "observations", Observation)
     observation = next(
@@ -1185,6 +1259,28 @@ async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
     tasks = await runtime.blackboard.list_models(event.run_id, "tasks", ResearchTask)
     task = next((value for value in tasks if value.id == observation.task_id), None)
     branch = branch_for_task(task) if task else infer_semantic_branch(observation.summary)
+    observation_artifacts = await runtime.blackboard.list_models(
+        event.run_id, "artifacts", Artifact
+    )
+    if is_data_gap_observation(observation, observation_artifacts):
+        await persist_action(
+            runtime,
+            event.run_id,
+            PrincipalActionType.REQUEST_VERIFICATION,
+            (
+                "Skipped claim extraction for data-gap/tool-failure observation; "
+                "provider gaps must remain caveats or open questions, not investment claims."
+            ),
+            required_role="research_agent",
+            target_branch=branch,
+            expected_information_gain=InformationGain.LOW,
+            priority=4,
+            producer="worker-agents",
+        )
+        await evaluate_principal_policy_safely(
+            runtime, event.run_id, trigger="claim.skipped_data_gap"
+        )
+        return
     try:
         result = await runtime.llm.json(
             event.run_id,
@@ -1212,9 +1308,6 @@ async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
         await fail_task(runtime, task, branch, "claim_generation", exc, producer="worker-agents")
         return
     await runtime.blackboard.put_claim(claim)
-    observation_artifacts = await runtime.blackboard.list_models(
-        event.run_id, "artifacts", Artifact
-    )
     depends_on = [
         value.id
         for value in observation_artifacts
