@@ -1947,6 +1947,69 @@ def test_aggregator_writes_deterministic_final_after_zero_verified_followup_wave
     }
 
 
+def test_forced_evidence_limited_final_links_unverified_claim_sources_when_capacity_exhausted() -> None:
+    run = Run(
+        question="What happens if the Fed cuts faster than expected?",
+        models=model_policy(),
+        budget=Budget(
+            limit_usd=5,
+            tools=ToolBudget(tavily_max_credits=2, tavily_credits_used=2),
+        ),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="Gold reaction",
+        question="Find evidence for gold.",
+        tool="web_search",
+        status="completed",
+    )
+    claim = Claim(
+        run_id=run.id,
+        task_id=task.id,
+        statement="Gold moved on rate-cut expectations.",
+        evidence_observation_ids=[uuid4()],
+        sources=["https://example.com/gold-source"],
+        confidence=0.6,
+    )
+    claim_artifact = Artifact(
+        run_id=run.id,
+        artifact_type=ArtifactType.CLAIM,
+        branch="market/gold",
+        text_or_summary=claim.statement,
+        status=ArtifactStatus.UNVERIFIED,
+        source_refs=claim.sources,
+        legacy_object_type="claim",
+        legacy_object_id=claim.id,
+    )
+    rt = runtime(run, QueueLLM({"answer": "This should not be called."}))
+    rt.blackboard.tasks.append(task)
+    rt.blackboard.claims.append(claim)
+    rt.blackboard.artifacts.append(claim_artifact)
+
+    asyncio.run(
+        aggregate(
+            rt,
+            EventEnvelope(
+                type=EventType.CLAIM_VERIFIED,
+                run_id=run.id,
+                producer="test",
+                payload={"force": True},
+            ),
+        )
+    )
+
+    assert rt.blackboard.final is not None
+    assert rt.blackboard.final.partial is True
+    assert rt.blackboard.final.sources == ["https://example.com/gold-source"]
+    final_artifact = next(
+        artifact
+        for artifact in rt.blackboard.artifacts
+        if artifact.artifact_type == ArtifactType.FINAL_REPORT
+    )
+    assert final_artifact.source_refs == ["https://example.com/gold-source"]
+    assert final_artifact.depends_on_artifact_ids == [claim_artifact.id]
+
+
 def test_aggregation_prompt_consumes_skeptic_counterargument_artifact() -> None:
     run = Run(
         question="Should I buy SAP?",

@@ -2859,7 +2859,7 @@ def _is_caveated_evidence_artifact(
 ) -> bool:
     if artifact.artifact_type not in {ArtifactType.CLAIM, ArtifactType.VERIFICATION}:
         return False
-    if artifact.status in {ArtifactStatus.DISPUTED, ArtifactStatus.REJECTED}:
+    if artifact.status != ArtifactStatus.VERIFIED:
         return True
     return bool(
         artifact.legacy_object_type == "claim"
