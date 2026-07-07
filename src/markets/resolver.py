@@ -80,8 +80,10 @@ _NON_TICKER_WORDS = {
     "PMI",
     "QQQ",
     "SPX",
+    "S",
     "THE",
     "TLT",
+    "U",
     "USD",
     "US",
     "UST",
@@ -406,6 +408,8 @@ def _classify_branch(asset_or_branch: str) -> str | None:
         return "gold"
     if "market/bonds" in normalized:
         return "long_duration_bonds"
+    if "macro/rates" in normalized:
+        return "rates"
     return None
 
 

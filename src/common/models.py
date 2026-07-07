@@ -138,8 +138,8 @@ class ModelPolicy(BaseModel):
 
 
 class ToolBudget(BaseModel):
-    tavily_max_credits: int = Field(default=2, ge=1)
-    market_data_max_requests: int = Field(default=1, ge=1)
+    tavily_max_credits: int = Field(default=2, ge=0)
+    market_data_max_requests: int = Field(default=1, ge=0)
     tavily_credits_used: int = Field(default=0, ge=0)
     market_data_requests_used: int = Field(default=0, ge=0)
 
@@ -196,6 +196,8 @@ class ResearchTask(BaseModel):
     title: str
     question: str
     tool: Literal["web_search", "market_data"]
+    branch: str | None = None
+    agent_spec_id: UUID | None = None
     status: Literal["created", "completed", "failed", "skipped_budget"] = "created"
     wave_number: int = Field(default=0, ge=0)
     reason: str | None = None
@@ -366,6 +368,18 @@ class BudgetSummary(BaseModel):
     stop_reasons: list[str] = Field(default_factory=list)
 
 
+class CapacitySummary(BaseModel):
+    llm_remaining_usd: float = Field(ge=0)
+    tavily_remaining: int = Field(ge=0)
+    market_data_remaining: int = Field(ge=0)
+    verifier_budget_remaining: float = Field(ge=0)
+    aggregator_budget_protected_remaining: float = Field(ge=0)
+    judge_budget_protected_remaining: float = Field(ge=0)
+    search_exhausted: bool = False
+    market_data_exhausted: bool = False
+    useful_action_available: bool = False
+
+
 class RunState(BaseModel):
     run_id: UUID
     iteration: int = 0
@@ -381,6 +395,7 @@ class RunState(BaseModel):
     disputed_claim_count: int = 0
     coverage_by_topic: dict[str, str] = Field(default_factory=dict)
     budget_summary: BudgetSummary | None = None
+    capacity: CapacitySummary | None = None
     budget_remaining: float = 0
     tool_budget_remaining: dict[str, int] = Field(default_factory=dict)
     agent_count: int = 0

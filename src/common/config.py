@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     runtime_topic: str = "agent-runtime"
     market_data_base_url: str = Field(default="https://api.massive.com", validation_alias=AliasChoices("MARKET_DATA_BASE_URL", "POLYGON_BASE_URL"))
+    market_data_product_rate_limit_per_minute: int = Field(default=5, ge=1)
+    market_data_enabled_products: str = "stocks"
     tavily_base_url: str = "https://api.tavily.com"
     brave_search_api_key: str | None = None
     brave_search_base_url: str = "https://api.search.brave.com/res/v1/web/search"

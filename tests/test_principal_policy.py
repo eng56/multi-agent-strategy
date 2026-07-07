@@ -292,6 +292,37 @@ def test_zero_verified_followup_completion_requests_partial_aggregation() -> Non
     assert "evidence-limited final" in selected.reason
 
 
+def test_zero_verified_before_repair_requests_followup_when_search_capacity_remains() -> None:
+    current_run = run()
+    current_task = task(current_run, status="completed")
+    claim = Claim(
+        run_id=current_run.id,
+        task_id=current_task.id,
+        statement="A broad cross-asset claim remains uncertain.",
+        evidence_observation_ids=[uuid4()],
+        confidence=0.7,
+    )
+    verification = Verification(
+        run_id=current_run.id,
+        claim_id=claim.id,
+        verdict="uncertain",
+        rationale="Partly supported but not synthesis-safe.",
+        confidence=0.6,
+    )
+    _, policy_snapshot = snapshot(
+        current_run,
+        tasks=[current_task],
+        claims=[claim],
+        verifications=[verification],
+    )
+
+    selected = select_principal_action(policy_snapshot)
+
+    assert selected is not None
+    assert selected.action_type == PrincipalActionType.REQUEST_FOLLOWUP
+    assert "evidence repair" in selected.reason
+
+
 def test_terminal_run_produces_no_actions() -> None:
     current_run = run(RunStatus.COMPLETED)
     _, policy_snapshot = snapshot(current_run)

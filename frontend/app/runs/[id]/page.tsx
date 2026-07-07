@@ -85,6 +85,18 @@ type BudgetSummary = {
   stop_reasons: string[];
 };
 
+type CapacitySummary = {
+  llm_remaining_usd: number;
+  tavily_remaining: number;
+  market_data_remaining: number;
+  verifier_budget_remaining: number;
+  aggregator_budget_protected_remaining: number;
+  judge_budget_protected_remaining: number;
+  search_exhausted: boolean;
+  market_data_exhausted: boolean;
+  useful_action_available: boolean;
+};
+
 type RunState = {
   current_phase: string;
   active_branches: string[];
@@ -96,6 +108,7 @@ type RunState = {
   disputed_claim_count: number;
   coverage_by_topic: Record<string, string>;
   budget_summary?: BudgetSummary;
+  capacity?: CapacitySummary | null;
   budget_remaining: number;
   tool_budget_remaining: Record<string, number>;
   agent_count: number;
@@ -372,6 +385,8 @@ export default function RunPage({params}: {params: Promise<{id: string}>}) {
     ...asList(summary?.stop_reasons),
   ]);
   const verifiedArtifacts = artifacts.filter((artifact) => artifact.status === "verified").length;
+  const verifiedKnowledgeClaims = state?.verified_claim_count ?? asList(detail.final?.verified_claim_ids).length;
+  const finalArtifactStatus = finalArtifact ? label(finalArtifact.status) : "not recorded";
   const rejectedArtifacts = artifacts.filter((artifact) => artifact.status === "rejected").length;
   const disputedArtifacts = artifacts.filter((artifact) => artifact.status === "disputed").length;
   const fallbackBudgetRemaining = Math.max(0, b.limit_usd - b.spent_usd - b.reserved_usd);
@@ -407,8 +422,12 @@ export default function RunPage({params}: {params: Promise<{id: string}>}) {
             {artifacts.length} artifacts
           </p>
           <p>
-            Verified {verifiedArtifacts || state?.verified_claim_count || 0} · Rejected{" "}
-            {rejectedArtifacts || state?.rejected_claim_count || 0} · Disputed{" "}
+            Verified knowledge claims {verifiedKnowledgeClaims} · Verified artifacts {verifiedArtifacts} · Final report{" "}
+            {finalArtifactStatus}
+          </p>
+          <p>
+            Rejected{" "}
+            {state?.rejected_claim_count ?? rejectedArtifacts} · Disputed{" "}
             {disputedArtifacts || state?.disputed_claim_count || 0}
           </p>
         </section>
@@ -435,6 +454,14 @@ export default function RunPage({params}: {params: Promise<{id: string}>}) {
             </p>
           ) : (
             <Empty>Detailed role budget summary is not available yet.</Empty>
+          )}
+          {state?.capacity && (
+            <p>
+              Capacity: LLM {money(state.capacity.llm_remaining_usd)} · Verifier{" "}
+              {money(state.capacity.verifier_budget_remaining)} · Aggregator protected{" "}
+              {money(state.capacity.aggregator_budget_protected_remaining)} · Judge protected{" "}
+              {money(state.capacity.judge_budget_protected_remaining)}
+            </p>
           )}
         </section>
       </div>
@@ -576,9 +603,16 @@ export default function RunPage({params}: {params: Promise<{id: string}>}) {
             Branches: <strong>{state.active_branches.join(", ") || "none yet"}</strong>
           </p>
           <p>
-            Tools remaining: Tavily {state.tool_budget_remaining.tavily_credits ?? 0} · Market{" "}
-            {state.tool_budget_remaining.market_data_requests ?? 0}
+            Tools remaining: Tavily {state.capacity?.tavily_remaining ?? state.tool_budget_remaining.tavily_credits ?? 0} · Market{" "}
+            {state.capacity?.market_data_remaining ?? state.tool_budget_remaining.market_data_requests ?? 0}
           </p>
+          {state.capacity && (
+            <p>
+              Search exhausted: <strong>{state.capacity.search_exhausted ? "yes" : "no"}</strong> · Market data exhausted:{" "}
+              <strong>{state.capacity.market_data_exhausted ? "yes" : "no"}</strong> · Useful action available:{" "}
+              <strong>{state.capacity.useful_action_available ? "yes" : "no"}</strong>
+            </p>
+          )}
           <div className="two-col">
             <div>
               <h3>Known facts</h3>
