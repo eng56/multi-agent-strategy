@@ -345,14 +345,27 @@ export default function RunPage({params}: {params: Promise<{id: string}>}) {
     .filter((artifact) => artifact.artifact_type === "final_report")
     .sort((a, b) => (a.created_at ?? "").localeCompare(b.created_at ?? ""));
   const finalArtifact = finalArtifacts[finalArtifacts.length - 1];
-  const finalEvidenceIds = unique([
-    ...asList(detail.final?.verified_claim_ids),
+  const isPartialFinal = Boolean(detail.final?.partial);
+  const finalLinkedEvidenceIds = unique([
     ...asList(finalArtifact?.depends_on_artifact_ids),
     ...asList(finalArtifact?.supports_artifact_ids),
     ...artifacts
       .filter((artifact) => finalArtifact && asList(artifact.supports_artifact_ids).includes(finalArtifact.id))
       .map((artifact) => artifact.id),
   ]);
+  const verifiedKnowledgeIds = unique([
+    ...asList(detail.final?.verified_claim_ids),
+    ...finalLinkedEvidenceIds.filter((id) => {
+      const artifact = artifactById.get(id);
+      return !isPartialFinal && artifact?.status === "verified";
+    }),
+  ]);
+  const caveatedEvidenceIds = unique(
+    finalLinkedEvidenceIds.filter((id) => {
+      const artifact = artifactById.get(id);
+      return isPartialFinal || !artifact || artifact.status !== "verified";
+    }),
+  );
   const stopReasons = unique([
     detail.run.failure_reason,
     ...asList(state?.stop_reasons),
@@ -479,19 +492,43 @@ export default function RunPage({params}: {params: Promise<{id: string}>}) {
                 <p>{detail.final?.judge_feedback ?? state?.last_judge_feedback}</p>
               </>
             )}
-            <h3>Evidence supporting final answer</h3>
-            {finalEvidenceIds.length > 0 ? (
+            <h3>Verified knowledge claims</h3>
+            {verifiedKnowledgeIds.length > 0 ? (
               <ul>
-                {finalEvidenceIds.map((evidenceId) => (
+                {verifiedKnowledgeIds.map((evidenceId) => (
                   <li key={evidenceId}>{renderReference(evidenceId)}</li>
                 ))}
               </ul>
             ) : (
-              <Empty>No explicit final evidence links recorded yet.</Empty>
+              <Empty>No verified knowledge claims were accepted as final support.</Empty>
+            )}
+            <h3>Caveated evidence considered</h3>
+            {caveatedEvidenceIds.length > 0 ? (
+              <ul>
+                {caveatedEvidenceIds.map((evidenceId) => (
+                  <li key={evidenceId}>{renderReference(evidenceId)}</li>
+                ))}
+              </ul>
+            ) : (
+              <Empty>No caveated evidence links recorded for this final.</Empty>
+            )}
+            <h3>Verified final artifact status</h3>
+            {finalArtifact ? (
+              <p>
+                <ArtifactLink artifact={finalArtifact} /> ·{" "}
+                <span className={statusClass(finalArtifact.status)}>{label(finalArtifact.status)}</span> · visibility{" "}
+                {label(finalArtifact.visibility)}
+              </p>
+            ) : (
+              <Empty>No final report artifact recorded yet.</Empty>
             )}
             {asList(detail.final?.sources).length > 0 && (
               <>
-                <h3>Sources</h3>
+                <h3>
+                  {isPartialFinal
+                    ? "Evidence reviewed but not accepted as final support"
+                    : "Sources supporting verified final answer"}
+                </h3>
                 <ul>
                   {asList(detail.final?.sources).map((source) => (
                     <li key={source}>

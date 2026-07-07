@@ -233,6 +233,22 @@ def validate_checks(value: Any, label: str = "checks") -> list[list[str]]:
     return checks
 
 
+def validate_context_config(config: dict[str, Any]) -> None:
+    if "context" not in config or config["context"] is None:
+        return
+    context = config["context"]
+    if not isinstance(context, dict):
+        raise LoopError("Config section 'context' must be a mapping")
+    files = context.get("files", [])
+    if files is None:
+        files = []
+    if not isinstance(files, list) or not all(isinstance(item, str) for item in files):
+        raise LoopError("context.files must be a list of strings")
+    prepend = context.get("prepend_to_prompt", bool(files))
+    if not isinstance(prepend, bool):
+        raise LoopError("context.prepend_to_prompt must be a boolean")
+
+
 def load_config(loop_dir: Path, explicit_path: str | None) -> tuple[dict[str, Any], Path]:
     if explicit_path:
         path = Path(explicit_path)
@@ -259,6 +275,7 @@ def load_config(loop_dir: Path, explicit_path: str | None) -> tuple[dict[str, An
         raise LoopError("codex.args must be a list of strings")
     if codex.get("pass_prompt_as") not in {"stdin", "argument"}:
         raise LoopError("codex.pass_prompt_as must be 'stdin' or 'argument'")
+    validate_context_config(config)
     validate_checks(config.get("checks"))
     for key in (
         "commit_on_success",
@@ -277,6 +294,67 @@ def load_config(loop_dir: Path, explicit_path: str | None) -> tuple[dict[str, An
     if security.get("redact_env_values_in_logs") is not True:
         raise LoopError("security.redact_env_values_in_logs must remain true")
     return config, path
+
+
+def context_paths(config: dict[str, Any], repo_root: Path) -> list[Path]:
+    context = config.get("context")
+    if not isinstance(context, dict):
+        return []
+    if not context.get("prepend_to_prompt", bool(context.get("files"))):
+        return []
+    files = context.get("files") or []
+    if not isinstance(files, list) or not all(isinstance(item, str) for item in files):
+        raise LoopError("context.files must be a list of strings")
+    paths: list[Path] = []
+    for raw_path in files:
+        path = Path(raw_path)
+        resolved = path if path.is_absolute() else repo_root / path
+        if not resolved.is_file():
+            raise LoopError(f"Context file not found: {raw_path}")
+        paths.append(resolved)
+    return paths
+
+
+def load_context_entries(config: dict[str, Any], repo_root: Path) -> list[tuple[Path, str]]:
+    entries: list[tuple[Path, str]] = []
+    for path in context_paths(config, repo_root):
+        try:
+            entries.append((path, path.read_text(encoding="utf-8")))
+        except OSError as error:
+            raise LoopError(f"Could not read context file {repo_relative(path, repo_root)}: {error}") from error
+    return entries
+
+
+def compose_prompt_with_context(
+    prompt_body: str,
+    context_entries: list[tuple[Path, str]],
+    repo_root: Path,
+) -> str:
+    if not context_entries:
+        return prompt_body
+    lines = ["BEGIN GLOBAL PROJECT CONTEXT", ""]
+    for path, text in context_entries:
+        lines.extend(
+            [
+                f"### Context file: {repo_relative(path, repo_root)}",
+                "",
+                text.rstrip(),
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "END GLOBAL PROJECT CONTEXT",
+            "",
+            "BEGIN TASK PROMPT",
+            "",
+            prompt_body.rstrip(),
+            "",
+            "END TASK PROMPT",
+            "",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def parse_prompt(path: Path) -> tuple[dict[str, Any], str]:
@@ -1034,7 +1112,7 @@ def git_publish_enabled(config: dict[str, Any], key: str) -> bool:
 
 
 def build_codex_input(
-    prompt_body: str,
+    composed_prompt: str,
     mode: str,
     env_file: Path | None,
     repo_root: Path,
@@ -1055,9 +1133,9 @@ def build_codex_input(
             "- Do not print, rotate, or modify credentials.",
             "- Save requested run artifacts in the run artifacts directory above.",
             "",
-            "# Original prompt",
+            "# Prompt passed to Codex",
             "",
-            prompt_body,
+            composed_prompt,
         ]
     )
 
@@ -1074,6 +1152,8 @@ def run_one(
 ) -> str:
     ensure_clean_worktree(repo_root)
     metadata, prompt_body = parse_prompt(prompt_path)
+    context_entries = load_context_entries(config, repo_root)
+    composed_prompt = compose_prompt_with_context(prompt_body, context_entries, repo_root)
     checks = (
         validate_checks(metadata["checks"], "prompt checks")
         if "checks" in metadata
@@ -1095,6 +1175,8 @@ def run_one(
     run_dir.mkdir(parents=True)
     copied_prompt = run_dir / "prompt.md"
     shutil.copy2(prompt_path, copied_prompt)
+    composed_prompt_path = run_dir / "composed_prompt.md"
+    composed_prompt_path.write_text(composed_prompt, encoding="utf-8")
 
     prompt_key = repo_relative(prompt_path, repo_root)
     run_key = repo_relative(run_dir, repo_root)
@@ -1112,11 +1194,13 @@ def run_one(
         "codex_exit_code": None,
         "checks": [],
         "run_dir": run_key,
+        "composed_prompt_path": repo_relative(composed_prompt_path, repo_root),
         "diff_path": repo_relative(diff_path, repo_root),
         "logs_path": repo_relative(codex_log, repo_root),
         "mode": mode,
         "env_file": repo_relative(env_file, repo_root) if env_file is not None else None,
         "prompt_secrets_override": allow_prompt_secrets_override,
+        "context_files": [repo_relative(path, repo_root) for path, _text in context_entries],
     }
     atomic_write_json(result_path, result)
     set_status(state, state_path, prompt_key, "PENDING", run_key)
@@ -1140,7 +1224,7 @@ def run_one(
             command,
             codex_config["pass_prompt_as"],
             build_codex_input(
-                prompt_body,
+                composed_prompt,
                 mode,
                 env_file,
                 repo_root,
@@ -1328,6 +1412,7 @@ def print_dry_run(
     allow_prompt_secrets_override: bool,
 ) -> None:
     metadata, _ = parse_prompt(prompt_path)
+    context_entries = load_context_entries(config, repo_root)
     checks = (
         validate_checks(metadata["checks"], "prompt checks")
         if "checks" in metadata
@@ -1352,6 +1437,12 @@ def print_dry_run(
     print(f"Branch: {branch_name}")
     print(f"Mode: {mode}")
     print(f"Prompt secret safety override: {allow_prompt_secrets_override}")
+    print("Context files:")
+    if context_entries:
+        for path, _text in context_entries:
+            print(f"  - {repo_relative(path, repo_root)}")
+    else:
+        print("  - none")
     print(
         "Environment file: "
         + (repo_relative(env_file, repo_root) if env_file is not None else "none")

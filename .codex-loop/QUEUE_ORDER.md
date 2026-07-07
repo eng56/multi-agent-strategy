@@ -26,6 +26,7 @@ Run the prompts in this order:
 22. `021-add-exa-firecrawl-optional-fetching.md` — add optional Exa/Firecrawl retrieval hooks.
 23. `022-add-evidence-quality-eval-harness.md` — add evidence quality eval harness.
 24. `023-principal-policy-and-evidence-engine-docs.md` — document PrincipalPolicy and EvidenceEngine.
+25. `024-add-principal-evidence-repair-loop.md` — add PrincipalPolicy evidence-repair actions.
 
 Rule:
 
