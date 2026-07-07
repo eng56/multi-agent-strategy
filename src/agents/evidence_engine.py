@@ -1,6 +1,7 @@
-from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from collections.abc import Awaitable, Callable, Iterable
+from datetime import UTC, date, datetime
 from enum import StrEnum
+import re
 from typing import Any, Literal
 from urllib.parse import urlparse
 from uuid import UUID
@@ -18,9 +19,88 @@ class SearchMode(StrEnum):
 
 class SourceTier(StrEnum):
     PRIMARY = "primary"
-    AUTHORITATIVE = "authoritative"
-    SECONDARY = "secondary"
+    HIGH_QUALITY_SECONDARY = "high_quality_secondary"
+    NEWS = "news"
+    BLOG_OR_OPINION = "blog_or_opinion"
     UNKNOWN = "unknown"
+    WEAK = "weak"
+
+
+PRIMARY_SOURCE_DOMAINS = {
+    "federalreserve.gov",
+    "stlouisfed.org",
+    "fred.stlouisfed.org",
+    "bls.gov",
+    "bea.gov",
+    "treasury.gov",
+    "sec.gov",
+    "cmegroup.com",
+    "nasdaq.com",
+    "nyse.com",
+}
+
+HIGH_QUALITY_SECONDARY_DOMAINS = {
+    "imf.org",
+    "worldbank.org",
+    "bis.org",
+    "oecd.org",
+}
+
+MAJOR_NEWS_DOMAINS = {
+    "reuters.com",
+    "bloomberg.com",
+    "ft.com",
+    "wsj.com",
+    "economist.com",
+}
+
+BLOG_OR_OPINION_DOMAINS = {
+    "blogspot.com",
+    "medium.com",
+    "seekingalpha.com",
+    "substack.com",
+    "wordpress.com",
+}
+
+WEAK_SOURCE_DOMAINS = {
+    "answers.com",
+    "contentfarm.com",
+    "quora.com",
+    "reddit.com",
+    "wikipedia.org",
+}
+
+DATA_SPECIFICITY_TERMS = {
+    "balance sheet",
+    "basis point",
+    "bps",
+    "cpi",
+    "dataset",
+    "earnings",
+    "filing",
+    "gdp",
+    "inflation",
+    "index",
+    "minutes",
+    "pce",
+    "release",
+    "report",
+    "series",
+    "statement",
+    "statistic",
+    "survey",
+    "table",
+    "yield",
+}
+
+WEAK_CONTENT_PATTERNS = (
+    "affiliate",
+    "clickbait",
+    "content farm",
+    "rumor",
+    "sponsored content",
+    "top 10",
+)
 
 
 SupportType = Literal["supports", "contradicts", "contextual", "unknown"]
@@ -51,6 +131,7 @@ class EvidenceQuery(BaseModel):
 class EvidenceSource(BaseModel):
     source_url: str = Field(min_length=1)
     source_title: str = Field(min_length=1)
+    domain: str | None = None
     publisher: str | None = None
     published_at: str | None = None
     source_tier: SourceTier = SourceTier.UNKNOWN
@@ -61,6 +142,8 @@ class EvidenceItem(EvidenceSource):
     snippet: str
     support_type: SupportType = "unknown"
     confidence: float = Field(ge=0, le=1)
+    quality_score: int = Field(default=0, ge=0, le=100)
+    source_quality_reason: str = ""
     limitations: list[str] = Field(default_factory=list)
 
 
@@ -70,6 +153,14 @@ class EvidenceBundle(BaseModel):
     items: list[EvidenceItem] = Field(default_factory=list)
     raw_result_artifact_uri: str | None = None
     source_quality_summary: dict[str, Any] = Field(default_factory=dict)
+
+
+class SourceQuality(BaseModel):
+    source_tier: SourceTier
+    quality_score: int = Field(ge=0, le=100)
+    domain: str | None = None
+    publisher: str | None = None
+    reason: str
 
 
 class EvidenceEngine:
@@ -235,23 +326,37 @@ def tavily_results_to_items(
             continue
         if _domain_matches_any(source_url, request.excluded_domains):
             continue
-        source_title = _string_value(result, "title", "source_title") or source_url
-        snippet = _string_value(result, "content", "snippet", "description", "raw_content") or ""
+        raw_title = _string_value(result, "title", "source_title")
+        source_title = raw_title or source_url
+        raw_snippet = _string_value(result, "content", "snippet", "description", "raw_content")
+        snippet = raw_snippet or ""
         publisher = _string_value(result, "publisher", "source")
         published_at = _string_value(result, "published_at", "published_date", "date")
         confidence = _confidence_from_score(result.get("score"))
         limitations = _limitations(result, request.search_mode)
+        source_quality = score_source_quality(
+            source_url=source_url,
+            source_title=raw_title,
+            snippet=raw_snippet,
+            publisher=publisher,
+            published_at=published_at,
+            preferred_domains=request.preferred_domains,
+            retrieved_at=retrieved_at,
+        )
         items.append(
             EvidenceItem(
                 source_url=source_url,
                 source_title=source_title,
-                publisher=publisher,
+                domain=source_quality.domain,
+                publisher=source_quality.publisher,
                 published_at=published_at,
                 retrieved_at=retrieved_at,
-                source_tier=_source_tier(source_url, request.preferred_domains),
+                source_tier=source_quality.source_tier,
                 snippet=snippet,
                 support_type=_support_type(request.search_mode),
                 confidence=confidence,
+                quality_score=source_quality.quality_score,
+                source_quality_reason=source_quality.reason,
                 limitations=limitations,
             )
         )
@@ -264,20 +369,103 @@ def summarize_source_quality(
     tiers = {tier.value: 0 for tier in SourceTier}
     domains: set[str] = set()
     missing_published_at_count = 0
+    total_quality_score = 0
+    top_quality_score = 0
     for item in items:
         tiers[item.source_tier.value] += 1
-        domain = _domain(item.source_url)
+        total_quality_score += item.quality_score
+        top_quality_score = max(top_quality_score, item.quality_score)
+        domain = item.domain or _domain(item.source_url)
         if domain:
             domains.add(domain)
         if item.published_at is None:
             missing_published_at_count += 1
+    average_quality_score = round(total_quality_score / len(items), 1) if items else 0.0
     return {
         "query_count": len(queries),
         "item_count": len(items),
         "unique_domain_count": len(domains),
         "source_tiers": tiers,
+        "average_quality_score": average_quality_score,
+        "top_quality_score": top_quality_score,
         "missing_published_at_count": missing_published_at_count,
     }
+
+
+def score_source_quality(
+    *,
+    source_url: str | None,
+    source_title: str | None = None,
+    snippet: str | None = None,
+    publisher: str | None = None,
+    published_at: str | None = None,
+    preferred_domains: list[str] | None = None,
+    retrieved_at: datetime | None = None,
+) -> SourceQuality:
+    """Score source quality with deterministic finance/macro domain rules."""
+
+    preferred_domains = preferred_domains or []
+    domain = _domain(source_url or "")
+    inferred_publisher = publisher or _publisher_from_domain(domain)
+    tier = _classify_source_tier(domain, preferred_domains)
+    score = 40
+    reasons: list[str] = []
+
+    if tier == SourceTier.PRIMARY:
+        score += 35
+        reasons.append("primary finance/macro or preferred source domain")
+    elif tier == SourceTier.HIGH_QUALITY_SECONDARY:
+        score += 25
+        reasons.append("high-quality institutional secondary source domain")
+    elif tier == SourceTier.NEWS:
+        score += 22
+        reasons.append("major financial/news outlet domain")
+    elif tier == SourceTier.BLOG_OR_OPINION:
+        score -= 5
+        reasons.append("blog or opinion-oriented domain")
+    elif tier == SourceTier.WEAK:
+        score -= 30
+        reasons.append("weak or crowd-sourced domain")
+    else:
+        reasons.append("domain not in source-quality rules")
+
+    if domain and (domain.endswith(".gov") or _domain_matches(domain, PRIMARY_SOURCE_DOMAINS)):
+        score += 8
+        reasons.append("government, central bank, statistical, exchange, or filing source bonus")
+
+    recency_score, recency_reason = _recency_score(published_at, retrieved_at)
+    score += recency_score
+    reasons.append(recency_reason)
+
+    specificity_score, specificity_reasons = _data_specificity_score(source_title, snippet)
+    score += specificity_score
+    reasons.extend(specificity_reasons)
+
+    missing_penalties: list[str] = []
+    if not source_url or not source_url.strip():
+        score -= 25
+        missing_penalties.append("missing url")
+    if not source_title or not source_title.strip():
+        score -= 10
+        missing_penalties.append("missing title")
+    if not snippet or not snippet.strip():
+        score -= 12
+        missing_penalties.append("missing snippet")
+    if missing_penalties:
+        reasons.append("penalized for " + ", ".join(missing_penalties))
+
+    if _has_weak_content_pattern(source_title, snippet):
+        score -= 10
+        reasons.append("weak-content language penalty")
+
+    quality_score = max(0, min(100, score))
+    return SourceQuality(
+        source_tier=tier,
+        quality_score=quality_score,
+        domain=domain,
+        publisher=inferred_publisher,
+        reason="; ".join(reasons),
+    )
 
 
 def _support_type(search_mode: SearchMode) -> SupportType:
@@ -299,15 +487,119 @@ def _limitations(result: dict[str, Any], search_mode: SearchMode) -> list[str]:
     return limitations
 
 
-def _source_tier(source_url: str, preferred_domains: list[str]) -> SourceTier:
-    domain = _domain(source_url)
+def _classify_source_tier(
+    domain: str | None,
+    preferred_domains: list[str],
+) -> SourceTier:
     if not domain:
         return SourceTier.UNKNOWN
-    if _domain_matches(domain, preferred_domains):
+    if _domain_matches(domain, WEAK_SOURCE_DOMAINS):
+        return SourceTier.WEAK
+    if _domain_matches(domain, preferred_domains) or _domain_matches(
+        domain, PRIMARY_SOURCE_DOMAINS
+    ):
         return SourceTier.PRIMARY
-    if domain.endswith((".gov", ".edu", ".int")):
-        return SourceTier.AUTHORITATIVE
-    return SourceTier.SECONDARY
+    if domain.endswith(".gov"):
+        return SourceTier.PRIMARY
+    if _domain_matches(domain, HIGH_QUALITY_SECONDARY_DOMAINS):
+        return SourceTier.HIGH_QUALITY_SECONDARY
+    if _domain_matches(domain, MAJOR_NEWS_DOMAINS):
+        return SourceTier.NEWS
+    if _domain_matches(domain, BLOG_OR_OPINION_DOMAINS):
+        return SourceTier.BLOG_OR_OPINION
+    return SourceTier.UNKNOWN
+
+
+def _recency_score(
+    published_at: str | None,
+    retrieved_at: datetime | None,
+) -> tuple[int, str]:
+    published_date = _publication_date(published_at)
+    if published_date is None:
+        return -6, "publication date missing or unparseable"
+    if retrieved_at is None:
+        return 4, "publication date available"
+    age_days = max(0, (retrieved_at.date() - published_date).days)
+    if age_days <= 370:
+        return 8, "recent publication date"
+    if age_days <= 365 * 3:
+        return 5, "moderately recent publication date"
+    return 2, "older publication date available"
+
+
+def _data_specificity_score(
+    source_title: str | None,
+    snippet: str | None,
+) -> tuple[int, list[str]]:
+    text = f"{source_title or ''} {snippet or ''}".lower()
+    score = 0
+    reasons: list[str] = []
+    if re.search(r"\d", text):
+        score += 5
+        reasons.append("contains numeric or dated detail")
+    if any(term in text for term in DATA_SPECIFICITY_TERMS):
+        score += 5
+        reasons.append("contains data-specific terminology")
+    return score, reasons
+
+
+def _has_weak_content_pattern(source_title: str | None, snippet: str | None) -> bool:
+    text = f"{source_title or ''} {snippet or ''}".lower()
+    return any(pattern in text for pattern in WEAK_CONTENT_PATTERNS)
+
+
+def _publication_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    iso_candidate = cleaned.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(iso_candidate).date()
+    except ValueError:
+        pass
+    if len(cleaned) > 10:
+        try:
+            return datetime.fromisoformat(iso_candidate[:10]).date()
+        except ValueError:
+            pass
+    for date_format in ("%Y-%m-%d", "%Y/%m/%d", "%B %d, %Y", "%b %d, %Y", "%Y"):
+        try:
+            return datetime.strptime(cleaned, date_format).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _publisher_from_domain(domain: str | None) -> str | None:
+    if not domain:
+        return None
+    known_publishers = {
+        "federalreserve.gov": "Federal Reserve",
+        "fred.stlouisfed.org": "FRED",
+        "stlouisfed.org": "Federal Reserve Bank of St. Louis",
+        "bls.gov": "Bureau of Labor Statistics",
+        "bea.gov": "Bureau of Economic Analysis",
+        "treasury.gov": "U.S. Treasury",
+        "sec.gov": "U.S. Securities and Exchange Commission",
+        "cmegroup.com": "CME Group",
+        "nasdaq.com": "Nasdaq",
+        "nyse.com": "NYSE",
+        "reuters.com": "Reuters",
+        "bloomberg.com": "Bloomberg",
+        "ft.com": "Financial Times",
+        "wsj.com": "Wall Street Journal",
+        "economist.com": "The Economist",
+        "imf.org": "International Monetary Fund",
+        "worldbank.org": "World Bank",
+        "bis.org": "Bank for International Settlements",
+        "oecd.org": "OECD",
+    }
+    for source_domain, publisher in known_publishers.items():
+        if _domain_matches(domain, [source_domain]):
+            return publisher
+    return None
 
 
 def _confidence_from_score(value: Any) -> float:
@@ -354,7 +646,7 @@ def _domain_matches_any(source_url: str, domains: list[str]) -> bool:
     return _domain_matches(source_domain, domains) if source_domain else False
 
 
-def _domain_matches(source_domain: str, domains: list[str]) -> bool:
+def _domain_matches(source_domain: str, domains: Iterable[str]) -> bool:
     normalized_source = _normalize_domain(source_domain)
     if not normalized_source:
         return False
@@ -369,7 +661,7 @@ def _domain_matches(source_domain: str, domains: list[str]) -> bool:
 
 def _domain(source_url: str) -> str | None:
     parsed = urlparse(source_url if "://" in source_url else f"https://{source_url}")
-    return _normalize_domain(parsed.hostname or "")
+    return _normalize_domain(parsed.hostname or "") or None
 
 
 def _normalize_domain(value: str) -> str:

@@ -757,6 +757,7 @@ def test_execute_tool_web_search_creates_evidence_bundle_backed_observation() ->
     observation = rt.blackboard.observations[0]
     assert "2 source(s)" in observation.summary
     assert "SAP cloud backlog expanded" in observation.summary
+    assert "Source quality:" in observation.summary
     assert observation.sources == [
         "https://example.com/sap-cloud",
         "https://example.com/sap-margin",
@@ -770,9 +771,12 @@ def test_execute_tool_web_search_creates_evidence_bundle_backed_observation() ->
     bundle_payload = next(raw for _run_id, kind, raw in payloads if kind == "web_search")
     assert bundle_payload["branch"] == "market/equities"
     assert bundle_payload["source_refs"] == observation.sources
-    assert bundle_payload["evidence_bundle"]["items"][0]["source_url"] == (
-        "https://example.com/sap-cloud"
-    )
+    first_item = bundle_payload["evidence_bundle"]["items"][0]
+    assert first_item["source_url"] == "https://example.com/sap-cloud"
+    assert first_item["source_tier"] == "unknown"
+    assert first_item["domain"] == "example.com"
+    assert first_item["quality_score"] > 0
+    assert "source_quality_reason" in first_item
 
 
 def test_execute_tool_web_search_empty_evidence_bundle_still_observes() -> None:
