@@ -1092,6 +1092,129 @@ def test_create_claim_skips_data_gap_observation() -> None:
     )
 
 
+def test_create_claim_falls_back_when_claim_extractor_returns_invalid_json() -> None:
+    run = Run(
+        question="What happens to equities if the Fed cuts faster?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="Equity evidence",
+        question="Fed cuts and U.S. equities",
+        tool="web_search",
+    )
+    observation_id = uuid4()
+    observation = SimpleNamespace(
+        id=observation_id,
+        run_id=run.id,
+        task_id=task.id,
+        summary="EvidenceEngine observation for branch market/equities: 5 source(s).",
+        sources=["https://example.com/equities"],
+    )
+    llm = QueueLLM(
+        LLMOutputError('model returned non-object JSON for claim-extractor: ["statement"]')
+    )
+    rt = runtime(run, llm)
+    rt.blackboard.tasks.append(task)
+    rt.blackboard.observations.append(observation)
+    rt.blackboard.artifacts.append(
+        Artifact(
+            run_id=run.id,
+            artifact_type=ArtifactType.OBSERVATION,
+            branch="market/equities",
+            text_or_summary=observation.summary,
+            legacy_object_type="observation",
+            legacy_object_id=observation_id,
+        )
+    )
+
+    asyncio.run(
+        create_claim(
+            rt,
+            EventEnvelope(
+                type=EventType.OBSERVATION_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"observation_id": str(observation_id)},
+            ),
+        )
+    )
+
+    assert len(rt.blackboard.claims) == 1
+    assert rt.blackboard.claims[0].statement.startswith(
+        "Evidence observation for market/equities"
+    )
+    assert rt.blackboard.tasks[0].status == "created"
+    assert any(event.type == EventType.CLAIM_CREATED for _topic, event in rt.published)
+    assert any(
+        action.action_type == PrincipalActionType.REQUEST_VERIFICATION
+        and "Claim extraction model returned invalid output" in action.reason
+        for action in rt.blackboard.actions
+    )
+
+
+def test_create_claim_uses_factual_market_snapshot_claim_without_llm() -> None:
+    run = Run(
+        question="What happens to long-duration bonds if the Fed cuts faster?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="Long-duration Treasury Yield & Price Response to Fed Cuts",
+        question="TLT market data",
+        tool="market_data",
+    )
+    observation_id = uuid4()
+    observation = Observation(
+        id=observation_id,
+        run_id=run.id,
+        task_id=task.id,
+        tool="market_data",
+        summary=(
+            "MarketSnapshot for macro/rates Long-Duration Treasury Yield & Price Response "
+            "to Fed Cuts: selected TLT (etf) via massive/stocks; 251 result(s) returned. "
+            "Resolver rationale: TLT is an ETF traded through the stocks aggregate endpoint. "
+            "Latest available close/price: 85.45. Latest available volume: 17940936.644408."
+        ),
+        artifact=ArtifactPointer(uri="gs://bucket/tlt.json", size_bytes=2, sha256="0" * 64),
+        sources=["https://massive.com/stocks/TLT"],
+    )
+    llm = QueueLLM({"statement": "This should not be called.", "confidence": 0.9})
+    rt = runtime(run, llm)
+    rt.blackboard.tasks.append(task)
+    rt.blackboard.observations.append(observation)
+    rt.blackboard.artifacts.append(
+        Artifact(
+            run_id=run.id,
+            artifact_type=ArtifactType.OBSERVATION,
+            branch="macro/rates",
+            text_or_summary=observation.summary,
+            legacy_object_type="observation",
+            legacy_object_id=observation_id,
+        )
+    )
+
+    asyncio.run(
+        create_claim(
+            rt,
+            EventEnvelope(
+                type=EventType.OBSERVATION_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"observation_id": str(observation_id)},
+            ),
+        )
+    )
+
+    assert llm.calls == []
+    claim = rt.blackboard.claims[0]
+    assert "selected TLT (etf) via massive/stocks" in claim.statement
+    assert "latest available close/price was 85.45" in claim.statement
+    assert "does not establish Fed-cut causality" in claim.statement
+
+
 def test_verify_claim_dual_writes_verification_artifact() -> None:
     run = Run(
         question="Should I buy SAP stock?",
@@ -1670,6 +1793,7 @@ def test_aggregator_writes_deterministic_final_when_no_claims_verify() -> None:
         verdict="uncertain",
         rationale="The evidence supports directionality but not the absolute guarantee.",
         confidence=0.52,
+        supported_parts=["Fed rate cuts can support some rate-sensitive assets."],
         unsupported_parts=["The guaranteed bullish outcome is not supported."],
         required_caveats=["The result depends on whether cuts reflect disinflation or recession."],
         sources=["https://example.com/fed"],
@@ -1690,6 +1814,8 @@ def test_aggregator_writes_deterministic_final_when_no_claims_verify() -> None:
     assert rt.blackboard.final.verified_claim_ids == []
     assert "Evidence-limited research result" in rt.blackboard.final.answer
     assert "Verified claims available for synthesis: 0" in rt.blackboard.final.answer
+    assert "Verifier-supported facts below public-verified threshold" in rt.blackboard.final.answer
+    assert "Fed rate cuts can support some rate-sensitive assets" in rt.blackboard.final.answer
     assert "guaranteed bullish outcome is not supported" in rt.blackboard.final.answer
     assert rt.blackboard.run.status == RunStatus.COMPLETED
     assert rt.blackboard.run.final_answer == rt.blackboard.final.answer

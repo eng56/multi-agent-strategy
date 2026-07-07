@@ -1246,6 +1246,66 @@ def is_data_gap_observation(observation: Observation, artifacts: list[Artifact])
     )
 
 
+def _market_snapshot_claim_statement(observation: Observation) -> str | None:
+    summary = " ".join(observation.summary.split())
+    if not summary.startswith("MarketSnapshot for "):
+        return None
+    selected_match = re.search(
+        r"selected\s+([A-Z0-9./=-]+)\s+\(([^)]+)\)\s+via\s+([^;]+);\s+(\d+)\s+result",
+        summary,
+    )
+    if not selected_match:
+        return compact_text(
+            f"Market data snapshot returned: {summary}. This is a point-in-time market "
+            "data fact and does not establish Fed-cut causality.",
+            max_chars=700,
+        )
+    symbol, asset_class, provider_endpoint, result_count = selected_match.groups()
+    close_match = re.search(r"Latest available close/price:\s*([0-9.,-]+)", summary)
+    volume_match = re.search(r"Latest available volume:\s*([0-9.,-]+)", summary)
+    details = [
+        f"Market data snapshot selected {symbol} ({asset_class}) via {provider_endpoint}",
+        f"returned {result_count} result(s)",
+    ]
+    if close_match:
+        details.append(f"latest available close/price was {close_match.group(1)}")
+    if volume_match:
+        details.append(f"latest available volume was {volume_match.group(1)}")
+    return (
+        "; ".join(details)
+        + ". This is a point-in-time market data fact and does not establish Fed-cut causality."
+    )
+
+
+def _fallback_claim_statement(observation: Observation, branch: str) -> str:
+    market_snapshot_claim = _market_snapshot_claim_statement(observation)
+    if market_snapshot_claim:
+        return market_snapshot_claim
+    return compact_text(
+        f"Evidence observation for {branch}: {observation.summary}",
+        max_chars=700,
+    )
+
+
+def _fallback_claim(
+    event: EventEnvelope,
+    observation: Observation,
+    branch: str,
+    *,
+    confidence: float = 0.35,
+) -> Claim:
+    if _market_snapshot_claim_statement(observation):
+        confidence = max(confidence, 0.55)
+    return Claim(
+        run_id=event.run_id,
+        task_id=observation.task_id,
+        statement=_fallback_claim_statement(observation, branch),
+        confidence=confidence,
+        evidence_observation_ids=[observation.id],
+        sources=observation.sources,
+    )
+
+
 async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
     observations = await runtime.blackboard.list_models(event.run_id, "observations", Observation)
     observation = next(
@@ -1281,32 +1341,71 @@ async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
             runtime, event.run_id, trigger="claim.skipped_data_gap"
         )
         return
-    try:
-        result = await runtime.llm.json(
+    claim: Claim
+    if _market_snapshot_claim_statement(observation):
+        claim = _fallback_claim(event, observation, branch)
+        await persist_action(
+            runtime,
             event.run_id,
-            AgentRole.RESEARCH,
-            "claim-extractor",
-            SYSTEM,
-            f"Create one precise, decision-relevant claim supported only by this observation. "
-            f'Return {{"statement":"...","confidence":0.0}}. Observation: {observation.summary}',
+            PrincipalActionType.REQUEST_VERIFICATION,
+            (
+                "Created deterministic factual claim from market snapshot; skipped LLM "
+                "claim extraction to avoid causal overreach."
+            ),
+            required_role="research_agent",
+            target_branch=branch,
+            expected_information_gain=InformationGain.LOW,
+            priority=4,
+            producer="worker-agents",
         )
-        claim = Claim(
-            run_id=event.run_id,
-            task_id=observation.task_id,
-            statement=result["statement"],
-            confidence=result["confidence"],
-            evidence_observation_ids=[observation.id],
-            sources=observation.sources,
-        )
-    except BudgetExceeded:
-        raise
-    except Exception as exc:
-        if is_transient_failure(exc):
+    else:
+        try:
+            result = await runtime.llm.json(
+                event.run_id,
+                AgentRole.RESEARCH,
+                "claim-extractor",
+                SYSTEM,
+                f"Create one narrow, verifiable claim supported only by this observation. "
+                f"Do not create portfolio advice, causal claims, or claims about data "
+                f"availability unless directly stated by a source. "
+                f'Return {{"statement":"...","confidence":0.0}}. Observation: '
+                f"{observation.summary}",
+            )
+            claim = Claim(
+                run_id=event.run_id,
+                task_id=observation.task_id,
+                statement=compact_text(text_from_model_field(result["statement"]), max_chars=700),
+                confidence=score_from_model_field(result["confidence"]),
+                evidence_observation_ids=[observation.id],
+                sources=observation.sources,
+            )
+        except BudgetExceeded:
             raise
-        if not task:
-            raise
-        await fail_task(runtime, task, branch, "claim_generation", exc, producer="worker-agents")
-        return
+        except Exception as exc:
+            if is_transient_failure(exc):
+                raise
+            if not task:
+                raise
+            if not isinstance(exc, (LLMOutputError, KeyError, TypeError, ValueError)):
+                await fail_task(
+                    runtime, task, branch, "claim_generation", exc, producer="worker-agents"
+                )
+                return
+            claim = _fallback_claim(event, observation, branch)
+            await persist_action(
+                runtime,
+                event.run_id,
+                PrincipalActionType.REQUEST_VERIFICATION,
+                (
+                    "Claim extraction model returned invalid output; created deterministic "
+                    f"fallback claim instead of failing the task: {concise_exception(exc)}"
+                ),
+                required_role="research_agent",
+                target_branch=branch,
+                expected_information_gain=InformationGain.LOW,
+                priority=4,
+                producer="worker-agents",
+            )
     await runtime.blackboard.put_claim(claim)
     depends_on = [
         value.id
@@ -2547,6 +2646,9 @@ def _no_verified_evidence_answer(
     if not claim_lines:
         claim_lines.append("- No candidate claims were produced.")
 
+    partially_supported_lines = _partially_supported_fact_lines(
+        claims, verifications, artifacts
+    )
     caveats = _verification_caveats(verifications)
     if not caveats:
         caveats = [
@@ -2578,6 +2680,16 @@ def _no_verified_evidence_answer(
             "",
             *claim_lines,
             "",
+            "## Verifier-supported facts below public-verified threshold",
+            "",
+            *(
+                partially_supported_lines
+                or [
+                    "- None recorded. The verifier did not identify supported sub-claims "
+                    "that could be safely separated from disputed material."
+                ]
+            ),
+            "",
             "## Main evidence gaps",
             "",
             *[f"- {_compact_text(caveat, 240)}" for caveat in caveats[:8]],
@@ -2592,6 +2704,40 @@ def _no_verified_evidence_answer(
             "No personalized investment advice.",
         ]
     )
+
+
+def _partially_supported_fact_lines(
+    claims: list[Claim],
+    verifications: list[Verification],
+    artifacts: list[Artifact],
+) -> list[str]:
+    claims_by_id = {claim.id: claim for claim in claims}
+    branch_by_claim_id: dict[UUID, str] = {}
+    for artifact in artifacts:
+        if artifact.artifact_type == ArtifactType.CLAIM and artifact.legacy_object_id:
+            branch_by_claim_id[artifact.legacy_object_id] = artifact.branch or "unknown"
+
+    lines: list[str] = []
+    seen: set[str] = set()
+    for verification in verifications:
+        if verification.verdict == "verified":
+            continue
+        claim = claims_by_id.get(verification.claim_id)
+        branch = branch_by_claim_id.get(
+            verification.claim_id,
+            infer_semantic_branch(claim.statement if claim else verification.rationale),
+        )
+        for supported_part in verification.supported_parts[:3]:
+            compact = _compact_text(supported_part, 220)
+            key = f"{branch}:{compact}"
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(
+                f"- [{branch}] {compact} "
+                f"(not public-verified; verifier confidence {verification.confidence:.0%})"
+            )
+    return lines[:10]
 
 
 def _verification_caveats(verifications: list[Verification]) -> list[str]:
