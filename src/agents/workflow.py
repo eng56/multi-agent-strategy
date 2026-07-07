@@ -699,29 +699,42 @@ async def plan(runtime: Runtime, event: EventEnvelope) -> None:
         fallback_used = True
         task_items = deterministic_task_items(run.question, organization)
 
-    created = 0
-    for item in task_items:
-        try:
-            task = ResearchTask(run_id=run.id, **item)
-        except Exception as exc:
-            logger.warning(
-                "planner produced invalid task run_id=%s error=%s item=%s", run.id, exc, item
+    async def persist_planned_tasks(items: list[dict[str, Any]]) -> int:
+        created_count = 0
+        for item in items:
+            try:
+                task = ResearchTask(run_id=run.id, **item)
+            except Exception as exc:
+                logger.warning(
+                    "planner produced invalid task run_id=%s error=%s item=%s", run.id, exc, item
+                )
+                continue
+            await runtime.blackboard.put_task(task)
+            await persist_action(
+                runtime,
+                run.id,
+                PrincipalActionType.ASSIGN_TASK,
+                f"Assigned research task: {task.title}",
+                required_role="research_agent",
+                target_branch=branch_for_task(task),
+                expected_information_gain=InformationGain.HIGH,
+                priority=8,
+                producer="planner-agent",
             )
-            continue
-        await runtime.blackboard.put_task(task)
-        await persist_action(
-            runtime,
+            emit(runtime, EventType.TASK_CREATED, run.id, "planner-agent", task_id=str(task.id))
+            created_count += 1
+        return created_count
+
+    created = await persist_planned_tasks(task_items)
+    if created == 0 and not fallback_used:
+        fallback_used = True
+        task_items = deterministic_task_items(run.question, organization)
+        logger.warning(
+            "planner returned no valid tasks run_id=%s using deterministic fallback",
             run.id,
-            PrincipalActionType.ASSIGN_TASK,
-            f"Assigned research task: {task.title}",
-            required_role="research_agent",
-            target_branch=branch_for_task(task),
-            expected_information_gain=InformationGain.HIGH,
-            priority=8,
-            producer="planner-agent",
         )
-        emit(runtime, EventType.TASK_CREATED, run.id, "planner-agent", task_id=str(task.id))
-        created += 1
+        created = await persist_planned_tasks(task_items)
+
     if created == 0:
         await stop_run(
             runtime,

@@ -293,6 +293,37 @@ def test_planner_malformed_json_twice_uses_deterministic_fallback() -> None:
     assert rt.blackboard.run.failure_reason is None
 
 
+def test_planner_uses_deterministic_fallback_when_all_tasks_are_invalid() -> None:
+    run = Run(
+        question="Will gold and USD move if Fed cuts rates?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    rt = runtime(
+        run,
+        QueueLLM(
+            {
+                "tasks": [
+                    {"title": "Missing question and tool"},
+                    {
+                        "title": "Unsupported tool",
+                        "question": "Research this with an unsupported tool.",
+                        "tool": "calculator",
+                    },
+                ]
+            }
+        ),
+    )
+
+    asyncio.run(plan(rt, EventEnvelope(type=EventType.RUN_CREATED, run_id=run.id, producer="test")))
+
+    titles = {task.title for task in rt.blackboard.tasks}
+    assert "Gold reaction to surprise Fed cut" in titles
+    assert "US dollar reaction to surprise Fed cut" in titles
+    assert rt.blackboard.run.status == RunStatus.RUNNING
+    assert rt.blackboard.run.failure_reason is None
+
+
 def test_deterministic_fallback_uses_semantic_branches_without_irrelevant_crypto() -> None:
     run = Run(
         question="Whether gold is better than equities after a Fed cut",
