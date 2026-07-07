@@ -46,6 +46,11 @@ async def readiness_payload(runtime: Any) -> dict[str, object]:
             settings.openrouter_api_key,
         ),
         "tavily": _provider_check("tavily", settings.tavily_base_url, settings.tavily_api_key),
+        "brave_search": _optional_provider_check(
+            "brave",
+            getattr(settings, "brave_search_base_url", ""),
+            getattr(settings, "brave_search_api_key", None),
+        ),
         "market_data": _provider_check(
             settings.market_data_provider,
             settings.market_data_base_url,
@@ -142,6 +147,16 @@ def _provider_check(provider: str, base_url: object, api_key: object) -> dict[st
         "status": "ok" if configured else "fail",
         "provider": provider,
         "configured": configured,
+        "base_url": redact_url(base_url),
+        "api_key_configured": bool(str(api_key or "").strip()),
+    }
+
+
+def _optional_provider_check(provider: str, base_url: object, api_key: object) -> dict[str, object]:
+    return {
+        "status": "ok",
+        "provider": provider,
+        "configured": bool(str(base_url or "").strip()) and bool(str(api_key or "").strip()),
         "base_url": redact_url(base_url),
         "api_key_configured": bool(str(api_key or "").strip()),
     }

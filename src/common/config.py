@@ -33,6 +33,8 @@ class Settings(BaseSettings):
     runtime_topic: str = "agent-runtime"
     market_data_base_url: str = Field(default="https://api.massive.com", validation_alias=AliasChoices("MARKET_DATA_BASE_URL", "POLYGON_BASE_URL"))
     tavily_base_url: str = "https://api.tavily.com"
+    brave_search_api_key: str | None = None
+    brave_search_base_url: str = "https://api.search.brave.com/res/v1/web/search"
     environment: str = "dev"
     default_max_parallel_agents: int = Field(default=10, gt=0)
     evidence_max_sources: int = Field(default=5, ge=0, le=25)

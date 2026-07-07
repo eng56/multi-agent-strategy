@@ -3,10 +3,12 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 from src.agents.evidence_engine import (
+    BraveProvider,
     EvidenceEngine,
     EvidenceRequest,
     SearchMode,
     SourceTier,
+    TavilyProvider,
     generate_evidence_queries,
     score_source_quality,
 )
@@ -21,7 +23,10 @@ class FakeSearchClient:
     async def search(self, run_id, query):
         self.calls.append((run_id, query))
         if self.responses:
-            return self.responses.pop(0)
+            response = self.responses.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return response
         return {"results": []}
 
 
@@ -108,6 +113,141 @@ def test_tavily_response_converts_to_evidence_items() -> None:
     assert item.quality_score < 50
     assert "domain not in source-quality rules" in item.source_quality_reason
     assert bundle.source_quality_summary["missing_published_at_count"] == 1
+
+
+def test_primary_source_without_brave_uses_tavily_only() -> None:
+    fake = FakeSearchClient(
+        {
+            "results": [
+                {
+                    "url": "https://www.sec.gov/Archives/edgar/data/sap",
+                    "title": "SAP filing",
+                    "content": "Official filing evidence.",
+                    "score": 0.91,
+                }
+            ]
+        }
+    )
+
+    bundle = asyncio.run(
+        EvidenceEngine(fake.search).search(
+            request(search_mode=SearchMode.PRIMARY_SOURCE, max_sources=1)
+        )
+    )
+
+    assert len(fake.calls) == 1
+    assert bundle.items[0].provider == "tavily"
+    assert bundle.items[0].source_url == "https://www.sec.gov/Archives/edgar/data/sap"
+
+
+def test_brave_provider_selected_for_primary_source_and_contradiction() -> None:
+    for mode in (SearchMode.PRIMARY_SOURCE, SearchMode.CONTRADICTION):
+        run_id = uuid4()
+        tavily = FakeSearchClient({"results": []})
+        brave = FakeSearchClient(
+            {
+                "web": {
+                    "results": [
+                        {
+                            "url": "https://www.sec.gov/report",
+                            "title": "Official report",
+                            "description": "Primary source evidence.",
+                        }
+                    ]
+                }
+            }
+        )
+        engine = EvidenceEngine(
+            providers=[
+                TavilyProvider(tavily.search, run_id),
+                BraveProvider(brave.search, run_id),
+            ],
+            clock=lambda: RETRIEVED_AT,
+        )
+
+        bundle = asyncio.run(
+            engine.search(request(run_id=run_id, search_mode=mode, max_sources=1))
+        )
+
+        assert tavily.calls == []
+        assert len(brave.calls) == 1
+        assert bundle.items[0].provider == "brave"
+        assert bundle.items[0].source_url == "https://www.sec.gov/report"
+
+
+def test_brave_failure_falls_back_to_tavily_and_records_limitation() -> None:
+    run_id = uuid4()
+    brave = FakeSearchClient(RuntimeError("brave unavailable"))
+    tavily = FakeSearchClient(
+        {
+            "results": [
+                {
+                    "url": "https://www.reuters.com/markets/rates/fallback",
+                    "title": "Fallback result",
+                    "content": "Fallback Tavily evidence.",
+                    "score": 0.8,
+                }
+            ]
+        }
+    )
+    engine = EvidenceEngine(
+        providers=[
+            TavilyProvider(tavily.search, run_id),
+            BraveProvider(brave.search, run_id),
+        ],
+        clock=lambda: RETRIEVED_AT,
+    )
+
+    bundle = asyncio.run(
+        engine.search(
+            request(run_id=run_id, search_mode=SearchMode.PRIMARY_SOURCE, max_sources=1)
+        )
+    )
+
+    assert len(brave.calls) == 1
+    assert len(tavily.calls) == 1
+    assert bundle.items[0].provider == "tavily"
+    assert any("brave provider failed" in limitation for limitation in bundle.limitations)
+
+
+def test_site_query_uses_brave_when_configured() -> None:
+    run_id = uuid4()
+    tavily = FakeSearchClient({"results": []})
+    brave = FakeSearchClient(
+        {
+            "web": {
+                "results": [
+                    {
+                        "url": "https://www.sec.gov/Archives/report",
+                        "title": "SEC report",
+                        "description": "Site-scoped result.",
+                    }
+                ]
+            }
+        }
+    )
+    engine = EvidenceEngine(
+        providers=[
+            TavilyProvider(tavily.search, run_id),
+            BraveProvider(brave.search, run_id),
+        ],
+        clock=lambda: RETRIEVED_AT,
+    )
+
+    bundle = asyncio.run(
+        engine.search(
+            request(
+                run_id=run_id,
+                search_mode=SearchMode.EXPLORATORY,
+                preferred_domains=["sec.gov"],
+                max_sources=1,
+            )
+        )
+    )
+
+    assert tavily.calls == []
+    assert len(brave.calls) == 1
+    assert bundle.items[0].provider == "brave"
 
 
 def test_source_quality_classifies_primary_finance_macro_domains() -> None:
@@ -245,6 +385,7 @@ def test_research_tools_evidence_search_uses_existing_web_search_path() -> None:
     class StubResearchTools(ResearchTools):
         def __init__(self) -> None:
             self.calls: list[tuple[object, str]] = []
+            self.brave_search_api_key = ""
 
         async def web_search(self, run_id, query):
             self.calls.append((run_id, query))

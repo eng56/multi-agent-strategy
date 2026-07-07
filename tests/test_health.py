@@ -79,6 +79,8 @@ def test_readiness_redacts_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
             openrouter_api_key="open-secret",
             tavily_base_url="https://tavily.example.com/search?token=tavily-secret",
             tavily_api_key="tavily-secret",
+            brave_search_base_url="https://brave.example.com/search?token=brave-secret",
+            brave_search_api_key="brave-secret",
             market_data_provider="massive",
             market_data_base_url="https://market.example.com?password=market-secret",
             market_data_api_key="market-secret",
@@ -96,6 +98,7 @@ def test_readiness_redacts_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
     assert events.published
     assert "open-secret" not in serialized
     assert "tavily-secret" not in serialized
+    assert "brave-secret" not in serialized
     assert "market-secret" not in serialized
     assert "user:" not in serialized
     assert payload["checks"]["llm_provider"]["base_url"] == (
@@ -103,6 +106,10 @@ def test_readiness_redacts_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     assert payload["checks"]["tavily"]["base_url"] == (
         "https://tavily.example.com/search?token=<redacted>"
+    )
+    assert payload["checks"]["brave_search"]["configured"] is True
+    assert payload["checks"]["brave_search"]["base_url"] == (
+        "https://brave.example.com/search?token=<redacted>"
     )
 
 
