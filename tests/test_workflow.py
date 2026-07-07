@@ -1528,6 +1528,63 @@ def test_aggregator_prompt_includes_synthesis_role_and_verified_evidence_require
     assert rt.blackboard.final.answer == "Gold has the cleaner verified setup."
 
 
+def test_aggregator_writes_deterministic_final_when_no_claims_verify() -> None:
+    run = Run(
+        question="What happens if the Fed cuts faster than expected?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="Rates and cross-asset impact",
+        question="Find evidence for faster Fed cuts.",
+        tool="web_search",
+        status="completed",
+    )
+    claim = Claim(
+        run_id=run.id,
+        task_id=task.id,
+        statement="A faster Fed cutting path guarantees a bullish cross-asset outcome.",
+        evidence_observation_ids=[uuid4()],
+        sources=["https://example.com/fed"],
+        confidence=0.8,
+    )
+    verification = Verification(
+        run_id=run.id,
+        claim_id=claim.id,
+        verdict="uncertain",
+        rationale="The evidence supports directionality but not the absolute guarantee.",
+        confidence=0.52,
+        unsupported_parts=["The guaranteed bullish outcome is not supported."],
+        required_caveats=["The result depends on whether cuts reflect disinflation or recession."],
+        sources=["https://example.com/fed"],
+    )
+    llm = QueueLLM({"answer": "This should not be called."})
+    rt = runtime(run, llm)
+    rt.blackboard.tasks.append(task)
+    rt.blackboard.claims.append(claim)
+    rt.blackboard.verifications.append(verification)
+
+    asyncio.run(
+        aggregate(rt, EventEnvelope(type=EventType.CLAIM_VERIFIED, run_id=run.id, producer="test"))
+    )
+
+    assert llm.calls == []
+    assert rt.blackboard.final is not None
+    assert rt.blackboard.final.partial is True
+    assert rt.blackboard.final.verified_claim_ids == []
+    assert "Evidence-limited research result" in rt.blackboard.final.answer
+    assert "Verified claims available for synthesis: 0" in rt.blackboard.final.answer
+    assert "guaranteed bullish outcome is not supported" in rt.blackboard.final.answer
+    assert rt.blackboard.run.status == RunStatus.COMPLETED
+    assert rt.blackboard.run.final_answer == rt.blackboard.final.answer
+    assert any(
+        action.action_type == PrincipalActionType.STOP_RUN
+        and "no synthesis-safe verified claims" in action.reason
+        for action in rt.blackboard.actions
+    )
+
+
 def test_aggregation_prompt_consumes_skeptic_counterargument_artifact() -> None:
     run = Run(
         question="Should I buy SAP?",
