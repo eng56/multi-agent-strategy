@@ -2,6 +2,7 @@ from uuid import uuid4
 
 from src.agents.state import build_run_state
 from src.common.models import (
+    AgentRole,
     AgentSpec,
     Artifact,
     ArtifactStatus,
@@ -74,6 +75,51 @@ def test_run_state_summarizes_pending_research_and_next_tool_action() -> None:
     assert state.budget_remaining == 3.25
     assert state.tool_budget_remaining == {"tavily_credits": 2, "market_data_requests": 1}
     assert state.next_action_candidates[0].action_type == PrincipalActionType.REQUEST_TOOL_CALL
+
+
+def test_run_state_exposes_budget_summary() -> None:
+    current_run = run()
+    current_run.budget.tools = ToolBudget(
+        tavily_max_credits=5,
+        market_data_max_requests=3,
+        tavily_credits_used=2,
+        market_data_requests_used=1,
+    )
+    current_run.budget.role_spent_usd = {
+        AgentRole.PLANNER: 0.11,
+        AgentRole.RESEARCH: 0.22,
+        AgentRole.VERIFIER: 0.33,
+        AgentRole.AGGREGATOR: 0.04,
+        AgentRole.JUDGE: 0.01,
+    }
+    current_run.budget.role_reserved_usd = {
+        AgentRole.RESEARCH: 0.05,
+        AgentRole.AGGREGATOR: 0.02,
+    }
+
+    state = build_run_state(current_run, [], [], [])
+
+    assert state.budget_summary is not None
+    assert state.budget_summary.total_limit_usd == 4
+    assert state.budget_summary.spent_usd == 0.5
+    assert state.budget_summary.reserved_usd == 0.25
+    assert state.budget_summary.remaining_usd == 3.25
+    assert state.budget_summary.role_spent_usd["planner"] == 0.11
+    assert state.budget_summary.role_spent_usd["research"] == 0.22
+    assert state.budget_summary.role_spent_usd["verifier"] == 0.33
+    assert state.budget_summary.role_spent_usd["aggregator"] == 0.04
+    assert state.budget_summary.role_spent_usd["judge"] == 0.01
+    assert state.budget_summary.role_reserved_usd["research"] == 0.05
+    assert state.budget_summary.role_reserved_usd["aggregator"] == 0.02
+    assert state.budget_summary.role_protected_usd == {"aggregator": 0.1, "judge": 0.1}
+    assert round(state.budget_summary.protected_remaining_usd, 2) == 0.13
+    assert state.budget_summary.tool_usage["tavily_credits"].used == 2
+    assert state.budget_summary.tool_usage["tavily_credits"].max == 5
+    assert state.budget_summary.tool_usage["tavily_credits"].remaining == 3
+    assert state.budget_summary.tool_usage["market_data_requests"].used == 1
+    assert state.budget_summary.tool_usage["market_data_requests"].max == 3
+    assert state.budget_summary.tool_usage["market_data_requests"].remaining == 2
+    assert state.tool_budget_remaining == {"tavily_credits": 3, "market_data_requests": 2}
 
 
 def test_run_state_promotes_verified_claims_and_requests_aggregation() -> None:
@@ -166,6 +212,42 @@ def test_completed_run_state_exposes_stop_reason_and_judge_payoff() -> None:
     assert state.last_judge_score == 0.82
     assert state.last_judge_feedback == "Well evidenced."
     assert state.stop_reasons == ["run completed"]
+    assert state.next_action_candidates == []
+
+
+def test_budget_exhausted_run_state_exposes_stop_reasons() -> None:
+    current_run = run(RunStatus.PARTIAL_BUDGET_EXHAUSTED)
+    current_run.failure_reason = (
+        "insufficient shared budget for research: requested=$0.0500, "
+        "available=$0.0100, protected=$0.0500"
+    )
+    task = ResearchTask(
+        run_id=current_run.id,
+        title="SAP catalysts",
+        question="Find SAP catalysts",
+        tool="web_search",
+        status="skipped_budget",
+        reason="Budget blocked tool_execution for task: SAP catalysts (Tavily credit budget reached)",
+    )
+    final = FinalReport(
+        run_id=current_run.id,
+        answer="Partial answer",
+        verified_claim_ids=[],
+        sources=[],
+        partial=True,
+    )
+
+    state = build_run_state(current_run, [task], [], [], final)
+
+    assert state.current_phase == RunPhase.COMPLETED
+    assert state.budget_summary is not None
+    assert state.budget_summary.stop_reasons == [
+        current_run.failure_reason,
+        "1 task(s) skipped due to budget: Budget blocked tool_execution for task: "
+        "SAP catalysts (Tavily credit budget reached)",
+    ]
+    assert current_run.failure_reason in state.stop_reasons
+    assert any("skipped due to budget" in reason for reason in state.stop_reasons)
     assert state.next_action_candidates == []
 
 

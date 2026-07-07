@@ -30,8 +30,10 @@ class Blackboard:
 def test_protected_finalization_budget_blocks_research() -> None:
     run = Run(question="q", models=policy(), budget=Budget(limit_usd=10, spent_usd=7, tools=ToolBudget()))
     budget = PersistentBudget(Blackboard(run))  # type: ignore[arg-type]
-    with pytest.raises(BudgetExceeded, match="shared budget"):
+    with pytest.raises(BudgetExceeded, match="shared budget") as raised:
         asyncio.run(budget.reserve_llm(run.id, AgentRole.RESEARCH, 1.01))
+    assert raised.value.role == AgentRole.RESEARCH
+    assert raised.value.protected == 2
 
 
 def test_aggregator_and_judge_can_use_their_protected_caps() -> None:
@@ -40,3 +42,23 @@ def test_aggregator_and_judge_can_use_their_protected_caps() -> None:
     asyncio.run(budget.reserve_llm(run.id, AgentRole.AGGREGATOR, 1))
     asyncio.run(budget.reserve_llm(run.id, AgentRole.JUDGE, 1))
     assert run.budget.reserved_usd == 2
+
+
+def test_tool_budget_exhaustion_reports_provider_usage() -> None:
+    run = Run(
+        question="q",
+        models=policy(),
+        budget=Budget(
+            limit_usd=10,
+            tools=ToolBudget(tavily_max_credits=1, tavily_credits_used=1),
+        ),
+    )
+    budget = PersistentBudget(Blackboard(run))  # type: ignore[arg-type]
+
+    with pytest.raises(BudgetExceeded, match="Tavily credit budget reached") as raised:
+        asyncio.run(budget.consume_tool(run.id, "tavily"))
+
+    assert raised.value.budget_type == "tool"
+    assert raised.value.provider == "tavily"
+    assert raised.value.used == 1
+    assert raised.value.limit == 1

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import re
 from src.common.models import (
+    AgentRole,
     AgentSpec,
     Artifact,
     ArtifactStatus,
     ArtifactType,
+    BudgetSummary,
     Claim,
     DeadLetterRecord,
     FinalReport,
@@ -18,6 +20,7 @@ from src.common.models import (
     RunPhase,
     RunState,
     RunStatus,
+    ToolUsageSummary,
     Verification,
 )
 
@@ -38,6 +41,13 @@ BRANCH_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 FOLLOWUP_JUDGE_SCORE_THRESHOLD = 0.75
 MAX_FOLLOWUP_WAVES = 1
+BUDGET_SUMMARY_ROLES: tuple[AgentRole, ...] = (
+    AgentRole.PLANNER,
+    AgentRole.RESEARCH,
+    AgentRole.VERIFIER,
+    AgentRole.AGGREGATOR,
+    AgentRole.JUDGE,
+)
 
 
 def text_matches_any(text: str, needles: tuple[str, ...]) -> bool:
@@ -127,10 +137,14 @@ def build_run_state(
             coverage_by_topic.setdefault(artifact.branch, artifact.status.value)
     phase = _phase(run, tasks, claims, verifications, final)
     active_branches = _active_branches(tasks, agent_specs, artifacts, organization_plan)
-    budget_remaining = max(0, run.budget.limit_usd - run.budget.spent_usd - run.budget.reserved_usd)
+    budget_summary = build_budget_summary(run, tasks, final)
+    budget_remaining = budget_summary.remaining_usd
     stop_reasons = []
     if run.failure_reason:
         stop_reasons.append(run.failure_reason)
+    for reason in budget_summary.stop_reasons:
+        if reason not in stop_reasons:
+            stop_reasons.append(reason)
     if final and final.partial:
         stop_reasons.append("partial final report produced before full synthesis")
     if run.status == RunStatus.COMPLETED:
@@ -154,16 +168,10 @@ def build_run_state(
         rejected_claim_count=len(rejected_ids | rejected_artifact_ids),
         disputed_claim_count=len(uncertain_ids | disputed_artifact_ids),
         coverage_by_topic=coverage_by_topic,
+        budget_summary=budget_summary,
         budget_remaining=budget_remaining,
         tool_budget_remaining={
-            "tavily_credits": max(
-                0, run.budget.tools.tavily_max_credits - run.budget.tools.tavily_credits_used
-            ),
-            "market_data_requests": max(
-                0,
-                run.budget.tools.market_data_max_requests
-                - run.budget.tools.market_data_requests_used,
-            ),
+            key: value.remaining for key, value in budget_summary.tool_usage.items()
         },
         agent_count=len(agent_specs),
         last_judge_score=final.judge_score if final else None,
@@ -175,6 +183,94 @@ def build_run_state(
         state, run, tasks, claims, verifications, final, artifacts
     )
     return state
+
+
+def build_budget_summary(
+    run: Run,
+    tasks: list[ResearchTask],
+    final: FinalReport | None = None,
+) -> BudgetSummary:
+    """Build a compact budget view for API serialization and Principal control state."""
+    budget = run.budget
+    role_spent = _role_amounts(budget.role_spent_usd)
+    role_reserved = _role_amounts(budget.role_reserved_usd)
+    role_protected = _role_protected_amounts(run)
+    protected_remaining = 0.0
+    for role_name, protected in role_protected.items():
+        protected_remaining += max(
+            0,
+            protected - role_spent.get(role_name, 0) - role_reserved.get(role_name, 0),
+        )
+    tool_usage = {
+        "tavily_credits": ToolUsageSummary(
+            used=budget.tools.tavily_credits_used,
+            max=budget.tools.tavily_max_credits,
+            remaining=max(0, budget.tools.tavily_max_credits - budget.tools.tavily_credits_used),
+        ),
+        "market_data_requests": ToolUsageSummary(
+            used=budget.tools.market_data_requests_used,
+            max=budget.tools.market_data_max_requests,
+            remaining=max(
+                0,
+                budget.tools.market_data_max_requests - budget.tools.market_data_requests_used,
+            ),
+        ),
+    }
+    return BudgetSummary(
+        total_limit_usd=budget.limit_usd,
+        spent_usd=budget.spent_usd,
+        reserved_usd=budget.reserved_usd,
+        remaining_usd=max(0, budget.limit_usd - budget.spent_usd - budget.reserved_usd),
+        role_spent_usd=role_spent,
+        role_reserved_usd=role_reserved,
+        role_protected_usd=role_protected,
+        protected_usd=sum(role_protected.values()),
+        protected_remaining_usd=protected_remaining,
+        tool_usage=tool_usage,
+        stop_reasons=_budget_stop_reasons(run, tasks, final),
+    )
+
+
+def _role_amounts(values: dict[AgentRole, float]) -> dict[str, float]:
+    amounts = {role.value: float(values.get(role, values.get(role.value, 0))) for role in BUDGET_SUMMARY_ROLES}
+    for key, value in values.items():
+        role_name = key.value if isinstance(key, AgentRole) else str(key)
+        amounts.setdefault(role_name, float(value))
+    return amounts
+
+
+def _role_protected_amounts(run: Run) -> dict[str, float]:
+    amounts: dict[str, float] = {}
+    for role in BUDGET_SUMMARY_ROLES:
+        policy = getattr(run.models, role.value, None)
+        if policy and policy.protected_usd > 0:
+            amounts[role.value] = policy.protected_usd
+    return amounts
+
+
+def _budget_stop_reasons(
+    run: Run,
+    tasks: list[ResearchTask],
+    final: FinalReport | None,
+) -> list[str]:
+    reasons: list[str] = []
+    if run.status == RunStatus.PARTIAL_BUDGET_EXHAUSTED:
+        if run.failure_reason:
+            reasons.append(run.failure_reason)
+        elif final and final.partial:
+            reasons.append("budget exhausted before full synthesis")
+        else:
+            reasons.append("budget exhausted")
+    skipped_tasks = [task for task in tasks if task.status == "skipped_budget"]
+    if skipped_tasks:
+        details = []
+        for task in skipped_tasks[:3]:
+            details.append(task.reason or f"Budget skipped task: {task.title}")
+        suffix = "; ".join(details)
+        if len(skipped_tasks) > 3:
+            suffix += f"; {len(skipped_tasks) - 3} more"
+        reasons.append(f"{len(skipped_tasks)} task(s) skipped due to budget: {suffix}")
+    return reasons
 
 
 def max_task_wave(tasks: list[ResearchTask]) -> int:

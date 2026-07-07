@@ -57,6 +57,26 @@ type OrganizationPlan = {
   stop_conditions: string[];
 };
 
+type ToolUsageSummary = {
+  used: number;
+  max: number;
+  remaining: number;
+};
+
+type BudgetSummary = {
+  total_limit_usd: number;
+  spent_usd: number;
+  reserved_usd: number;
+  remaining_usd: number;
+  role_spent_usd: Record<string, number>;
+  role_reserved_usd: Record<string, number>;
+  role_protected_usd: Record<string, number>;
+  protected_usd: number;
+  protected_remaining_usd: number;
+  tool_usage: Record<string, ToolUsageSummary>;
+  stop_reasons: string[];
+};
+
 type RunState = {
   current_phase: string;
   active_branches: string[];
@@ -67,6 +87,7 @@ type RunState = {
   rejected_claim_count: number;
   disputed_claim_count: number;
   coverage_by_topic: Record<string, string>;
+  budget_summary?: BudgetSummary;
   budget_remaining: number;
   tool_budget_remaining: Record<string, number>;
   agent_count: number;
@@ -120,6 +141,10 @@ function ActionList({ actions, empty }: { actions: PrincipalAction[]; empty: str
   ));
 }
 
+function money(value: number | undefined) {
+  return `$${(value ?? 0).toFixed(2)}`;
+}
+
 export default function RunPage({ params }: { params: Promise<{ id: string }> }) {
   const [id, setId] = useState("");
   const [detail, setDetail] = useState<Detail>();
@@ -140,8 +165,10 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
 
   const b = detail.run.budget;
   const state = detail.run_state;
+  const summary = state?.budget_summary;
   const candidates = state?.next_action_candidates ?? [];
   const deadLetters = detail.dead_letters ?? [];
+  const roleNames = ["planner", "research", "verifier", "aggregator", "judge"];
 
   return (
     <main className="shell">
@@ -151,12 +178,33 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
       <div className="grid">
         <section className="card">
           <h2>Budget</h2>
-          <p>${b.spent_usd.toFixed(2)} / ${b.limit_usd.toFixed(2)}</p>
+          <p>{money(summary?.spent_usd ?? b.spent_usd)} / {money(summary?.total_limit_usd ?? b.limit_usd)}</p>
           <p>
-            ${b.reserved_usd.toFixed(2)} reserved · Tavily {b.tools.tavily_credits_used}/
-            {b.tools.tavily_max_credits} · Market {b.tools.market_data_requests_used}/
-            {b.tools.market_data_max_requests}
+            {money(summary?.reserved_usd ?? b.reserved_usd)} reserved ·{" "}
+            {money(summary?.remaining_usd ?? Math.max(0, b.limit_usd - b.spent_usd - b.reserved_usd))} remaining
           </p>
+          <p>
+            Tavily {summary?.tool_usage.tavily_credits?.used ?? b.tools.tavily_credits_used}/
+            {summary?.tool_usage.tavily_credits?.max ?? b.tools.tavily_max_credits} · Market data{" "}
+            {summary?.tool_usage.market_data_requests?.used ?? b.tools.market_data_requests_used}/
+            {summary?.tool_usage.market_data_requests?.max ?? b.tools.market_data_max_requests}
+          </p>
+          {summary && (
+            <>
+              <p>
+                Protected {money(summary.protected_usd)} · {money(summary.protected_remaining_usd)} remaining protected
+              </p>
+              <ul>
+                {roleNames.map((role) => (
+                  <li key={role}>
+                    {role}: spent {money(summary.role_spent_usd[role])} · reserved{" "}
+                    {money(summary.role_reserved_usd[role])}
+                    {summary.role_protected_usd[role] ? ` · protected ${money(summary.role_protected_usd[role])}` : ""}
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
         </section>
         <section className="card">
           <h2>Progress</h2>
@@ -171,6 +219,9 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
           <p>Verified {state.verified_claim_count} · Rejected {state.rejected_claim_count} · Disputed {state.disputed_claim_count} · Dead letters {state.dead_letter_count}</p>
           <p>Branches: {state.active_branches.join(", ") || "none yet"}</p>
           <p>Tools remaining: Tavily {state.tool_budget_remaining.tavily_credits ?? 0} · Market {state.tool_budget_remaining.market_data_requests ?? 0}</p>
+          {(state.budget_summary?.stop_reasons ?? []).length > 0 && (
+            <p>Budget stops: {(state.budget_summary?.stop_reasons ?? []).join(" · ")}</p>
+          )}
           <h3>Open questions</h3>
           <ul>{state.open_questions.map((q) => <li key={q}>{q}</li>)}</ul>
           {(state.failed_tasks ?? []).length > 0 && (
