@@ -16,6 +16,12 @@ from src.agents.state import (
     text_matches_any,
     title_from_branch,
 )
+from src.agents.evidence_engine import (
+    EvidenceBundle,
+    EvidenceEngine,
+    EvidenceRequest,
+    SearchMode,
+)
 from src.agents.knowledge_router import select_context_for_agent
 from src.agents.principal_runtime import evaluate_principal_policy
 from src.agents.prompts import build_agent_instruction_block
@@ -825,6 +831,158 @@ async def request_followup_wave(
     return created
 
 
+DEFAULT_EVIDENCE_MAX_SOURCES = 5
+MAX_EVIDENCE_SNIPPETS = 3
+
+
+class EvidenceProviderError(RuntimeError):
+    def __init__(self, original: Exception) -> None:
+        super().__init__(str(original))
+        self.original = original
+
+
+def evidence_max_sources(runtime: Runtime) -> int:
+    settings = getattr(runtime, "settings", None)
+    for name in ("evidence_max_sources", "max_evidence_sources"):
+        value = getattr(settings, name, None)
+        if isinstance(value, bool) or value is None:
+            continue
+        try:
+            return max(0, min(25, int(value)))
+        except (TypeError, ValueError):
+            continue
+    return DEFAULT_EVIDENCE_MAX_SOURCES
+
+
+def build_evidence_request(
+    runtime: Runtime, task: ResearchTask, branch: str
+) -> EvidenceRequest:
+    return EvidenceRequest(
+        run_id=task.run_id,
+        task_id=task.id,
+        branch=branch,
+        objective=task.question,
+        search_mode=SearchMode.EXPLORATORY,
+        max_sources=evidence_max_sources(runtime),
+    )
+
+
+async def search_evidence(runtime: Runtime, request: EvidenceRequest) -> EvidenceBundle:
+    async def search_client(run_id: UUID, query: str) -> dict[str, Any]:
+        try:
+            return await runtime.tools.web_search(run_id, query)
+        except BudgetExceeded:
+            raise
+        except Exception as exc:
+            raise EvidenceProviderError(exc) from exc
+
+    engine = EvidenceEngine(
+        search_client,
+        artifact_store=getattr(runtime, "artifacts", None),
+    )
+    return await engine.search(request)
+
+
+def evidence_source_refs(bundle: EvidenceBundle) -> list[str]:
+    source_refs: list[str] = []
+    seen: set[str] = set()
+    for item in bundle.items:
+        if item.source_url in seen:
+            continue
+        seen.add(item.source_url)
+        source_refs.append(item.source_url)
+    return source_refs
+
+
+def compact_text(value: str, max_chars: int = 1200) -> str:
+    cleaned = " ".join(value.split())
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[:max_chars].rsplit(" ", 1)[0] + "..."
+
+
+def evidence_summary(bundle: EvidenceBundle, branch: str) -> str:
+    source_count = len(bundle.items)
+    strongest_items = sorted(
+        bundle.items,
+        key=lambda item: item.confidence,
+        reverse=True,
+    )[:MAX_EVIDENCE_SNIPPETS]
+    snippets = [
+        compact_text(
+            f"{item.source_title}: {item.snippet or 'provider returned no snippet'}",
+            max_chars=220,
+        )
+        for item in strongest_items
+    ]
+    strongest = "; ".join(snippets) if snippets else "none; provider returned no sources"
+
+    limitations: list[str] = []
+    for item in strongest_items:
+        for limitation in item.limitations:
+            if limitation not in limitations:
+                limitations.append(limitation)
+    quality = bundle.source_quality_summary
+    if source_count == 0:
+        limitations.append(
+            f"No provider results were returned for {quality.get('query_count', 0)} "
+            "generated evidence query or queries."
+        )
+    missing_dates = quality.get("missing_published_at_count", 0)
+    if missing_dates:
+        limitations.append(f"{missing_dates} source(s) did not include a publication date.")
+    if bundle.raw_result_artifact_uri is None:
+        limitations.append("No raw provider artifact URI was returned by EvidenceEngine.")
+
+    limitation_text = "; ".join(limitations) if limitations else "no material limitations flagged"
+    return (
+        f"EvidenceEngine observation for branch {branch}: {source_count} source(s). "
+        f"Strongest evidence snippets: {strongest}. "
+        f"Source limitations: {limitation_text}. "
+        f"Branch: {branch}."
+    )
+
+
+def evidence_artifact_payload(
+    bundle: EvidenceBundle, summary: str, source_refs: list[str]
+) -> dict[str, Any]:
+    return {
+        "summary": compact_text(summary),
+        "branch": bundle.request.branch,
+        "source_refs": source_refs,
+        "raw_result_artifact_uri": bundle.raw_result_artifact_uri,
+        "evidence_bundle": bundle.model_dump(mode="json"),
+    }
+
+
+async def legacy_tool_observation(
+    runtime: Runtime,
+    task: ResearchTask,
+    agent_spec: AgentSpec,
+    raw: dict[str, Any],
+    *,
+    evidence_error: Exception | None = None,
+) -> tuple[str, Any, list[str]]:
+    sources = [item["url"] for item in raw.get("results", []) if item.get("url")]
+    artifact_pointer = runtime.artifacts.put_json(task.run_id, task.tool, raw)
+    summary_result = await runtime.llm.json(
+        task.run_id,
+        AgentRole.RESEARCH,
+        "tool-summary",
+        SYSTEM,
+        f"{build_agent_instruction_block(agent_spec)}\n\n"
+        f"Summarize the most decision-relevant facts from this tool output. Return "
+        f'{{"summary":"..."}}. Output: {json.dumps(raw)[:30000]}',
+    )
+    summary = summary_result["summary"]
+    if evidence_error is not None:
+        summary = (
+            f"EvidenceEngine failed ({concise_exception(evidence_error)}). "
+            f"Legacy web_search fallback observation: {summary}"
+        )
+    return summary, artifact_pointer, sources
+
+
 async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:
     tasks = await runtime.blackboard.list_models(event.run_id, "tasks", ResearchTask)
     task = next((value for value in tasks if str(value.id) == event.payload.get("task_id")), None)
@@ -838,6 +996,7 @@ async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:
     branch = branch_for_task(task, agent_specs)
     agent_spec = agent_spec_for_branch(event.run_id, branch, agent_specs, task=task)
     stage = "tool_execution"
+    evidence_error: Exception | None = None
     try:
         if task.tool == "market_data":
             stage = "ticker_extraction"
@@ -851,21 +1010,73 @@ async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:
             stage = "tool_execution"
             raw = await runtime.tools.market_data(task.run_id, ticker_result["ticker"])
             sources = [f"https://massive.com/stocks/{ticker_result['ticker']}"]
+            stage = "raw_artifact_persistence"
+            artifact_pointer = runtime.artifacts.put_json(task.run_id, task.tool, raw)
+            stage = "tool_summary"
+            summary_result = await runtime.llm.json(
+                task.run_id,
+                AgentRole.RESEARCH,
+                "tool-summary",
+                SYSTEM,
+                f"{build_agent_instruction_block(agent_spec)}\n\n"
+                f"Summarize the most decision-relevant facts from this tool output. Return "
+                f'{{"summary":"..."}}. Output: {json.dumps(raw)[:30000]}',
+            )
+            summary = summary_result["summary"]
         else:
-            raw = await runtime.tools.web_search(task.run_id, task.question)
-            sources = [item["url"] for item in raw.get("results", []) if item.get("url")]
-        stage = "raw_artifact_persistence"
-        artifact_pointer = runtime.artifacts.put_json(task.run_id, task.tool, raw)
-        stage = "tool_summary"
-        summary_result = await runtime.llm.json(
-            task.run_id,
-            AgentRole.RESEARCH,
-            "tool-summary",
-            SYSTEM,
-            f"{build_agent_instruction_block(agent_spec)}\n\n"
-            f"Summarize the most decision-relevant facts from this tool output. Return "
-            f'{{"summary":"..."}}. Output: {json.dumps(raw)[:30000]}',
-        )
+            stage = "evidence_request"
+            evidence_request = build_evidence_request(runtime, task, branch)
+            try:
+                stage = "tool_execution"
+                bundle = await search_evidence(runtime, evidence_request)
+            except BudgetExceeded:
+                raise
+            except EvidenceProviderError as exc:
+                stage = "tool_execution"
+                raise exc.original
+            except Exception as exc:
+                if is_transient_failure(exc):
+                    raise
+                evidence_error = exc
+                stage = "evidence_engine"
+                logger.warning(
+                    "EvidenceEngine failed; falling back to legacy web_search "
+                    "run_id=%s task_id=%s error=%s",
+                    task.run_id,
+                    task.id,
+                    concise_exception(exc),
+                )
+                try:
+                    stage = "legacy_web_search_fallback"
+                    raw = await runtime.tools.web_search(task.run_id, task.question)
+                    stage = "raw_artifact_persistence"
+                    summary, artifact_pointer, sources = await legacy_tool_observation(
+                        runtime,
+                        task,
+                        agent_spec,
+                        raw,
+                        evidence_error=evidence_error,
+                    )
+                except BudgetExceeded:
+                    raise
+                except Exception as fallback_exc:
+                    if is_transient_failure(fallback_exc):
+                        raise
+                    raise RuntimeError(
+                        "EvidenceEngine failed "
+                        f"({concise_exception(evidence_error)}); "
+                        "legacy web_search fallback failed "
+                        f"({concise_exception(fallback_exc)})"
+                    ) from fallback_exc
+            else:
+                sources = evidence_source_refs(bundle)
+                summary = evidence_summary(bundle, branch)
+                stage = "evidence_bundle_artifact_persistence"
+                artifact_pointer = runtime.artifacts.put_json(
+                    task.run_id,
+                    task.tool,
+                    evidence_artifact_payload(bundle, summary, sources),
+                )
     except BudgetExceeded as exc:
         await skip_task_due_to_budget(runtime, task, branch, stage, exc, producer="tool-runner")
         raise
@@ -878,19 +1089,33 @@ async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:
         run_id=task.run_id,
         task_id=task.id,
         tool=task.tool,
-        summary=summary_result["summary"],
+        summary=summary,
         artifact=artifact_pointer,
         sources=sources,
     )
     await runtime.blackboard.put_observation(observation)
+    artifact_tags = tags_for_text(f"{task.title} {task.question} {observation.summary}")
+    if task.tool == "web_search":
+        artifact_tags = sorted(
+            set(
+                artifact_tags
+                + [
+                    "evidence_engine"
+                    if evidence_error is None
+                    else "legacy_web_search_fallback",
+                    "tool:web_search",
+                    branch.replace("/", ":"),
+                ]
+            )
+        )
     await persist_artifact(
         runtime,
         Artifact(
             run_id=task.run_id,
             artifact_type=ArtifactType.OBSERVATION,
             branch=branch,
-            text_or_summary=observation.summary,
-            tags=tags_for_text(f"{task.title} {task.question} {observation.summary}"),
+            text_or_summary=compact_text(observation.summary),
+            tags=artifact_tags,
             visibility=VisibilityScope.PUBLIC_UNVERIFIED,
             status=ArtifactStatus.UNVERIFIED,
             source_refs=observation.sources,
@@ -905,7 +1130,14 @@ async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:
         runtime,
         task.run_id,
         PrincipalActionType.REQUEST_TOOL_CALL,
-        f"Executed {task.tool} for task: {task.title}",
+        (
+            f"Executed {task.tool} for task: {task.title}"
+            if evidence_error is None
+            else (
+                f"Executed {task.tool} for task: {task.title} via legacy fallback "
+                f"after EvidenceEngine failure: {concise_exception(evidence_error)}"
+            )
+        ),
         required_role="tool_runner",
         target_branch=branch,
         expected_information_gain=InformationGain.HIGH,

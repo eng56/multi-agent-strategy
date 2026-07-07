@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     tavily_base_url: str = "https://api.tavily.com"
     environment: str = "dev"
     default_max_parallel_agents: int = Field(default=10, gt=0)
+    evidence_max_sources: int = Field(default=5, ge=0, le=25)
     principal_policy_mode: Literal["off", "shadow", "active"] = "shadow"
 
 

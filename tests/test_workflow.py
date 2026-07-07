@@ -140,7 +140,11 @@ class FakeBlackboard:
 
 
 class FakeArtifacts:
+    def __init__(self) -> None:
+        self.payloads = []
+
     def put_json(self, run_id, kind, _raw):
+        self.payloads.append((run_id, kind, _raw))
         return ArtifactPointer(
             uri=f"gs://bucket/runs/{run_id}/{kind}/raw.json",
             size_bytes=2,
@@ -701,7 +705,153 @@ def test_execute_tool_dual_writes_observation_artifact() -> None:
     )
 
 
-def test_tool_summary_prompt_includes_gold_agent_spec_context() -> None:
+def test_execute_tool_web_search_creates_evidence_bundle_backed_observation() -> None:
+    run = Run(
+        question="Should I buy SAP stock?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="SAP stock catalysts",
+        question="SAP cloud backlog catalysts",
+        tool="web_search",
+    )
+    rt = runtime(run, QueueLLM())
+    rt.blackboard.tasks.append(task)
+
+    class EvidenceTools(FakeTools):
+        async def web_search(self, _run_id, _query):
+            return {
+                "results": [
+                    {
+                        "url": "https://example.com/sap-cloud",
+                        "title": "SAP cloud backlog",
+                        "content": "SAP cloud backlog expanded with resilient demand.",
+                        "published_date": "2026-07-01",
+                        "score": 0.9,
+                    },
+                    {
+                        "url": "https://example.com/sap-margin",
+                        "title": "SAP margin context",
+                        "snippet": "Margins remain a constraint on the stock thesis.",
+                        "score": 0.6,
+                    },
+                ]
+            }
+
+    rt.tools = EvidenceTools()
+
+    asyncio.run(
+        execute_tool(
+            rt,
+            EventEnvelope(
+                type=EventType.TASK_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"task_id": str(task.id)},
+            ),
+        )
+    )
+
+    observation = rt.blackboard.observations[0]
+    assert "2 source(s)" in observation.summary
+    assert "SAP cloud backlog expanded" in observation.summary
+    assert observation.sources == [
+        "https://example.com/sap-cloud",
+        "https://example.com/sap-margin",
+    ]
+    artifact = rt.blackboard.artifacts[-1]
+    assert artifact.source_refs == observation.sources
+    assert "evidence_engine" in artifact.tags
+
+    payloads = rt.artifacts.payloads
+    assert any(kind == "evidence-search" for _run_id, kind, _raw in payloads)
+    bundle_payload = next(raw for _run_id, kind, raw in payloads if kind == "web_search")
+    assert bundle_payload["branch"] == "market/equities"
+    assert bundle_payload["source_refs"] == observation.sources
+    assert bundle_payload["evidence_bundle"]["items"][0]["source_url"] == (
+        "https://example.com/sap-cloud"
+    )
+
+
+def test_execute_tool_web_search_empty_evidence_bundle_still_observes() -> None:
+    run = Run(
+        question="Should I buy SAP stock?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="Sparse SAP query",
+        question="obscure SAP catalyst with no results",
+        tool="web_search",
+    )
+    rt = runtime(run, QueueLLM())
+    rt.blackboard.tasks.append(task)
+
+    class EmptyTools(FakeTools):
+        async def web_search(self, _run_id, _query):
+            return {"results": []}
+
+    rt.tools = EmptyTools()
+
+    asyncio.run(
+        execute_tool(
+            rt,
+            EventEnvelope(
+                type=EventType.TASK_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"task_id": str(task.id)},
+            ),
+        )
+    )
+
+    observation = rt.blackboard.observations[0]
+    assert rt.blackboard.tasks[0].status == "completed"
+    assert observation.sources == []
+    assert "0 source(s)" in observation.summary
+    assert "No provider results were returned" in observation.summary
+    assert rt.blackboard.artifacts[-1].source_refs == []
+
+
+def test_execute_tool_market_data_path_still_uses_legacy_summary() -> None:
+    run = Run(
+        question="Should I buy SAP stock?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="SAP market data",
+        question="Get SAP ticker market data",
+        tool="market_data",
+    )
+    llm = QueueLLM({"ticker": "SAP"}, {"summary": "SAP price data is available."})
+    rt = runtime(run, llm)
+    rt.blackboard.tasks.append(task)
+
+    asyncio.run(
+        execute_tool(
+            rt,
+            EventEnvelope(
+                type=EventType.TASK_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"task_id": str(task.id)},
+            ),
+        )
+    )
+
+    assert [call["name"] for call in llm.calls] == ["ticker-extractor", "tool-summary"]
+    observation = rt.blackboard.observations[0]
+    assert observation.summary == "SAP price data is available."
+    assert observation.sources == ["https://massive.com/stocks/SAP"]
+    assert rt.blackboard.artifacts[-1].source_refs == observation.sources
+
+
+def test_execute_tool_web_search_creates_evidence_observation_with_agent_branch() -> None:
     run = Run(
         question="Will gold rise if Fed cuts rates?",
         models=model_policy(),
@@ -743,19 +893,21 @@ def test_tool_summary_prompt_includes_gold_agent_spec_context() -> None:
         )
     )
 
-    prompt = llm.calls[-1]["prompt"]
-    assert llm.calls[-1]["name"] == "tool-summary"
-    assert "branch: market/gold" in prompt
-    assert "domain: market" in prompt
-    assert "objective: Research gold evidence relevant to Fed cuts." in prompt
-    assert "allowed_tools: web_search, market_data" in prompt
-    assert "retrieval_tags: market:gold, macro:rates" in prompt
-    assert "visibility_scope: team" in prompt
-    assert "local_budget_usd: $0.0700" in prompt
-    assert "You own gold evidence for branch market/gold" in prompt
-    assert "do not overreach into equities" in prompt
-    assert 'Return {"summary":"..."}' in prompt
-    assert rt.blackboard.observations[0].summary == "Gold context kept."
+    assert llm.calls == []
+    observation = rt.blackboard.observations[0]
+    assert "EvidenceEngine observation for branch market/gold" in observation.summary
+    assert "1 source(s)" in observation.summary
+    assert "Strongest evidence snippets" in observation.summary
+    assert "Source limitations" in observation.summary
+    assert "Branch: market/gold" in observation.summary
+    artifact = rt.blackboard.artifacts[-1]
+    assert artifact.branch == "market/gold"
+    assert artifact.legacy_object_type == "observation"
+    assert artifact.legacy_object_id == observation.id
+    assert artifact.source_refs == observation.sources
+    assert {"evidence_engine", "tool:web_search", "market:gold"}.issubset(
+        set(artifact.tags)
+    )
 
 
 def test_create_claim_dual_writes_claim_artifact() -> None:
@@ -1507,6 +1659,107 @@ def test_execute_tool_failure_does_not_record_executed_tool_action() -> None:
         and "Task failed during tool_execution" in action.reason
         for action in rt.blackboard.actions
     )
+
+
+def test_evidence_engine_failure_falls_back_to_legacy_web_search(monkeypatch) -> None:
+    run = Run(
+        question="Should I buy SAP stock?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="SAP stock catalysts",
+        question="SAP stock catalysts",
+        tool="web_search",
+    )
+    rt = runtime(run, QueueLLM({"summary": "Legacy summary kept."}))
+    rt.blackboard.tasks.append(task)
+
+    async def failing_evidence_search(_runtime, _request):
+        raise ValueError("bundle conversion failed")
+
+    monkeypatch.setattr(
+        "src.agents.workflow.search_evidence",
+        failing_evidence_search,
+    )
+
+    asyncio.run(
+        execute_tool(
+            rt,
+            EventEnvelope(
+                type=EventType.TASK_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"task_id": str(task.id)},
+            ),
+        )
+    )
+
+    observation = rt.blackboard.observations[0]
+    assert "EvidenceEngine failed" in observation.summary
+    assert "Legacy summary kept." in observation.summary
+    assert "legacy_web_search_fallback" in rt.blackboard.artifacts[-1].tags
+    assert any(
+        action.action_type == PrincipalActionType.REQUEST_TOOL_CALL
+        and action.status == ActionStatus.EXECUTED
+        and "EvidenceEngine failure" in action.reason
+        for action in rt.blackboard.actions
+    )
+
+
+def test_evidence_engine_failure_without_observation_records_no_success(monkeypatch) -> None:
+    run = Run(
+        question="Should I buy SAP stock?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="SAP stock catalysts",
+        question="SAP stock catalysts",
+        tool="web_search",
+    )
+    rt = runtime(run, QueueLLM({"summary": "unused"}))
+    rt.blackboard.tasks.append(task)
+
+    async def failing_evidence_search(_runtime, _request):
+        raise ValueError("bundle conversion failed")
+
+    class FailingFallbackTools(FakeTools):
+        async def web_search(self, _run_id, _query):
+            raise RuntimeError("fallback failed")
+
+    monkeypatch.setattr(
+        "src.agents.workflow.search_evidence",
+        failing_evidence_search,
+    )
+    rt.tools = FailingFallbackTools()
+
+    asyncio.run(
+        execute_tool(
+            rt,
+            EventEnvelope(
+                type=EventType.TASK_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"task_id": str(task.id)},
+            ),
+        )
+    )
+
+    assert rt.blackboard.tasks[0].status == "failed"
+    assert rt.blackboard.observations == []
+    assert not any(
+        action.action_type == PrincipalActionType.REQUEST_TOOL_CALL
+        and action.status == ActionStatus.EXECUTED
+        for action in rt.blackboard.actions
+    )
+    failed_action = next(
+        action for action in rt.blackboard.actions if action.status == ActionStatus.FAILED
+    )
+    assert "EvidenceEngine failed" in failed_action.reason
+    assert "fallback failed" in failed_action.reason
 
 
 def test_dispatch_retries_transient_tool_failure_with_metadata() -> None:
