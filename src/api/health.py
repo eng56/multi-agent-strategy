@@ -51,6 +51,16 @@ async def readiness_payload(runtime: Any) -> dict[str, object]:
             getattr(settings, "brave_search_base_url", ""),
             getattr(settings, "brave_search_api_key", None),
         ),
+        "exa": _optional_provider_check(
+            "exa",
+            getattr(settings, "exa_base_url", ""),
+            getattr(settings, "exa_api_key", None),
+        ),
+        "firecrawl": _optional_provider_check(
+            "firecrawl",
+            getattr(settings, "firecrawl_base_url", ""),
+            getattr(settings, "firecrawl_api_key", None),
+        ),
         "market_data": _provider_check(
             settings.market_data_provider,
             settings.market_data_base_url,

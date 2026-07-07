@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     tavily_base_url: str = "https://api.tavily.com"
     brave_search_api_key: str | None = None
     brave_search_base_url: str = "https://api.search.brave.com/res/v1/web/search"
+    exa_api_key: str | None = None
+    exa_base_url: str = "https://api.exa.ai/search"
+    firecrawl_api_key: str | None = None
+    firecrawl_base_url: str = "https://api.firecrawl.dev/v1/scrape"
     environment: str = "dev"
     default_max_parallel_agents: int = Field(default=10, gt=0)
     evidence_max_sources: int = Field(default=5, ge=0, le=25)

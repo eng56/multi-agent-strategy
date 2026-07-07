@@ -107,6 +107,7 @@ WEAK_CONTENT_PATTERNS = (
 
 SupportType = Literal["supports", "contradicts", "contextual", "unknown"]
 SearchClient = Callable[[UUID, str], Awaitable[dict[str, Any]]]
+FetchClient = Callable[[UUID, str], Awaitable[dict[str, Any]]]
 
 
 class EvidenceRequest(BaseModel):
@@ -172,6 +173,78 @@ class BraveProvider(SearchProvider):
         )
 
 
+class ExaProvider(SearchProvider):
+    name = "exa"
+
+    def __init__(self, search_client: SearchClient | None, run_id: UUID | None) -> None:
+        self.search_client = search_client
+        self.run_id = run_id
+
+    @property
+    def enabled(self) -> bool:
+        return self.search_client is not None and self.run_id is not None
+
+    async def search(self, query: EvidenceQuery) -> ProviderSearchResult:
+        if not self.enabled:
+            return ProviderSearchResult(provider=self.name, raw={"results": [], "disabled": True})
+        assert self.search_client is not None
+        assert self.run_id is not None
+        return ProviderSearchResult(
+            provider=self.name,
+            raw=await self.search_client(self.run_id, query.query),
+        )
+
+
+class FetchedContent(BaseModel):
+    provider: str = Field(min_length=1)
+    source_url: str = Field(min_length=1)
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+
+class ContentFetcher(ABC):
+    name: str
+    max_urls: int
+
+    @property
+    @abstractmethod
+    def enabled(self) -> bool:
+        ...
+
+    @abstractmethod
+    async def fetch(self, source_url: str) -> FetchedContent | None:
+        ...
+
+
+class FirecrawlFetcher(ContentFetcher):
+    name = "firecrawl"
+
+    def __init__(
+        self,
+        fetch_client: FetchClient | None,
+        run_id: UUID | None,
+        *,
+        max_urls: int = 1,
+    ) -> None:
+        self.fetch_client = fetch_client
+        self.run_id = run_id
+        self.max_urls = max(0, max_urls)
+
+    @property
+    def enabled(self) -> bool:
+        return self.fetch_client is not None and self.run_id is not None and self.max_urls > 0
+
+    async def fetch(self, source_url: str) -> FetchedContent | None:
+        if not self.enabled:
+            return None
+        assert self.fetch_client is not None
+        assert self.run_id is not None
+        return FetchedContent(
+            provider=self.name,
+            source_url=source_url,
+            raw=await self.fetch_client(self.run_id, source_url),
+        )
+
+
 class EvidenceSource(BaseModel):
     source_url: str = Field(min_length=1)
     source_title: str = Field(min_length=1)
@@ -217,11 +290,13 @@ class EvidenceEngine:
         search_client: SearchClient | None = None,
         *,
         providers: Iterable[SearchProvider] | None = None,
+        fetcher: ContentFetcher | None = None,
         artifact_store: Any | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.search_client = search_client
         self.providers = list(providers or [])
+        self.fetcher = fetcher
         self.artifact_store = artifact_store
         self.clock = clock or (lambda: datetime.now(UTC))
 
@@ -260,6 +335,7 @@ class EvidenceEngine:
                 if len(items) >= request.max_sources:
                     break
 
+        await self._fetch_content_for_top_sources(items, bundle_limitations, raw_outputs)
         artifact_uri = self._persist_raw_results(request, queries, raw_outputs)
         return EvidenceBundle(
             request=request,
@@ -305,6 +381,45 @@ class EvidenceEngine:
                 f"fell back to {fallback.name}."
             )
             return await fallback.search(query)
+
+    async def _fetch_content_for_top_sources(
+        self,
+        items: list[EvidenceItem],
+        bundle_limitations: list[str],
+        raw_outputs: list[dict[str, Any]],
+    ) -> None:
+        fetcher = self.fetcher
+        if fetcher is None or not fetcher.enabled or not items:
+            return
+
+        fetch_outputs: list[dict[str, Any]] = []
+        for item in items[: fetcher.max_urls]:
+            try:
+                fetched = await fetcher.fetch(item.source_url)
+            except Exception as exc:
+                fetch_outputs.append(
+                    {
+                        "url": item.source_url,
+                        "provider": fetcher.name,
+                        "error": {"type": type(exc).__name__},
+                    }
+                )
+                bundle_limitations.append(
+                    f"{fetcher.name} fetch failed with {type(exc).__name__}."
+                )
+                continue
+            if fetched is None:
+                continue
+            fetch_outputs.append(fetched_content_to_raw_output(fetched))
+
+        if fetch_outputs:
+            raw_outputs.append(
+                {
+                    "provider": fetcher.name,
+                    "operation": "fetch",
+                    "responses": fetch_outputs,
+                }
+            )
 
     def _persist_raw_results(
         self,
@@ -406,8 +521,11 @@ def select_search_provider(
     providers: list[SearchProvider],
 ) -> SearchProvider:
     brave = _provider_by_name(providers, "brave")
-    if brave is not None and _should_use_brave(query):
+    if brave is not None and _provider_enabled(brave) and _should_use_brave(query):
         return brave
+    exa = _provider_by_name(providers, "exa")
+    if exa is not None and _provider_enabled(exa) and _should_use_exa(query):
+        return exa
     tavily = _provider_by_name(providers, "tavily")
     return tavily or providers[0]
 
@@ -419,6 +537,8 @@ def provider_results_to_items(
 ) -> list[EvidenceItem]:
     if result.provider == "brave":
         return brave_results_to_items(result.raw, request, retrieved_at)
+    if result.provider == "exa":
+        return exa_results_to_items(result.raw, request, retrieved_at)
     return tavily_results_to_items(
         result.raw,
         request,
@@ -485,6 +605,71 @@ def tavily_results_to_items(
     return items
 
 
+def exa_results_to_items(
+    raw: dict[str, Any],
+    request: EvidenceRequest,
+    retrieved_at: datetime,
+) -> list[EvidenceItem]:
+    results = raw.get("results", [])
+    if not isinstance(results, list):
+        return []
+
+    items: list[EvidenceItem] = []
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        source_url = _string_value(result, "url", "source_url")
+        if not source_url:
+            continue
+        if _domain_matches_any(source_url, request.excluded_domains):
+            continue
+        raw_title = _string_value(result, "title", "source_title")
+        source_title = raw_title or source_url
+        raw_snippet = _exa_snippet(result)
+        publisher = _string_value(result, "publisher", "source", "author")
+        published_at = _string_value(
+            result,
+            "published_at",
+            "published_date",
+            "publishedDate",
+            "date",
+        )
+        confidence = _confidence_from_score(result.get("score"))
+        limitations = _limitations(result, request.search_mode)
+        if raw_snippet is None:
+            limitations.append("Exa result did not include text, summary, or highlight content.")
+        source_quality = score_source_quality(
+            source_url=source_url,
+            source_title=raw_title,
+            snippet=raw_snippet,
+            publisher=publisher,
+            published_at=published_at,
+            preferred_domains=request.preferred_domains,
+            retrieved_at=retrieved_at,
+        )
+        items.append(
+            EvidenceItem(
+                source_url=source_url,
+                source_title=source_title,
+                provider="exa",
+                domain=source_quality.domain,
+                publisher=source_quality.publisher,
+                published_at=published_at,
+                retrieved_at=retrieved_at,
+                source_tier=source_quality.source_tier,
+                snippet=raw_snippet or "",
+                support_type=_support_type(request.search_mode),
+                confidence=confidence,
+                quality_score=source_quality.quality_score,
+                source_quality_reason=source_quality.reason,
+                limitations=limitations,
+            )
+        )
+        if len(items) >= request.max_sources:
+            break
+    return items
+
+
 def brave_results_to_items(
     raw: dict[str, Any],
     request: EvidenceRequest,
@@ -539,6 +724,21 @@ def brave_results_to_items(
         if len(items) >= request.max_sources:
             break
     return items
+
+
+def fetched_content_to_raw_output(fetched: FetchedContent) -> dict[str, Any]:
+    output: dict[str, Any] = {
+        "url": fetched.source_url,
+        "provider": fetched.provider,
+        "raw": fetched.raw,
+    }
+    markdown = _nested_string(fetched.raw, ("markdown",), ("data", "markdown"))
+    content = _nested_string(fetched.raw, ("content",), ("text",), ("data", "content"))
+    if markdown:
+        output["markdown"] = markdown
+    if content:
+        output["content"] = content
+    return output
 
 
 def summarize_source_quality(
@@ -675,10 +875,19 @@ def _provider_by_name(
     return None
 
 
+def _provider_enabled(provider: SearchProvider) -> bool:
+    enabled = getattr(provider, "enabled", True)
+    return bool(enabled)
+
+
 def _should_use_brave(query: EvidenceQuery) -> bool:
     if query.search_mode in {SearchMode.CONTRADICTION, SearchMode.PRIMARY_SOURCE}:
         return True
     return "site:" in query.query.lower()
+
+
+def _should_use_exa(query: EvidenceQuery) -> bool:
+    return query.search_mode in {SearchMode.EXPLORATORY, SearchMode.HISTORICAL}
 
 
 def _unique_preserving_order(values: list[str]) -> list[str]:
@@ -709,6 +918,18 @@ def _brave_publisher(result: dict[str, Any]) -> str | None:
         if isinstance(name, str) and name.strip():
             return name.strip()
     return _string_value(result, "publisher", "source")
+
+
+def _exa_snippet(result: dict[str, Any]) -> str | None:
+    direct = _string_value(result, "text", "summary", "content", "snippet")
+    if direct:
+        return direct
+    highlights = result.get("highlights")
+    if isinstance(highlights, list):
+        strings = [value.strip() for value in highlights if isinstance(value, str) and value.strip()]
+        if strings:
+            return " ".join(strings)
+    return None
 
 
 def _clean_provider_text(value: str | None) -> str | None:
@@ -845,6 +1066,19 @@ def _string_value(result: dict[str, Any], *keys: str) -> str | None:
         value = result.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
+    return None
+
+
+def _nested_string(value: dict[str, Any], *paths: tuple[str, ...]) -> str | None:
+    for path in paths:
+        current: Any = value
+        for key in path:
+            if not isinstance(current, dict):
+                current = None
+                break
+            current = current.get(key)
+        if isinstance(current, str) and current.strip():
+            return current.strip()
     return None
 
 

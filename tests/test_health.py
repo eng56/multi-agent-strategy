@@ -81,6 +81,10 @@ def test_readiness_redacts_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
             tavily_api_key="tavily-secret",
             brave_search_base_url="https://brave.example.com/search?token=brave-secret",
             brave_search_api_key="brave-secret",
+            exa_base_url="https://exa.example.com/search?token=exa-secret",
+            exa_api_key="exa-secret",
+            firecrawl_base_url="https://firecrawl.example.com/scrape?token=firecrawl-secret",
+            firecrawl_api_key="firecrawl-secret",
             market_data_provider="massive",
             market_data_base_url="https://market.example.com?password=market-secret",
             market_data_api_key="market-secret",
@@ -99,6 +103,8 @@ def test_readiness_redacts_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "open-secret" not in serialized
     assert "tavily-secret" not in serialized
     assert "brave-secret" not in serialized
+    assert "exa-secret" not in serialized
+    assert "firecrawl-secret" not in serialized
     assert "market-secret" not in serialized
     assert "user:" not in serialized
     assert payload["checks"]["llm_provider"]["base_url"] == (
@@ -110,6 +116,14 @@ def test_readiness_redacts_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
     assert payload["checks"]["brave_search"]["configured"] is True
     assert payload["checks"]["brave_search"]["base_url"] == (
         "https://brave.example.com/search?token=<redacted>"
+    )
+    assert payload["checks"]["exa"]["configured"] is True
+    assert payload["checks"]["exa"]["base_url"] == (
+        "https://exa.example.com/search?token=<redacted>"
+    )
+    assert payload["checks"]["firecrawl"]["configured"] is True
+    assert payload["checks"]["firecrawl"]["base_url"] == (
+        "https://firecrawl.example.com/scrape?token=<redacted>"
     )
 
 
