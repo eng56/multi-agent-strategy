@@ -120,6 +120,15 @@ def test_run_state_exposes_budget_summary() -> None:
     assert state.budget_summary.tool_usage["market_data_requests"].max == 3
     assert state.budget_summary.tool_usage["market_data_requests"].remaining == 2
     assert state.tool_budget_remaining == {"tavily_credits": 3, "market_data_requests": 2}
+    assert state.capacity is not None
+    assert state.capacity.llm_remaining_usd == 3.25
+    assert state.capacity.tavily_remaining == 3
+    assert state.capacity.market_data_remaining == 2
+    assert round(state.capacity.verifier_budget_remaining, 2) == 0.67
+    assert round(state.capacity.aggregator_budget_protected_remaining, 2) == 0.04
+    assert round(state.capacity.judge_budget_protected_remaining, 2) == 0.09
+    assert state.capacity.search_exhausted is False
+    assert state.capacity.market_data_exhausted is False
 
 
 def test_run_state_promotes_verified_claims_and_requests_aggregation() -> None:
@@ -589,6 +598,45 @@ def test_run_state_verified_count_ignores_non_knowledge_artifacts() -> None:
     )
 
     assert state.verified_claim_count == 0
+
+
+def test_run_state_reports_search_exhausted_when_tavily_zero_despite_llm_budget() -> None:
+    current_run = run()
+    current_run.budget.limit_usd = 20
+    current_run.budget.spent_usd = 0.1
+    current_run.budget.reserved_usd = 0
+    current_run.budget.tools = ToolBudget(
+        tavily_max_credits=0,
+        tavily_credits_used=0,
+        market_data_max_requests=10,
+        market_data_requests_used=0,
+    )
+    task = ResearchTask(
+        run_id=current_run.id,
+        title="Equity evidence",
+        question="Find equity evidence.",
+        tool="web_search",
+        status="completed",
+        branch="market/equities",
+    )
+    claim = Claim(
+        run_id=current_run.id,
+        task_id=task.id,
+        statement="Equities rise on faster Fed cuts.",
+        evidence_observation_ids=[uuid4()],
+        confidence=0.6,
+    )
+
+    state = build_run_state(current_run, [task], [claim], [])
+
+    assert state.capacity is not None
+    assert state.capacity.llm_remaining_usd == 19.9
+    assert state.capacity.search_exhausted is True
+    assert state.capacity.market_data_exhausted is False
+    assert (
+        "Search/tool budget exhausted before enough claims passed verification."
+        in state.stop_reasons
+    )
 
 
 def test_run_state_verified_count_includes_claim_artifacts() -> None:

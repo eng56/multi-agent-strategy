@@ -273,6 +273,7 @@ def _candidate_rules(snapshot: PrincipalSnapshot) -> list[PrincipalActionCandida
 
     needs_followup_aggregation = _should_reaggregate_after_followup(snapshot)
     zero_verified_terminal_aggregation = _zero_verified_terminal_aggregation_ready(snapshot)
+    zero_verified_repair = _zero_verified_repair_ready(snapshot)
     if has_verified_knowledge and has_counterargument:
         candidates.append(_aggregation_candidate(snapshot, PolicyDecisionReason.REQUEST_AGGREGATION))
     elif (
@@ -283,6 +284,22 @@ def _candidate_rules(snapshot: PrincipalSnapshot) -> list[PrincipalActionCandida
         and not snapshot.final
     ) or needs_followup_aggregation:
         candidates.append(_aggregation_candidate(snapshot, PolicyDecisionReason.REQUEST_AGGREGATION))
+    elif zero_verified_repair:
+        candidates.append(
+            PrincipalActionCandidate(
+                action_type=PrincipalActionType.REQUEST_FOLLOWUP,
+                reason=(
+                    "Zero claims passed verification while search capacity remains; "
+                    "launch branch-distributed evidence repair before any terminal final."
+                ),
+                expected_information_gain=InformationGain.HIGH,
+                estimated_cost=_estimated_cost(snapshot.run, "research_agent"),
+                target_branch="research/recovery",
+                required_role="principal_policy",
+                priority=8,
+                decision_reason=PolicyDecisionReason.REQUEST_FOLLOWUP,
+            )
+        )
     elif zero_verified_terminal_aggregation:
         candidates.append(_aggregation_candidate(snapshot, PolicyDecisionReason.PARTIAL_AGGREGATION))
 
@@ -354,6 +371,12 @@ def _validate_candidate(
         snapshot.tasks
     ) >= MAX_FOLLOWUP_WAVES:
         return "follow-up wave already used"
+
+    if candidate.action_type in {
+        PrincipalActionType.REQUEST_VERIFICATION,
+        PrincipalActionType.REQUEST_FOLLOWUP,
+    } and snapshot.run_state.capacity and snapshot.run_state.capacity.search_exhausted:
+        return "search/tool budget is exhausted"
 
     if _duplicates_recent_action(snapshot, candidate):
         return "duplicates recent equivalent action"
@@ -541,12 +564,22 @@ def _observations_without_claims(snapshot: PrincipalSnapshot) -> list[Observatio
         observation
         for observation in snapshot.observations
         if observation.id not in claimed_observation_ids
+        and not _is_market_snapshot_observation(observation, snapshot.artifacts)
+        and not _is_data_gap_observation(observation, snapshot.artifacts)
     ]
 
 
 def _unverified_claim_count(snapshot: PrincipalSnapshot) -> int:
     verified_claim_ids = {verification.claim_id for verification in snapshot.verifications}
-    return len([claim for claim in snapshot.claims if claim.id not in verified_claim_ids])
+    artifact_by_claim_id = _claim_artifacts_by_legacy_id(snapshot.artifacts)
+    return len(
+        [
+            claim
+            for claim in snapshot.claims
+            if claim.id not in verified_claim_ids
+            and not _is_market_snapshot_claim(claim, artifact_by_claim_id.get(claim.id))
+        ]
+    )
 
 
 def _verified_knowledge_count(snapshot: PrincipalSnapshot) -> int:
@@ -562,6 +595,61 @@ def _verified_knowledge_count(snapshot: PrincipalSnapshot) -> int:
         and artifact.artifact_type in {ArtifactType.CLAIM, ArtifactType.FORECAST}
     }
     return len(verified_claim_ids | verified_artifact_ids)
+
+
+def _claim_artifacts_by_legacy_id(artifacts: list[Artifact]) -> dict[object, Artifact]:
+    return {
+        artifact.legacy_object_id: artifact
+        for artifact in artifacts
+        if artifact.artifact_type == ArtifactType.CLAIM
+        and artifact.legacy_object_type == "claim"
+        and artifact.legacy_object_id is not None
+    }
+
+
+def _is_market_snapshot_claim(claim: Claim, artifact: Artifact | None) -> bool:
+    text = claim.statement.casefold()
+    if text.startswith("market data snapshot") or text.startswith("marketsnapshot"):
+        return True
+    return bool(
+        artifact
+        and (
+            "market_snapshot" in artifact.tags
+            or "context_only" in artifact.tags
+            or "tool:market_data" in artifact.tags
+        )
+    )
+
+
+def _is_market_snapshot_observation(
+    observation: Observation, artifacts: list[Artifact]
+) -> bool:
+    if observation.tool == "market_data" or observation.summary.casefold().startswith(
+        "marketsnapshot for "
+    ):
+        return True
+    return any(
+        artifact.legacy_object_type == "observation"
+        and artifact.legacy_object_id == observation.id
+        and ("market_snapshot" in artifact.tags or "tool:market_data" in artifact.tags)
+        for artifact in artifacts
+    )
+
+
+def _is_data_gap_observation(observation: Observation, artifacts: list[Artifact]) -> bool:
+    if "market data gap" in observation.summary.casefold() or "tool failure" in observation.summary.casefold():
+        return True
+    return any(
+        artifact.legacy_object_type == "observation"
+        and artifact.legacy_object_id == observation.id
+        and (
+            artifact.artifact_type == ArtifactType.DATA_GAP
+            or "data_gap" in artifact.tags
+            or "market_data_gap" in artifact.tags
+            or "tool_failure" in artifact.tags
+        )
+        for artifact in artifacts
+    )
 
 
 def _has_counterargument(artifacts: list[Artifact]) -> bool:
@@ -598,6 +686,31 @@ def _zero_verified_terminal_aggregation_ready(snapshot: PrincipalSnapshot) -> bo
     checked_claim_ids = {verification.claim_id for verification in snapshot.verifications}
     claim_ids = {claim.id for claim in snapshot.claims}
     return claim_ids <= checked_claim_ids
+
+
+def _zero_verified_repair_ready(snapshot: PrincipalSnapshot) -> bool:
+    if snapshot.final is not None:
+        return False
+    if not snapshot.tasks or any(task.status == "created" for task in snapshot.tasks):
+        return False
+    if _max_task_wave(snapshot.tasks) >= MAX_FOLLOWUP_WAVES:
+        return False
+    if any(verification.verdict == "verified" for verification in snapshot.verifications):
+        return False
+    if snapshot.run_state.capacity and snapshot.run_state.capacity.search_exhausted:
+        return False
+    if snapshot.run_state.budget_remaining < MIN_USEFUL_ACTION_BUDGET_USD:
+        return False
+    checked_claim_ids = {verification.claim_id for verification in snapshot.verifications}
+    claim_ids = {claim.id for claim in snapshot.claims}
+    failed_claim_tasks = [
+        task
+        for task in snapshot.tasks
+        if task.status == "failed"
+        and task.reason
+        and "claim_generation" in task.reason.lower()
+    ]
+    return bool(claim_ids and claim_ids <= checked_claim_ids) or bool(failed_claim_tasks)
 
 
 def _max_task_wave(tasks: list[ResearchTask]) -> int:

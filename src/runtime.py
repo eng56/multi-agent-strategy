@@ -43,6 +43,8 @@ def build_runtime() -> Runtime:
             settings.market_data_api_key,
             settings.tavily_base_url,
             settings.market_data_base_url,
+            settings.market_data_product_rate_limit_per_minute,
+            settings.market_data_enabled_products,
             settings.brave_search_api_key,
             settings.brave_search_base_url,
             settings.exa_api_key,

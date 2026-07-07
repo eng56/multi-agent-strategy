@@ -125,6 +125,7 @@ async def get_market_snapshot(
     *,
     fetch_market_data: MarketDataFetcher | None = None,
     capabilities: MarketDataCapabilities | None = None,
+    stocks_endpoint_only: bool = True,
 ) -> MarketSnapshot | MarketDataGap:
     """Resolve an asset to endpoint-valid candidates and return the first usable snapshot."""
     candidates = resolve_instruments(asset, question, capabilities=capabilities)
@@ -152,7 +153,7 @@ async def get_market_snapshot(
 
     attempts: list[MarketDataAttempt] = []
     for candidate in candidates:
-        if not is_valid_for_stocks_endpoint(candidate):
+        if stocks_endpoint_only and not is_valid_for_stocks_endpoint(candidate):
             attempts.append(
                 MarketDataAttempt(
                     candidate=candidate,

@@ -53,6 +53,7 @@ from src.common.models import (
     VisibilityScope,
 )
 from src.integrations.llm import LLMOutputError
+from src.markets.resolver import MarketDataCapabilities
 from src.markets.snapshot import MarketDataGap, MarketSnapshot, get_market_snapshot
 from src.runtime import Runtime
 
@@ -329,11 +330,13 @@ def followup_task_items(run: Run, final: FinalReport, wave_number: int) -> list[
             "Find targeted evidence addressing this quality feedback: "
             f"{short_focus}. Original question: {run.question}"
         )
+        branch = infer_semantic_branch(f"{short_focus} {run.question}", fallback="research/general")
         items.append(
             {
                 "title": followup_title(short_focus),
                 "question": question[:1000].rstrip(),
                 "tool": "web_search",
+                "branch": branch,
                 "wave_number": wave_number,
                 "reason": reason[:1000].rstrip(),
             }
@@ -441,7 +444,7 @@ FALLBACK_TASKS: dict[str, tuple[str, str, str]] = {
 
 def deterministic_task_items(
     question: str, organization: OrganizationPlan | None
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     branches = [
         branch
         for branch in (organization.branches if organization else semantic_branches(question))
@@ -454,8 +457,39 @@ def deterministic_task_items(
             continue
         seen.add(branch)
         title, task_question, tool = FALLBACK_TASKS.get(branch, FALLBACK_TASKS["research/general"])
-        task_items.append({"title": title, "question": task_question, "tool": tool})
+        agent_spec_id = next(
+            (spec.id for spec in (organization.agent_specs if organization else []) if spec.branch == branch),
+            None,
+        )
+        task_items.append(
+            {
+                "title": title,
+                "question": task_question,
+                "tool": tool,
+                "branch": branch,
+                "agent_spec_id": agent_spec_id,
+            }
+        )
     return task_items
+
+
+def _task_item_branch(item: dict[str, Any], organization: OrganizationPlan | None) -> str:
+    if isinstance(item.get("branch"), str) and item["branch"].strip():
+        return item["branch"].strip()
+    inferred = infer_semantic_branch(
+        f"{item.get('title', '')} {item.get('question', '')}",
+        fallback="research/general",
+    )
+    branches = set(organization.branches if organization else [])
+    return inferred if not branches or inferred in branches else "research/general"
+
+
+def _task_item_agent_spec_id(
+    branch: str, organization: OrganizationPlan | None
+) -> UUID | None:
+    if not organization:
+        return None
+    return next((spec.id for spec in organization.agent_specs if spec.branch == branch), None)
 
 
 def compact_planner_prompt(question: str) -> str:
@@ -745,6 +779,10 @@ async def plan(runtime: Runtime, event: EventEnvelope) -> None:
     async def persist_planned_tasks(items: list[dict[str, Any]]) -> int:
         created_count = 0
         for item in items:
+            item = dict(item)
+            branch = _task_item_branch(item, organization)
+            item.setdefault("branch", branch)
+            item.setdefault("agent_spec_id", _task_item_agent_spec_id(branch, organization))
             try:
                 task = ResearchTask(run_id=run.id, **item)
             except Exception as exc:
@@ -853,11 +891,25 @@ def _has_zero_verified_recovery_capacity(run: Run) -> bool:
     return budget_remaining > 0.05 and tavily_remaining > 0
 
 
-def _disputed_claim_texts(claims: list[Claim], verifications: list[Verification]) -> list[str]:
-    disputed_ids = {
-        verification.claim_id for verification in verifications if verification.verdict != "verified"
-    }
-    return [claim.statement for claim in claims if claim.id in disputed_ids][:5]
+def _has_verification_capacity(run: Run) -> bool:
+    budget_remaining = run.budget.limit_usd - run.budget.spent_usd - run.budget.reserved_usd
+    tavily_remaining = run.budget.tools.tavily_max_credits - run.budget.tools.tavily_credits_used
+    verifier_spent = run.budget.role_spent_usd.get(
+        AgentRole.VERIFIER, run.budget.role_spent_usd.get(AgentRole.VERIFIER.value, 0)
+    )
+    verifier_reserved = run.budget.role_reserved_usd.get(
+        AgentRole.VERIFIER, run.budget.role_reserved_usd.get(AgentRole.VERIFIER.value, 0)
+    )
+    verifier_cap = (
+        run.models.verifier.cap_usd
+        if run.models.verifier.cap_usd is not None
+        else run.budget.limit_usd
+    )
+    return (
+        budget_remaining > 0.05
+        and tavily_remaining > 0
+        and float(verifier_cap) - float(verifier_spent) - float(verifier_reserved) > 0
+    )
 
 
 def _failed_claim_generation_tasks(tasks: list[ResearchTask]) -> list[ResearchTask]:
@@ -883,78 +935,143 @@ def zero_verified_followup_task_items(
     claims: list[Claim],
     verifications: list[Verification],
     wave_number: int,
+    artifacts: list[Artifact] | None = None,
 ) -> list[dict[str, Any]]:
-    disputed_text = "\n".join(f"- {text}" for text in _disputed_claim_texts(claims, verifications))
-    if not disputed_text:
-        disputed_text = "- No disputed claim text was available; use observations and the original question."
-    base_context = f"Original question: {run.question}\nDisputed candidate claims:\n{disputed_text}"
-    items = [
-        {
-            "title": "Follow-up: atomic disputed claims",
-            "question": (
-                "Split the broad disputed claims into narrow, source-verifiable atomic "
-                "claims. Avoid portfolio advice and causal overreach. "
-                f"{base_context}"
-            )[:1000].rstrip(),
-            "tool": "web_search",
-            "wave_number": wave_number,
-            "reason": (
-                "Zero claims passed verification; split broad disputed claims into "
-                "atomic claims before retrying verification."
-            ),
-        },
-        {
-            "title": "Follow-up: primary dated sources",
-            "question": (
-                "Find primary or clearly date-bearing sources for Fed policy expectations, "
-                "CME/Fed/FRED/Treasury/rates evidence, USD, gold, U.S. equities, and "
-                "long-duration bonds. Prefer official, exchange, central-bank, filing, "
-                f"or dated major-news sources. {base_context}"
-            )[:1000].rstrip(),
-            "tool": "web_search",
-            "wave_number": wave_number,
-            "reason": (
-                "Zero claims passed verification; search primary and date-bearing sources "
-                "to resolve temporal ambiguity."
-            ),
-        },
-        {
-            "title": "Follow-up: contradiction search",
-            "question": (
-                "Search for contradiction and counterargument evidence against the disputed "
-                "claims, including recession-vs-disinflation regimes, conflicting USD "
-                "signals, real-yield/gold caveats, and long-duration bond risks. "
-                f"{base_context}"
-            )[:1000].rstrip(),
-            "tool": "web_search",
-            "wave_number": wave_number,
-            "reason": (
-                "Zero claims passed verification; run targeted contradiction search before "
-                "any terminal synthesis."
-            ),
-        },
-    ]
-    retry_targets = _claim_generation_recovery_candidates(tasks)
-    if retry_targets:
-        target_text = "; ".join(f"{task.title}: {task.question}" for task in retry_targets[:3])
+    artifacts = artifacts or []
+    capacity = max(0, run.budget.tools.tavily_max_credits - run.budget.tools.tavily_credits_used)
+    if capacity <= 0:
+        return []
+    branch_context = _zero_verified_repair_context_by_branch(
+        run, tasks, claims, verifications, artifacts
+    )
+    items: list[dict[str, Any]] = []
+    for branch, context_lines in list(branch_context.items())[:capacity]:
+        context = "\n".join(f"- {line}" for line in context_lines[:6])
+        if not context:
+            context = "- No branch-specific claim text was available; use observations and the original question."
+        title = f"Evidence repair: {title_from_branch(branch)}"[:80].rstrip()
         items.append(
             {
-                "title": "Follow-up: retry failed claim generation",
+                "title": title,
                 "question": (
-                    "Retry failed claim-generation coverage with conservative, narrow, "
-                    "source-grounded claims. If source evidence remains weak, state only "
-                    f"the factual observation and caveats. Failed task context: {target_text}. "
-                    f"Original question: {run.question}"
+                    f"Repair evidence for branch {branch}. Original question: {run.question}\n"
+                    f"Failed/disputed evidence state:\n{context}\n"
+                    "Required repair behavior: split broad claims into atomic claims; "
+                    "search primary/date-bearing sources; search higher-quality secondary "
+                    "or news sources; run contradiction search; retry failed branch coverage "
+                    "if present; produce narrow observations suitable for re-verification. "
+                    "Keep verification strict and do not turn data gaps into investment claims."
                 )[:1000].rstrip(),
                 "tool": "web_search",
+                "branch": branch,
                 "wave_number": wave_number,
                 "reason": (
-                    "Zero claims passed verification and at least one task failed claim "
-                    "generation; retry with deterministic conservative fallback behavior."
+                    "Zero claims passed verification; branch-distributed evidence repair "
+                    f"for {branch} before terminal synthesis."
                 ),
             }
         )
     return items
+
+
+def _zero_verified_repair_context_by_branch(
+    run: Run,
+    tasks: list[ResearchTask],
+    claims: list[Claim],
+    verifications: list[Verification],
+    artifacts: list[Artifact],
+) -> dict[str, list[str]]:
+    task_by_id = {task.id: task for task in tasks}
+    verification_by_claim_id = {
+        verification.claim_id: verification for verification in verifications
+    }
+    claim_artifact_by_claim_id = {
+        artifact.legacy_object_id: artifact
+        for artifact in artifacts
+        if artifact.artifact_type == ArtifactType.CLAIM
+        and artifact.legacy_object_type == "claim"
+        and artifact.legacy_object_id is not None
+    }
+    context_by_branch: dict[str, list[str]] = {}
+
+    def add(branch: str, line: str) -> None:
+        context_by_branch.setdefault(branch, [])
+        if line not in context_by_branch[branch]:
+            context_by_branch[branch].append(line)
+
+    for claim in claims:
+        artifact = claim_artifact_by_claim_id.get(claim.id)
+        if _is_market_snapshot_context_claim(claim, artifact):
+            continue
+        verification = verification_by_claim_id.get(claim.id)
+        if verification and verification.verdict == "verified":
+            continue
+        task = task_by_id.get(claim.task_id)
+        branch = (
+            artifact.branch
+            if artifact and artifact.branch
+            else branch_for_task(task) if task else infer_semantic_branch(claim.statement)
+        )
+        parts = [f"claim: {claim.statement}"]
+        if verification:
+            if verification.unsupported_parts:
+                parts.append("unsupported: " + "; ".join(verification.unsupported_parts[:2]))
+            if verification.contradictions:
+                parts.append("contradictions: " + "; ".join(verification.contradictions[:2]))
+            if verification.required_caveats:
+                parts.append("caveats: " + "; ".join(verification.required_caveats[:2]))
+            if verification.source_quality_summary:
+                parts.append(f"source quality: {verification.source_quality_summary}")
+        add(branch, compact_text(" | ".join(parts), max_chars=500))
+
+    for task in _claim_generation_recovery_candidates(tasks):
+        branch = branch_for_task(task)
+        add(
+            branch,
+            compact_text(
+                f"failed branch/task: {task.title}; reason: {task.reason or 'not recorded'}",
+                max_chars=400,
+            ),
+        )
+
+    if context_by_branch:
+        return _prioritize_repair_branches(context_by_branch, run.question)
+
+    for branch in semantic_branches(run.question):
+        if branch.startswith(("root", "trust/", "synthesis/")):
+            continue
+        add(branch, "no verified claims; branch needs dated source repair coverage")
+    return _prioritize_repair_branches(context_by_branch, run.question)
+
+
+def _is_market_snapshot_context_claim(claim: Claim, artifact: Artifact | None) -> bool:
+    text = claim.statement.casefold()
+    if text.startswith("market data snapshot") or text.startswith("marketsnapshot"):
+        return True
+    return bool(
+        artifact
+        and (
+            "market_snapshot" in artifact.tags
+            or "context_only" in artifact.tags
+            or "tool:market_data" in artifact.tags
+        )
+    )
+
+
+def _prioritize_repair_branches(
+    context_by_branch: dict[str, list[str]], question: str
+) -> dict[str, list[str]]:
+    requested = semantic_branches(question)
+    order = {branch: index for index, branch in enumerate(requested)}
+    return dict(
+        sorted(
+            context_by_branch.items(),
+            key=lambda item: (
+                order.get(item[0], len(order) + 1),
+                item[0],
+            ),
+        )
+    )
 
 
 async def request_zero_verified_followup_wave(
@@ -1003,7 +1120,10 @@ async def request_zero_verified_followup_wave(
     )
 
     created = 0
-    for item in zero_verified_followup_task_items(run, tasks, claims, verifications, wave_number):
+    artifacts = await runtime.blackboard.list_models(run.id, "artifacts", Artifact)
+    for item in zero_verified_followup_task_items(
+        run, tasks, claims, verifications, wave_number, artifacts
+    ):
         task = ResearchTask(run_id=run.id, **item)
         await runtime.blackboard.put_task(task)
         await persist_action(
@@ -1262,6 +1382,29 @@ async def persist_market_data_gap(
     )
 
 
+def market_data_capabilities(runtime: Runtime) -> MarketDataCapabilities:
+    settings = getattr(runtime, "settings", None)
+    raw_products = getattr(settings, "market_data_enabled_products", "stocks")
+    products = {
+        product.strip().lower()
+        for product in str(raw_products).split(",")
+        if product.strip()
+    } or {"stocks"}
+    return MarketDataCapabilities(
+        provider=getattr(settings, "market_data_provider", "massive"),
+        stocks="stocks" in products,
+        indices=bool({"indices", "index"} & products),
+        forex=bool({"currencies", "forex", "fx"} & products),
+        futures="futures" in products,
+        macro_series=bool({"macro_series", "macro"} & products),
+    )
+
+
+def _market_data_stocks_endpoint_only(runtime: Runtime) -> bool:
+    products = market_data_capabilities(runtime)
+    return not (products.indices or products.forex or products.futures or products.macro_series)
+
+
 async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:
     tasks = await runtime.blackboard.list_models(event.run_id, "tasks", ResearchTask)
     task = next((value for value in tasks if str(value.id) == event.payload.get("task_id")), None)
@@ -1282,12 +1425,21 @@ async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:
             run = await runtime.blackboard.get_run(event.run_id)
 
             async def fetch_candidate(candidate):
-                return await runtime.tools.market_data(task.run_id, candidate.symbol)
+                try:
+                    return await runtime.tools.market_data(
+                        task.run_id,
+                        candidate.symbol,
+                        product=candidate.endpoint_family,
+                    )
+                except TypeError:
+                    return await runtime.tools.market_data(task.run_id, candidate.symbol)
 
             snapshot_result = await get_market_snapshot(
                 f"{branch} {task.title}",
                 f"{run.question if run else ''} {task.question}",
                 fetch_market_data=fetch_candidate,
+                capabilities=market_data_capabilities(runtime),
+                stocks_endpoint_only=_market_data_stocks_endpoint_only(runtime),
             )
             if isinstance(snapshot_result, MarketDataGap):
                 await persist_market_data_gap(runtime, task, branch, snapshot_result)
@@ -1423,15 +1575,18 @@ async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:
         priority=7,
         producer="tool-runner",
     )
-    emit(
-        runtime,
-        EventType.OBSERVATION_CREATED,
-        task.run_id,
-        "tool-runner",
-        observation_id=str(observation.id),
-    )
+    if task.tool == "web_search":
+        emit(
+            runtime,
+            EventType.OBSERVATION_CREATED,
+            task.run_id,
+            "tool-runner",
+            observation_id=str(observation.id),
+        )
     await evaluate_principal_policy_safely(
-        runtime, task.run_id, trigger="observation.created"
+        runtime,
+        task.run_id,
+        trigger="observation.created" if task.tool == "web_search" else "market_snapshot.created",
     )
 
 
@@ -1448,6 +1603,18 @@ def is_data_gap_observation(observation: Observation, artifacts: list[Artifact])
             or "market_data_gap" in artifact.tags
             or "tool_failure" in artifact.tags
         )
+        for artifact in artifacts
+    )
+
+
+def is_market_snapshot_observation(observation: Observation, artifacts: list[Artifact]) -> bool:
+    summary = observation.summary.casefold()
+    if summary.startswith("marketsnapshot for "):
+        return True
+    return any(
+        artifact.legacy_object_type == "observation"
+        and artifact.legacy_object_id == observation.id
+        and ("market_snapshot" in artifact.tags or "tool:market_data" in artifact.tags)
         for artifact in artifacts
     )
 
@@ -1547,16 +1714,14 @@ async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
             runtime, event.run_id, trigger="claim.skipped_data_gap"
         )
         return
-    claim: Claim
-    if _market_snapshot_claim_statement(observation):
-        claim = _fallback_claim(event, observation, branch)
+    if is_market_snapshot_observation(observation, observation_artifacts):
         await persist_action(
             runtime,
             event.run_id,
-            PrincipalActionType.REQUEST_VERIFICATION,
+            PrincipalActionType.ASSIGN_TASK,
             (
-                "Created deterministic factual claim from market snapshot; skipped LLM "
-                "claim extraction to avoid causal overreach."
+                "Skipped claim extraction for market snapshot observation; snapshots are "
+                "context-only market data and must not be sent to normal claim verification."
             ),
             required_role="research_agent",
             target_branch=branch,
@@ -1564,54 +1729,58 @@ async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
             priority=4,
             producer="worker-agents",
         )
-    else:
-        try:
-            result = await runtime.llm.json(
-                event.run_id,
-                AgentRole.RESEARCH,
-                "claim-extractor",
-                SYSTEM,
-                f"Create one narrow, verifiable claim supported only by this observation. "
-                f"Do not create portfolio advice, causal claims, or claims about data "
-                f"availability unless directly stated by a source. "
-                f'Return {{"statement":"...","confidence":0.0}}. Observation: '
-                f"{observation.summary}",
-            )
-            claim = Claim(
-                run_id=event.run_id,
-                task_id=observation.task_id,
-                statement=compact_text(text_from_model_field(result["statement"]), max_chars=700),
-                confidence=score_from_model_field(result["confidence"]),
-                evidence_observation_ids=[observation.id],
-                sources=observation.sources,
-            )
-        except BudgetExceeded:
+        await evaluate_principal_policy_safely(
+            runtime, event.run_id, trigger="claim.skipped_market_snapshot"
+        )
+        return
+    claim: Claim
+    try:
+        result = await runtime.llm.json(
+            event.run_id,
+            AgentRole.RESEARCH,
+            "claim-extractor",
+            SYSTEM,
+            f"Create one narrow, verifiable claim supported only by this observation. "
+            f"Do not create portfolio advice, causal claims, or claims about data "
+            f"availability unless directly stated by a source. "
+            f'Return {{"statement":"...","confidence":0.0}}. Observation: '
+            f"{observation.summary}",
+        )
+        claim = Claim(
+            run_id=event.run_id,
+            task_id=observation.task_id,
+            statement=compact_text(text_from_model_field(result["statement"]), max_chars=700),
+            confidence=score_from_model_field(result["confidence"]),
+            evidence_observation_ids=[observation.id],
+            sources=observation.sources,
+        )
+    except BudgetExceeded:
+        raise
+    except Exception as exc:
+        if is_transient_failure(exc):
             raise
-        except Exception as exc:
-            if is_transient_failure(exc):
-                raise
-            if not task:
-                raise
-            if not isinstance(exc, (LLMOutputError, KeyError, TypeError, ValueError)):
-                await fail_task(
-                    runtime, task, branch, "claim_generation", exc, producer="worker-agents"
-                )
-                return
-            claim = _fallback_claim(event, observation, branch)
-            await persist_action(
-                runtime,
-                event.run_id,
-                PrincipalActionType.REQUEST_VERIFICATION,
-                (
-                    "Claim extraction model returned invalid output; created deterministic "
-                    f"fallback claim instead of failing the task: {concise_exception(exc)}"
-                ),
-                required_role="research_agent",
-                target_branch=branch,
-                expected_information_gain=InformationGain.LOW,
-                priority=4,
-                producer="worker-agents",
+        if not task:
+            raise
+        if not isinstance(exc, (LLMOutputError, KeyError, TypeError, ValueError)):
+            await fail_task(
+                runtime, task, branch, "claim_generation", exc, producer="worker-agents"
             )
+            return
+        claim = _fallback_claim(event, observation, branch)
+        await persist_action(
+            runtime,
+            event.run_id,
+            PrincipalActionType.REQUEST_VERIFICATION,
+            (
+                "Claim extraction model returned invalid output; created deterministic "
+                f"fallback claim instead of failing the task: {concise_exception(exc)}"
+            ),
+            required_role="research_agent",
+            target_branch=branch,
+            expected_information_gain=InformationGain.LOW,
+            priority=4,
+            producer="worker-agents",
+        )
     await runtime.blackboard.put_claim(claim)
     depends_on = [
         value.id
@@ -2533,6 +2702,11 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
     run = await runtime.blackboard.get_run(event.run_id)
     if not run:
         return
+    if unchecked_claims and _has_verification_capacity(run):
+        await evaluate_principal_policy_safely(
+            runtime, event.run_id, trigger="aggregate.unverified_claims"
+        )
+        return
     agent_specs = await runtime.blackboard.list_models(event.run_id, "agent_specs", AgentSpec)
     aggregator_spec = next(
         (
@@ -2870,6 +3044,10 @@ def _is_caveated_evidence_artifact(
     artifact: Artifact,
     non_verified_claim_ids: set[UUID],
 ) -> bool:
+    if artifact.artifact_type == ArtifactType.OBSERVATION and (
+        "market_snapshot" in artifact.tags or "tool:market_data" in artifact.tags
+    ):
+        return True
     if artifact.artifact_type not in {ArtifactType.CLAIM, ArtifactType.VERIFICATION}:
         return False
     if artifact.status != ArtifactStatus.VERIFIED:
@@ -2927,6 +3105,7 @@ def _no_verified_evidence_answer(
     partially_supported_lines = _partially_supported_fact_lines(
         claims, verifications, artifacts
     )
+    unassessed_due_to_capacity = _unassessed_claim_lines_due_to_capacity(run, claims, verifications)
     caveats = _verification_caveats(verifications)
     if not caveats:
         caveats = [
@@ -2968,6 +3147,13 @@ def _no_verified_evidence_answer(
                 ]
             ),
             "",
+            "## Unassessed claims due to capacity exhaustion",
+            "",
+            *(
+                unassessed_due_to_capacity
+                or ["- None. All normal candidate claims were assessed before this final."]
+            ),
+            "",
             "## Main evidence gaps",
             "",
             *[f"- {_compact_text(caveat, 240)}" for caveat in caveats[:8]],
@@ -2982,6 +3168,21 @@ def _no_verified_evidence_answer(
             "No personalized investment advice.",
         ]
     )
+
+
+def _unassessed_claim_lines_due_to_capacity(
+    run: Run,
+    claims: list[Claim],
+    verifications: list[Verification],
+) -> list[str]:
+    if run.budget.tools.tavily_credits_used < run.budget.tools.tavily_max_credits:
+        return []
+    checked_ids = {verification.claim_id for verification in verifications}
+    return [
+        f"- {_compact_text(claim.statement, 220)}"
+        for claim in claims
+        if claim.id not in checked_ids
+    ][:10]
 
 
 def _partially_supported_fact_lines(

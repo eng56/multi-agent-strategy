@@ -868,6 +868,9 @@ def test_execute_tool_market_data_path_uses_deterministic_snapshot() -> None:
     assert {"market_snapshot", "tool:market_data", "market:equities"}.issubset(
         set(rt.blackboard.artifacts[-1].tags)
     )
+    assert rt.blackboard.claims == []
+    assert not any(event.type == EventType.OBSERVATION_CREATED for _topic, event in rt.published)
+    assert run.budget.tools.tavily_credits_used == 0
 
 
 def test_execute_tool_market_data_gap_creates_artifact_without_observation_event() -> None:
@@ -990,6 +993,49 @@ def test_market_data_tasks_use_branch_grounded_symbols_despite_global_bond_quest
     assert any("selected UUP" in summary for summary in summaries)
     assert any("selected GLD" in summary for summary in summaries)
     assert any("selected TLT" in summary for summary in summaries)
+
+
+def test_explicit_research_task_branch_overrides_text_inference_for_market_data() -> None:
+    run = Run(
+        question="Compare U.S. equities and long-duration bonds.",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget(market_data_max_requests=1)),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="Long-duration bond market data",
+        question="Fetch TLT data, but this task is explicitly the equities branch.",
+        tool="market_data",
+        branch="market/equities",
+    )
+    rt = runtime(run, QueueLLM())
+    rt.blackboard.tasks.append(task)
+
+    class RecordingMarketDataTools(FakeTools):
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def market_data(self, _run_id, ticker):
+            self.calls.append(ticker)
+            return {"ticker": ticker, "results": [{"c": 1}], "resultsCount": 1}
+
+    tools = RecordingMarketDataTools()
+    rt.tools = tools
+
+    asyncio.run(
+        execute_tool(
+            rt,
+            EventEnvelope(
+                type=EventType.TASK_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"task_id": str(task.id)},
+            ),
+        )
+    )
+
+    assert tools.calls == ["SPY"]
+    assert rt.blackboard.artifacts[-1].branch == "market/equities"
 
 
 def test_execute_tool_web_search_creates_evidence_observation_with_agent_branch() -> None:
@@ -1224,7 +1270,7 @@ def test_create_claim_falls_back_when_claim_extractor_returns_invalid_json() -> 
     )
 
 
-def test_create_claim_uses_factual_market_snapshot_claim_without_llm() -> None:
+def test_create_claim_skips_market_snapshot_observation_without_claim_or_verification() -> None:
     run = Run(
         question="What happens to long-duration bonds if the Fed cuts faster?",
         models=model_policy(),
@@ -1279,10 +1325,13 @@ def test_create_claim_uses_factual_market_snapshot_claim_without_llm() -> None:
     )
 
     assert llm.calls == []
-    claim = rt.blackboard.claims[0]
-    assert "selected TLT (etf) via massive/stocks" in claim.statement
-    assert "latest available close/price was 85.45" in claim.statement
-    assert "does not establish Fed-cut causality" in claim.statement
+    assert rt.blackboard.claims == []
+    assert not any(event.type == EventType.CLAIM_CREATED for _topic, event in rt.published)
+    assert any(
+        action.action_type == PrincipalActionType.ASSIGN_TASK
+        and "Skipped claim extraction for market snapshot" in action.reason
+        for action in rt.blackboard.actions
+    )
 
 
 def test_verify_claim_dual_writes_verification_artifact() -> None:
@@ -1893,12 +1942,13 @@ def test_aggregator_requests_zero_verified_followup_before_deterministic_final()
     assert llm.calls == []
     assert rt.blackboard.final is None
     followups = [task for task in rt.blackboard.tasks if task.wave_number == 1]
-    assert len(followups) == 4
-    followup_titles = {task.title for task in followups}
-    assert "Follow-up: atomic disputed claims" in followup_titles
-    assert "Follow-up: primary dated sources" in followup_titles
-    assert "Follow-up: contradiction search" in followup_titles
-    assert "Follow-up: retry failed claim generation" in followup_titles
+    assert len(followups) == 2
+    followup_branches = {task.branch for task in followups}
+    assert followup_branches == {"macro/rates", "market/equities"}
+    assert all(task.title.startswith("Evidence repair:") for task in followups)
+    assert all("split broad claims into atomic claims" in task.question for task in followups)
+    assert all("search primary/date-bearing sources" in task.question for task in followups)
+    assert all("run contradiction search" in task.question for task in followups)
     assert any(
         action.action_type == PrincipalActionType.REQUEST_FOLLOWUP
         and action.status == ActionStatus.EXECUTED
@@ -1911,6 +1961,82 @@ def test_aggregator_requests_zero_verified_followup_before_deterministic_final()
     published_types = [event.type for _topic, event in rt.published]
     assert EventType.FOLLOWUP_REQUESTED in published_types
     assert published_types.count(EventType.TASK_CREATED) >= len(followups)
+
+
+def test_zero_verified_repair_tasks_are_distributed_across_failed_branches() -> None:
+    run = Run(
+        question=(
+            "If the Fed signals faster rate cuts, compare macro rates, U.S. equities, "
+            "the U.S. dollar, gold, and long-duration bonds."
+        ),
+        models=model_policy(),
+        budget=Budget(limit_usd=5, tools=ToolBudget(tavily_max_credits=20, tavily_credits_used=4)),
+    )
+    branches = ["macro/rates", "market/equities", "market/fx", "market/gold"]
+    tasks = [
+        ResearchTask(
+            run_id=run.id,
+            title=f"{branch} evidence",
+            question=f"Find evidence for {branch}",
+            tool="web_search",
+            branch=branch,
+            status="completed",
+        )
+        for branch in branches
+    ]
+    claims = [
+        Claim(
+            run_id=run.id,
+            task_id=task.id,
+            statement=f"Broad unsupported claim for {task.branch}.",
+            evidence_observation_ids=[uuid4()],
+            confidence=0.7,
+        )
+        for task in tasks
+    ]
+    verifications = [
+        Verification(
+            run_id=run.id,
+            claim_id=claim.id,
+            verdict="uncertain",
+            rationale="Too broad.",
+            confidence=0.4,
+            unsupported_parts=[f"Unsupported part for {task.branch}"],
+            required_caveats=[f"Caveat for {task.branch}"],
+            source_quality_summary="No dated primary source.",
+        )
+        for task, claim in zip(tasks, claims)
+    ]
+    artifacts = [
+        Artifact(
+            run_id=run.id,
+            artifact_type=ArtifactType.CLAIM,
+            branch=task.branch,
+            text_or_summary=claim.statement,
+            status=ArtifactStatus.DISPUTED,
+            legacy_object_type="claim",
+            legacy_object_id=claim.id,
+        )
+        for task, claim in zip(tasks, claims)
+    ]
+    rt = runtime(run, QueueLLM({"answer": "This should not be called."}))
+    rt.blackboard.tasks.extend(tasks)
+    rt.blackboard.claims.extend(claims)
+    rt.blackboard.verifications.extend(verifications)
+    rt.blackboard.artifacts.extend(artifacts)
+
+    asyncio.run(
+        aggregate(rt, EventEnvelope(type=EventType.CLAIM_VERIFIED, run_id=run.id, producer="test"))
+    )
+
+    repair_tasks = [task for task in rt.blackboard.tasks if task.wave_number == 1]
+    repair_branches = {task.branch for task in repair_tasks}
+    assert len(repair_tasks) == 4
+    assert len(repair_branches) >= 3
+    assert "market/gold" in repair_branches
+    assert repair_branches != {"market/gold"}
+    assert all(task.branch for task in repair_tasks)
+    assert rt.blackboard.final is None
 
 
 def test_aggregator_writes_deterministic_final_after_zero_verified_followup_wave() -> None:
@@ -2071,6 +2197,8 @@ def test_forced_evidence_limited_final_links_unverified_claim_sources_when_capac
     assert rt.blackboard.final is not None
     assert rt.blackboard.final.partial is True
     assert rt.blackboard.final.sources == ["https://example.com/gold-source"]
+    assert "Unassessed claims due to capacity exhaustion" in rt.blackboard.final.answer
+    assert "Gold moved on rate-cut expectations" in rt.blackboard.final.answer
     final_artifact = next(
         artifact
         for artifact in rt.blackboard.artifacts
@@ -2078,6 +2206,56 @@ def test_forced_evidence_limited_final_links_unverified_claim_sources_when_capac
     )
     assert final_artifact.source_refs == ["https://example.com/gold-source"]
     assert final_artifact.depends_on_artifact_ids == [claim_artifact.id]
+
+
+def test_forced_aggregation_does_not_finalize_with_unverified_claims_when_capacity_remains() -> None:
+    run = Run(
+        question="What happens if the Fed cuts faster than expected?",
+        models=model_policy(),
+        budget=Budget(
+            limit_usd=5,
+            tools=ToolBudget(tavily_max_credits=20, tavily_credits_used=1),
+        ),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="FX evidence",
+        question="Find evidence for USD.",
+        tool="web_search",
+        status="completed",
+        branch="market/fx",
+    )
+    claim = Claim(
+        run_id=run.id,
+        task_id=task.id,
+        statement="USD weakens when Fed cuts faster.",
+        evidence_observation_ids=[uuid4()],
+        sources=["https://example.com/usd"],
+        confidence=0.6,
+    )
+    rt = runtime(run, QueueLLM({"answer": "This should not be called."}))
+    rt.blackboard.tasks.append(task)
+    rt.blackboard.claims.append(claim)
+
+    asyncio.run(
+        aggregate(
+            rt,
+            EventEnvelope(
+                type=EventType.CLAIM_VERIFIED,
+                run_id=run.id,
+                producer="test",
+                payload={"force": True},
+            ),
+        )
+    )
+
+    assert rt.blackboard.final is None
+    assert any(
+        action.action_type == PrincipalActionType.REQUEST_VERIFICATION
+        and action.status == ActionStatus.EXECUTED
+        for action in rt.blackboard.actions
+    )
+    assert any(event.type == EventType.CLAIM_CREATED for _topic, event in rt.published)
 
 
 def test_aggregation_prompt_consumes_skeptic_counterargument_artifact() -> None:

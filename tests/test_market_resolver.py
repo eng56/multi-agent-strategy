@@ -72,8 +72,8 @@ def test_us_equities_adds_growth_and_small_cap_proxies_when_requested() -> None:
     assert symbols(candidates) == ["SPY", "QQQ", "IWM"]
 
 
-def test_tlt_maps_to_tlt() -> None:
-    candidates = resolve_instruments("macro/rates", "Long-duration bond TLT data")
+def test_market_bonds_maps_to_tlt() -> None:
+    candidates = resolve_instruments("market/bonds", "Long-duration bond TLT data")
 
     assert symbols(candidates) == ["TLT"]
     assert candidates[0].asset_class == AssetClass.ETF
@@ -81,7 +81,7 @@ def test_tlt_maps_to_tlt() -> None:
 
 
 def test_rates_do_not_use_stock_endpoint() -> None:
-    candidates = resolve_instruments("macro/rates", "Fed funds and yield curve evidence")
+    candidates = resolve_instruments("macro/rates", "Fed funds, yield curve, and TLT evidence")
 
     assert candidates == []
 

@@ -50,6 +50,13 @@ ACTIVE_EXECUTOR_ACTIONS = {
     PrincipalActionType.REQUEST_FOLLOWUP,
     PrincipalActionType.STOP_RUN,
 }
+SAFE_SHADOW_ACTIVE_ACTIONS = {
+    PrincipalActionType.ASSIGN_TASK,
+    PrincipalActionType.REQUEST_VERIFICATION,
+    PrincipalActionType.REQUEST_AGGREGATION,
+    PrincipalActionType.REQUEST_FOLLOWUP,
+    PrincipalActionType.STOP_RUN,
+}
 
 
 @dataclass(frozen=True)
@@ -83,16 +90,20 @@ async def evaluate_principal_policy(
         current_phase=phase,
         wave_number=wave_number,
     )
-    if equivalent_proposed_action_exists(
+    safe_shadow_active = mode == "shadow" and is_safe_shadow_active_candidate(
+        runtime_snapshot.snapshot, selected
+    )
+    has_equivalent_proposed = equivalent_proposed_action_exists(
         runtime_snapshot.all_actions,
         selected,
         current_phase=phase,
         wave_number=wave_number,
         idempotency_key=idempotency_key,
-    ):
+    )
+    if has_equivalent_proposed and not safe_shadow_active:
         return None
 
-    if mode == "active":
+    if mode == "active" or safe_shadow_active:
         return await persist_active_action(
             runtime,
             runtime_snapshot.snapshot,
@@ -120,6 +131,32 @@ async def evaluate_principal_policy(
         shadow_action.action_type,
     )
     return shadow_action
+
+
+def is_safe_shadow_active_candidate(
+    snapshot: PrincipalSnapshot, selected: PrincipalAction
+) -> bool:
+    if selected.action_type not in SAFE_SHADOW_ACTIVE_ACTIONS:
+        return False
+    capacity = snapshot.run_state.capacity
+    if selected.action_type in {
+        PrincipalActionType.REQUEST_VERIFICATION,
+        PrincipalActionType.REQUEST_FOLLOWUP,
+    } and capacity and capacity.search_exhausted:
+        return False
+    if selected.action_type == PrincipalActionType.ASSIGN_TASK:
+        return selected.reason.startswith("No research tasks exist") or (
+            "observation(s) have no extracted claim" in selected.reason
+        )
+    if selected.action_type == PrincipalActionType.REQUEST_VERIFICATION:
+        return first_unverified_claim(snapshot) is not None
+    if selected.action_type == PrincipalActionType.REQUEST_AGGREGATION:
+        return should_dispatch_aggregation(snapshot)
+    if selected.action_type == PrincipalActionType.REQUEST_FOLLOWUP:
+        return True
+    if selected.action_type == PrincipalActionType.STOP_RUN:
+        return not useful_action_remains(snapshot)
+    return False
 
 
 async def load_principal_snapshot(
@@ -313,6 +350,8 @@ async def execute_principal_decision(
         return False
 
     if action.action_type == PrincipalActionType.ASSIGN_TASK:
+        if "observation(s) have no extracted claim" in action.reason:
+            return execute_claim_extraction_assignment(runtime, snapshot, action)
         return await execute_assign_task(runtime, snapshot, action)
 
     if (
@@ -399,10 +438,20 @@ async def execute_assign_task(
 async def execute_followup(
     runtime: Runtime, snapshot: PrincipalSnapshot, action: PrincipalAction
 ) -> bool:
-    if not snapshot.final:
-        return False
     if dispatch_already_executed(snapshot, action):
         return False
+
+    if not snapshot.final:
+        from src.agents.workflow import request_zero_verified_followup_wave
+
+        created = await request_zero_verified_followup_wave(
+            runtime,
+            snapshot.run,
+            tasks=snapshot.tasks,
+            claims=snapshot.claims,
+            verifications=snapshot.verifications,
+        )
+        return created > 0
 
     from src.agents.workflow import (
         followup_already_requested,
@@ -478,11 +527,70 @@ def matching_pending_task(
     return None
 
 
+def execute_claim_extraction_assignment(
+    runtime: Runtime, snapshot: PrincipalSnapshot, action: PrincipalAction
+) -> bool:
+    observation = first_observation_without_claim(snapshot)
+    if not observation:
+        return False
+    publish(
+        runtime,
+        EventType.OBSERVATION_CREATED,
+        action.run_id,
+        observation_id=str(observation.id),
+    )
+    return True
+
+
+def first_observation_without_claim(snapshot: PrincipalSnapshot) -> Observation | None:
+    claimed_observation_ids = {
+        observation_id
+        for claim in snapshot.claims
+        for observation_id in claim.evidence_observation_ids
+    }
+    return next(
+        (
+            observation
+            for observation in snapshot.observations
+            if observation.id not in claimed_observation_ids
+            and observation.tool != "market_data"
+            and not observation.summary.casefold().startswith("marketsnapshot for ")
+        ),
+        None,
+    )
+
+
 def first_unverified_claim(snapshot: PrincipalSnapshot) -> Claim | None:
     verified_claim_ids = {verification.claim_id for verification in snapshot.verifications}
+    claim_artifact_by_id = {
+        artifact.legacy_object_id: artifact
+        for artifact in snapshot.artifacts
+        if artifact.artifact_type == ArtifactType.CLAIM
+        and artifact.legacy_object_type == "claim"
+        and artifact.legacy_object_id is not None
+    }
     return next(
-        (claim for claim in snapshot.claims if claim.id not in verified_claim_ids),
+        (
+            claim
+            for claim in snapshot.claims
+            if claim.id not in verified_claim_ids
+            and not is_market_snapshot_context_claim(claim, claim_artifact_by_id.get(claim.id))
+        ),
         None,
+    )
+
+
+def is_market_snapshot_context_claim(claim: Claim, artifact: Artifact | None) -> bool:
+    text = claim.statement.casefold()
+    if text.startswith("market data snapshot") or text.startswith("marketsnapshot"):
+        return True
+    return bool(
+        artifact
+        and (
+            "market_snapshot" in artifact.tags
+            or "context_only" in artifact.tags
+            or "tool:market_data" in artifact.tags
+        )
     )
 
 

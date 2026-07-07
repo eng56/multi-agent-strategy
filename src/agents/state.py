@@ -8,6 +8,7 @@ from src.common.models import (
     ArtifactStatus,
     ArtifactType,
     BudgetSummary,
+    CapacitySummary,
     Claim,
     DeadLetterRecord,
     FinalReport,
@@ -80,6 +81,12 @@ def infer_semantic_branch(text: str, fallback: str = "research/general") -> str:
 
 
 def branch_for_task(task: ResearchTask, agent_specs: list[AgentSpec] | None = None) -> str:
+    if task.branch:
+        return task.branch
+    if task.agent_spec_id:
+        for spec in agent_specs or []:
+            if spec.id == task.agent_spec_id:
+                return spec.branch
     inferred = infer_semantic_branch(f"{task.title} {task.question}", fallback="")
     if inferred:
         for spec in agent_specs or []:
@@ -158,11 +165,16 @@ def build_run_state(
     phase = _phase(run, tasks, claims, verifications, final)
     active_branches = _active_branches(tasks, agent_specs, artifacts, organization_plan)
     budget_summary = build_budget_summary(run, tasks, final)
+    capacity = build_capacity_summary(run, budget_summary)
     budget_remaining = budget_summary.remaining_usd
     stop_reasons = []
     if run.failure_reason:
         stop_reasons.append(run.failure_reason)
     for reason in budget_summary.stop_reasons:
+        if reason not in stop_reasons:
+            stop_reasons.append(reason)
+    if _search_exhausted_before_verification(run, claims, verifications):
+        reason = "Search/tool budget exhausted before enough claims passed verification."
         if reason not in stop_reasons:
             stop_reasons.append(reason)
     if final and final.partial:
@@ -189,6 +201,7 @@ def build_run_state(
         disputed_claim_count=len(uncertain_ids | disputed_artifact_ids),
         coverage_by_topic=coverage_by_topic,
         budget_summary=budget_summary,
+        capacity=capacity,
         budget_remaining=budget_remaining,
         tool_budget_remaining={
             key: value.remaining for key, value in budget_summary.tool_usage.items()
@@ -213,6 +226,8 @@ def build_run_state(
         principal_actions,
         observations,
     )
+    if state.capacity:
+        state.capacity.useful_action_available = bool(state.next_action_candidates)
     return state
 
 
@@ -262,6 +277,46 @@ def build_budget_summary(
     )
 
 
+def build_capacity_summary(run: Run, budget_summary: BudgetSummary) -> CapacitySummary:
+    role_spent = budget_summary.role_spent_usd
+    role_reserved = budget_summary.role_reserved_usd
+    role_protected = budget_summary.role_protected_usd
+
+    def role_remaining(role: AgentRole) -> float:
+        policy = getattr(run.models, role.value, None)
+        cap = policy.cap_usd if policy and policy.cap_usd is not None else run.budget.limit_usd
+        return max(
+            0.0,
+            float(cap)
+            - role_spent.get(role.value, 0.0)
+            - role_reserved.get(role.value, 0.0),
+        )
+
+    def protected_remaining(role: AgentRole) -> float:
+        protected = role_protected.get(role.value, 0.0)
+        return max(
+            0.0,
+            protected
+            - role_spent.get(role.value, 0.0)
+            - role_reserved.get(role.value, 0.0),
+        )
+
+    tavily = budget_summary.tool_usage.get("tavily_credits")
+    market = budget_summary.tool_usage.get("market_data_requests")
+    tavily_remaining = tavily.remaining if tavily else 0
+    market_remaining = market.remaining if market else 0
+    return CapacitySummary(
+        llm_remaining_usd=budget_summary.remaining_usd,
+        tavily_remaining=tavily_remaining,
+        market_data_remaining=market_remaining,
+        verifier_budget_remaining=role_remaining(AgentRole.VERIFIER),
+        aggregator_budget_protected_remaining=protected_remaining(AgentRole.AGGREGATOR),
+        judge_budget_protected_remaining=protected_remaining(AgentRole.JUDGE),
+        search_exhausted=tavily_remaining <= 0,
+        market_data_exhausted=market_remaining <= 0,
+    )
+
+
 def _role_amounts(values: dict[AgentRole, float]) -> dict[str, float]:
     amounts = {role.value: float(values.get(role, values.get(role.value, 0))) for role in BUDGET_SUMMARY_ROLES}
     for key, value in values.items():
@@ -302,6 +357,22 @@ def _budget_stop_reasons(
             suffix += f"; {len(skipped_tasks) - 3} more"
         reasons.append(f"{len(skipped_tasks)} task(s) skipped due to budget: {suffix}")
     return reasons
+
+
+def _search_exhausted_before_verification(
+    run: Run,
+    claims: list[Claim],
+    verifications: list[Verification],
+) -> bool:
+    if run.budget.tools.tavily_credits_used < run.budget.tools.tavily_max_credits:
+        return False
+    if (run.budget.limit_usd - run.budget.spent_usd - run.budget.reserved_usd) <= 0:
+        return False
+    verified_ids = {
+        verification.claim_id for verification in verifications if verification.verdict == "verified"
+    }
+    checked_ids = {verification.claim_id for verification in verifications}
+    return not verified_ids or any(claim.id not in checked_ids for claim in claims)
 
 
 def max_task_wave(tasks: list[ResearchTask]) -> int:
