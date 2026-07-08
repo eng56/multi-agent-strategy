@@ -1147,6 +1147,94 @@ def test_create_claim_dual_writes_claim_artifact() -> None:
     assert artifact.depends_on_artifact_ids
 
 
+def test_create_claim_generates_multiple_atomic_asset_specific_claims() -> None:
+    run = Run(
+        question="What happens to rates, gold, and equities if the Fed cuts faster?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="Cross-asset Fed cuts",
+        question="Fed cuts and market reactions",
+        tool="web_search",
+        branch="macro/rates",
+    )
+    observation = Observation(
+        run_id=run.id,
+        task_id=task.id,
+        tool="web_search",
+        summary=(
+            "Lower expected policy rates can reduce Treasury yields, support gold "
+            "through lower real yields, and help equities through lower discount rates "
+            "unless cuts signal a growth scare."
+        ),
+        artifact=ArtifactPointer(uri="gs://bucket/raw.json", size_bytes=2, sha256="0" * 64),
+        sources=["https://www.federalreserve.gov/monetarypolicy"],
+    )
+    llm = QueueLLM(
+        {
+            "claims": [
+                {
+                    "statement": "Lower expected Fed policy rates tend to reduce front-end Treasury yields, all else equal.",
+                    "claim_type": "mechanism",
+                    "asset": "rates",
+                    "direction": "down",
+                    "time_horizon": "unspecified",
+                    "confidence": 0.72,
+                },
+                {
+                    "statement": "Lower real yields tend to support gold by reducing the opportunity cost of holding a non-yielding asset.",
+                    "claim_type": "mechanism",
+                    "asset": "gold",
+                    "direction": "up",
+                    "time_horizon": "unspecified",
+                    "confidence": 0.7,
+                },
+                {
+                    "statement": "U.S. equities can benefit from lower discount rates, but growth-scare cuts can offset that effect through weaker earnings expectations.",
+                    "claim_type": "market_reaction",
+                    "asset": "equities",
+                    "direction": "mixed",
+                    "time_horizon": "unspecified",
+                    "confidence": 0.66,
+                },
+            ]
+        }
+    )
+    rt = runtime(run, llm)
+    rt.blackboard.tasks.append(task)
+    rt.blackboard.observations.append(observation)
+    rt.blackboard.artifacts.append(
+        Artifact(
+            run_id=run.id,
+            artifact_type=ArtifactType.OBSERVATION,
+            branch="macro/rates",
+            text_or_summary=observation.summary,
+            legacy_object_type="observation",
+            legacy_object_id=observation.id,
+        )
+    )
+
+    asyncio.run(
+        create_claim(
+            rt,
+            EventEnvelope(
+                type=EventType.OBSERVATION_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"observation_id": str(observation.id)},
+            ),
+        )
+    )
+
+    assert len(rt.blackboard.claims) == 3
+    assert {claim.asset for claim in rt.blackboard.claims} == {"rates", "gold", "equities"}
+    assert all(len(claim.statement) < 180 for claim in rt.blackboard.claims)
+    assert all(claim.claim_type in {"mechanism", "market_reaction"} for claim in rt.blackboard.claims)
+    assert sum(event.type == EventType.CLAIM_CREATED for _topic, event in rt.published) == 3
+
+
 def test_create_claim_skips_data_gap_observation() -> None:
     run = Run(
         question="Will gold rise if the Fed cuts rates?",
@@ -1223,7 +1311,10 @@ def test_create_claim_falls_back_when_claim_extractor_returns_invalid_json() -> 
         id=observation_id,
         run_id=run.id,
         task_id=task.id,
-        summary="EvidenceEngine observation for branch market/equities: 5 source(s).",
+        summary=(
+            "Equities can benefit from lower discount rates after Fed cuts, while "
+            "growth-scare cuts can pressure earnings expectations."
+        ),
         sources=["https://example.com/equities"],
     )
     llm = QueueLLM(
@@ -1269,7 +1360,7 @@ def test_create_claim_falls_back_when_claim_extractor_returns_invalid_json() -> 
     )
 
 
-def test_create_claim_replaces_source_meta_model_output_with_mechanism_claim() -> None:
+def test_create_claim_skips_source_meta_observation_without_claim() -> None:
     run = Run(
         question="What happens to equities if the Fed cuts faster?",
         models=model_policy(),
@@ -1312,14 +1403,11 @@ def test_create_claim_replaces_source_meta_model_output_with_mechanism_claim() -
         )
     )
 
-    assert len(rt.blackboard.claims) == 1
-    claim = rt.blackboard.claims[0]
-    assert "EvidenceEngine retrieval" not in claim.statement
-    assert "missing publication dates" not in claim.statement
-    assert claim.statement.startswith("Equities can benefit from easier expected policy")
+    assert rt.blackboard.claims == []
+    assert llm.calls == []
     assert any(
         action.action_type == PrincipalActionType.REQUEST_VERIFICATION
-        and "source/provider metadata" in action.reason
+        and "Skipped claim extraction for source/provider metadata" in action.reason
         for action in rt.blackboard.actions
     )
 
@@ -1656,6 +1744,68 @@ def test_verify_claim_contradiction_downgrades_verified_result_to_uncertain() ->
     assert promoted.status == ArtifactStatus.DISPUTED
 
 
+def test_verify_claim_ignores_non_material_contradiction_text() -> None:
+    run = Run(
+        question="Should I buy SAP stock?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    claim = Claim(
+        run_id=run.id,
+        task_id=uuid4(),
+        statement="SAP backlog is rising.",
+        evidence_observation_ids=[uuid4()],
+        confidence=0.8,
+    )
+    claim_artifact = Artifact(
+        run_id=run.id,
+        artifact_type=ArtifactType.CLAIM,
+        branch="market/equities",
+        text_or_summary=claim.statement,
+        legacy_object_type="claim",
+        legacy_object_id=claim.id,
+    )
+    rt = runtime(
+        run,
+        QueueLLM(
+            {
+                "verdict": "verified",
+                "rationale": "Primary filing support remains intact.",
+                "confidence": 0.78,
+                "supported_parts": ["SAP backlog is rising."],
+                "unsupported_parts": [],
+                "contradictions": ["None material", "No direct contradiction"],
+                "required_caveats": [],
+                "source_quality_summary": "Primary filing support.",
+            }
+        ),
+    )
+    rt.blackboard.claims.append(claim)
+    rt.blackboard.artifacts.append(claim_artifact)
+
+    asyncio.run(
+        verify_claim(
+            rt,
+            EventEnvelope(
+                type=EventType.CLAIM_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"claim_id": str(claim.id)},
+            ),
+        )
+    )
+
+    verification = rt.blackboard.verifications[-1]
+    assert verification.verdict == "verified"
+    assert verification.contradictions == []
+    assert not any(
+        "Verifier identified contradictions" in caveat
+        for caveat in verification.required_caveats
+    )
+    promoted = next(item for item in rt.blackboard.artifacts if item.id == claim_artifact.id)
+    assert promoted.status == ArtifactStatus.VERIFIED
+
+
 def test_verify_claim_partial_support_adds_required_caveat() -> None:
     run = Run(
         question="Should I buy SAP stock?",
@@ -1706,6 +1856,110 @@ def test_verify_claim_partial_support_adds_required_caveat() -> None:
     assert verification.required_caveats
     artifact = rt.blackboard.artifacts[-1]
     assert "Required caveats:" in artifact.text_or_summary
+
+
+def test_verify_claim_promotes_supported_parts_as_reverifiable_subclaims() -> None:
+    run = Run(
+        question="What happens if the Fed cuts faster?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget(tavily_max_credits=10)),
+    )
+    observation_id = uuid4()
+    claim = Claim(
+        run_id=run.id,
+        task_id=uuid4(),
+        statement="Fed cuts lower yields and guarantee a bullish cross-asset outcome.",
+        evidence_observation_ids=[observation_id],
+        sources=["https://www.federalreserve.gov/monetarypolicy"],
+        confidence=0.8,
+        asset="cross_asset",
+    )
+    rt = runtime(
+        run,
+        QueueLLM(
+            {
+                "verdict": "uncertain",
+                "rationale": "Yield direction is supported but the guarantee is not.",
+                "confidence": 0.62,
+                "supported_parts": [
+                    "Lower expected Fed policy rates tend to reduce front-end Treasury yields, all else equal."
+                ],
+                "unsupported_parts": ["The evidence does not support a guaranteed bullish cross-asset outcome."],
+                "contradictions": [],
+                "required_caveats": [],
+                "source_quality_summary": "Primary and institutional sources support the rate mechanism.",
+            },
+            {
+                "verdict": "verified",
+                "rationale": "Primary and institutional evidence support the atomic rate claim.",
+                "confidence": 0.81,
+                "supported_parts": [],
+                "unsupported_parts": [],
+                "contradictions": ["No material contradiction"],
+                "required_caveats": [],
+                "source_quality_summary": "Primary and high_quality_secondary support.",
+            },
+        ),
+    )
+    rt.blackboard.claims.append(claim)
+    rt.blackboard.observations.append(
+        Observation(
+            id=observation_id,
+            run_id=run.id,
+            task_id=claim.task_id,
+            tool="web_search",
+            summary="Fed cut evidence.",
+            artifact=ArtifactPointer(uri="gs://bucket/obs.json", size_bytes=2, sha256="0" * 64),
+            sources=claim.sources,
+        )
+    )
+
+    asyncio.run(
+        verify_claim(
+            rt,
+            EventEnvelope(
+                type=EventType.CLAIM_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"claim_id": str(claim.id)},
+            ),
+        )
+    )
+
+    subclaims = [
+        item for item in rt.blackboard.claims if item.derived_from_verification_id is not None
+    ]
+    assert len(subclaims) == 1
+    subclaim = subclaims[0]
+    assert subclaim.statement.startswith("Lower expected Fed policy rates")
+    assert any(
+        artifact.legacy_object_id == subclaim.id
+        and "supported_part_subclaim" in artifact.tags
+        and artifact.status == ArtifactStatus.UNVERIFIED
+        for artifact in rt.blackboard.artifacts
+    )
+    assert any(
+        event.type == EventType.CLAIM_CREATED
+        and event.payload.get("claim_id") == str(subclaim.id)
+        for _topic, event in rt.published
+    )
+
+    asyncio.run(
+        verify_claim(
+            rt,
+            EventEnvelope(
+                type=EventType.CLAIM_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"claim_id": str(subclaim.id)},
+            ),
+        )
+    )
+
+    assert any(
+        verification.claim_id == subclaim.id and verification.verdict == "verified"
+        for verification in rt.blackboard.verifications
+    )
 
 
 def test_verify_claim_requests_skeptic_when_second_verified_claim_exists() -> None:
@@ -2318,6 +2572,7 @@ def test_evidence_limited_final_runs_judge_before_terminal_stop() -> None:
         run,
         QueueLLM(
             {"diagnostic": "Search exhausted; judge the partial.", "targeted_gaps": []},
+            {"answer": "Caveated diagnostic synthesis: evidence remains partial."},
             {"score": 0.82, "feedback": "Evidence-limited status is clear."},
         ),
     )
@@ -2334,8 +2589,95 @@ def test_evidence_limited_final_runs_judge_before_terminal_stop() -> None:
     assert rt.blackboard.final is not None
     assert rt.blackboard.final.partial is True
     assert rt.blackboard.final.judge_score == 0.82
+    assert [call["name"] for call in rt.llm.calls] == [
+        "evidence-gap-planner",
+        "caveated-partial-aggregator",
+        "judge",
+    ]
+    assert "Conversion quality" in rt.blackboard.final.answer
+    assert "2 Tavily credits produced 0 verified claim(s)" in rt.blackboard.final.answer
+    assert "Judge payoff" in rt.blackboard.final.answer
+    assert "Score: 0.82" in rt.blackboard.final.answer
     assert rt.blackboard.run.status == RunStatus.COMPLETED
     assert any(action.action_type == PrincipalActionType.STOP_RUN for action in rt.blackboard.actions)
+
+
+def test_terminal_partial_final_is_idempotent_and_ignores_late_claim_events() -> None:
+    run = Run(
+        question="What happens if the Fed cuts faster than expected?",
+        models=model_policy(judge_enabled=False),
+        budget=Budget(limit_usd=5, tools=ToolBudget(tavily_max_credits=2, tavily_credits_used=2)),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="Exhausted search repair",
+        question="Find dated primary evidence for faster Fed cuts.",
+        tool="web_search",
+        status="completed",
+    )
+    claim = Claim(
+        run_id=run.id,
+        task_id=task.id,
+        statement="A faster Fed cutting path guarantees a bullish cross-asset outcome.",
+        evidence_observation_ids=[uuid4()],
+        sources=["https://example.com/claim-source"],
+        confidence=0.8,
+    )
+    verification = Verification(
+        run_id=run.id,
+        claim_id=claim.id,
+        verdict="uncertain",
+        rationale="The evidence supports directionality but not the absolute guarantee.",
+        confidence=0.52,
+        supported_parts=["Fed cuts can lower expected short rates."],
+        unsupported_parts=["The guaranteed bullish outcome is not supported."],
+        sources=["https://example.com/verifier-source"],
+    )
+    observation = Observation(
+        run_id=run.id,
+        task_id=task.id,
+        tool="web_search",
+        summary="Lower expected short rates can move yields.",
+        artifact=ArtifactPointer(uri="gs://bucket/raw.json", size_bytes=2, sha256="0" * 64),
+        sources=["https://example.com/source"],
+    )
+    rt = runtime(
+        run,
+        QueueLLM(
+            {"diagnostic": "Search exhausted.", "targeted_gaps": []},
+            {"answer": "Caveated diagnostic synthesis."},
+        ),
+    )
+    rt.blackboard.tasks.append(task)
+    rt.blackboard.claims.append(claim)
+    rt.blackboard.verifications.append(verification)
+    rt.blackboard.observations.append(observation)
+
+    event = EventEnvelope(type=EventType.CLAIM_VERIFIED, run_id=run.id, producer="test")
+    asyncio.run(aggregate(rt, event))
+    asyncio.run(aggregate(rt, event))
+    asyncio.run(
+        create_claim(
+            rt,
+            EventEnvelope(
+                type=EventType.OBSERVATION_CREATED,
+                run_id=run.id,
+                producer="late-test",
+                payload={"observation_id": str(observation.id)},
+            ),
+        )
+    )
+
+    assert rt.blackboard.run.status == RunStatus.COMPLETED
+    assert sum(
+        artifact.artifact_type == ArtifactType.FINAL_REPORT
+        for artifact in rt.blackboard.artifacts
+    ) == 1
+    assert sum(
+        action.action_type == PrincipalActionType.STOP_RUN
+        for action in rt.blackboard.actions
+    ) == 1
+    assert rt.blackboard.claims == [claim]
 
 
 def test_forced_evidence_limited_final_links_unverified_claim_sources_when_capacity_exhausted() -> None:

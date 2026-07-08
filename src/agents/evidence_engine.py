@@ -42,10 +42,32 @@ PRIMARY_SOURCE_DOMAINS = {
 }
 
 HIGH_QUALITY_SECONDARY_DOMAINS = {
-    "imf.org",
-    "worldbank.org",
+    "am.gs",
+    "am.jpmorgan.com",
     "bis.org",
+    "blackrock.com",
+    "bloomberg.com",
+    "citi.com",
+    "fidelity.com",
+    "ft.com",
+    "goldmansachs.com",
+    "imf.org",
+    "ishares.com",
+    "jpmorgan.com",
+    "marketinsights.citi.com",
+    "morningstar.com",
+    "mufgresearch.com",
     "oecd.org",
+    "pimco.com",
+    "reuters.com",
+    "schwab.com",
+    "spglobal.com",
+    "ssga.com",
+    "ubs.com",
+    "usbank.com",
+    "vanguard.com",
+    "worldbank.org",
+    "wsj.com",
 }
 
 MAJOR_NEWS_DOMAINS = {

@@ -228,6 +228,19 @@ def build_run_state(
         last_judge_feedback=final.judge_feedback if final else None,
         dead_letter_count=len(dead_letters),
         stop_reasons=stop_reasons,
+        tavily_used=run.budget.tools.tavily_credits_used,
+        verified_claims=len(verified_ids | verified_artifact_ids),
+        verified_claims_per_10_tavily=_claims_per_10_tavily(
+            len(verified_ids | verified_artifact_ids),
+            run.budget.tools.tavily_credits_used,
+        ),
+        disputed_claims=len(uncertain_ids | disputed_artifact_ids),
+        source_quality_distribution=_source_quality_distribution(verifications, artifacts),
+        claims_created_from_supported_parts=_claims_created_from_supported_parts(
+            claims, artifacts
+        ),
+        aggregator_used=_aggregator_used(final, artifacts, principal_actions),
+        judge_used=_judge_used(final, artifacts),
     )
     state.next_action_candidates = _next_actions(
         state,
@@ -252,6 +265,96 @@ def build_run_state(
             state.capacity.useful_capacity_remaining or useful_candidate_exists
         )
     return state
+
+
+def _claims_per_10_tavily(verified_claim_count: int, tavily_used: int) -> float:
+    if tavily_used <= 0:
+        return 0.0
+    return round((verified_claim_count / tavily_used) * 10, 2)
+
+
+SOURCE_TIER_NAMES = (
+    "primary",
+    "high_quality_secondary",
+    "news",
+    "blog_or_opinion",
+    "unknown",
+    "weak",
+)
+
+
+def _source_quality_distribution(
+    verifications: list[Verification], artifacts: list[Artifact]
+) -> dict[str, int]:
+    counts = {tier: 0 for tier in SOURCE_TIER_NAMES}
+    for verification in verifications:
+        text = verification.source_quality_summary.casefold().replace("-", "_")
+        for tier in SOURCE_TIER_NAMES:
+            found_numbered = False
+            for match in re.finditer(rf"(\d+)\s+{re.escape(tier)}", text):
+                counts[tier] += int(match.group(1))
+                found_numbered = True
+            if not found_numbered and tier in text:
+                counts[tier] += 1
+    for artifact in artifacts:
+        for tag in artifact.tags:
+            if tag.startswith("source_tier:"):
+                tier = tag.split(":", 1)[1]
+                if tier in counts:
+                    counts[tier] += 1
+    return {tier: count for tier, count in counts.items() if count > 0}
+
+
+def _claims_created_from_supported_parts(
+    claims: list[Claim], artifacts: list[Artifact]
+) -> int:
+    derived_claim_ids = {
+        claim.id for claim in claims if claim.derived_from_verification_id is not None
+    }
+    derived_claim_ids.update(
+        artifact.legacy_object_id
+        for artifact in artifacts
+        if artifact.artifact_type == ArtifactType.CLAIM
+        and artifact.legacy_object_type == "claim"
+        and artifact.legacy_object_id is not None
+        and (
+            "supported_part_subclaim" in artifact.tags
+            or "derived_from_supported_parts" in artifact.tags
+        )
+    )
+    return len(derived_claim_ids)
+
+
+def _aggregator_used(
+    final: FinalReport | None,
+    artifacts: list[Artifact],
+    principal_actions: list[PrincipalAction],
+) -> bool:
+    return bool(
+        final
+        or any(
+            artifact.artifact_type in {ArtifactType.FINAL_REPORT, ArtifactType.DATA_GAP}
+            and (
+                artifact.branch == "synthesis/aggregator"
+                or "evidence_gap_planner" in artifact.tags
+                or "caveated_aggregator_synthesis" in artifact.tags
+            )
+            for artifact in artifacts
+        )
+        or any(
+            action.action_type == PrincipalActionType.REQUEST_AGGREGATION
+            and action.status == "executed"
+            for action in principal_actions
+        )
+    )
+
+
+def _judge_used(final: FinalReport | None, artifacts: list[Artifact]) -> bool:
+    return bool(
+        final
+        and final.judge_score is not None
+        or any(artifact.artifact_type == ArtifactType.JUDGE_FEEDBACK for artifact in artifacts)
+    )
 
 
 def apply_budget_utilization(

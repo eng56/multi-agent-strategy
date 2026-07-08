@@ -67,6 +67,19 @@ SYSTEM = (
     "You are a rigorous investment research agent. Return valid JSON only. Never invent sources."
 )
 logger = logging.getLogger(__name__)
+TERMINAL_RUN_STATUSES = {
+    RunStatus.COMPLETED,
+    RunStatus.PARTIAL_BUDGET_EXHAUSTED,
+    RunStatus.FAILED,
+}
+
+
+def is_terminal_run(run: Run | None) -> bool:
+    return bool(run and run.status in TERMINAL_RUN_STATUSES)
+
+
+async def run_is_terminal(runtime: Runtime, run_id: UUID) -> bool:
+    return is_terminal_run(await runtime.blackboard.get_run(run_id))
 
 
 def emit(
@@ -120,6 +133,39 @@ async def persist_action(
     await runtime.blackboard.put_principal_action(action)
     emit(runtime, EventType.PRINCIPAL_ACTION_CREATED, run_id, producer, action_id=str(action.id))
     return action
+
+
+async def persist_stop_action_once(
+    runtime: Runtime,
+    run_id: UUID,
+    reason: str,
+    *,
+    required_role: str | None,
+    target_branch: str | None,
+    expected_information_gain: InformationGain = InformationGain.LOW,
+    priority: int = 4,
+    producer: str,
+) -> PrincipalAction | None:
+    actions = await runtime.blackboard.list_models(
+        run_id, "principal_actions", PrincipalAction
+    )
+    if any(
+        action.action_type == PrincipalActionType.STOP_RUN
+        and action.status == ActionStatus.EXECUTED
+        for action in actions
+    ):
+        return None
+    return await persist_action(
+        runtime,
+        run_id,
+        PrincipalActionType.STOP_RUN,
+        reason,
+        required_role=required_role,
+        target_branch=target_branch,
+        expected_information_gain=expected_information_gain,
+        priority=priority,
+        producer=producer,
+    )
 
 
 async def persist_artifact(runtime: Runtime, artifact: Artifact, producer: str) -> Artifact:
@@ -259,10 +305,9 @@ async def fail_run_if_all_tasks_failed(runtime: Runtime, run_id: UUID) -> None:
     run.status = RunStatus.FAILED
     run.failure_reason = reason
     run.final_answer = None
-    await persist_action(
+    await persist_stop_action_once(
         runtime,
         run_id,
-        PrincipalActionType.STOP_RUN,
         reason,
         required_role="principal_policy",
         target_branch="root",
@@ -1550,6 +1595,8 @@ def _market_data_stocks_endpoint_only(runtime: Runtime) -> bool:
 
 
 async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:
+    if await run_is_terminal(runtime, event.run_id):
+        return
     tasks = await runtime.blackboard.list_models(event.run_id, "tasks", ResearchTask)
     task = next((value for value in tasks if str(value.id) == event.payload.get("task_id")), None)
     if not task:
@@ -1833,23 +1880,6 @@ def _mechanism_claim_statement(branch: str) -> str:
     )
 
 
-def _fallback_claim(
-    event: EventEnvelope,
-    observation: Observation,
-    branch: str,
-    *,
-    confidence: float = 0.35,
-) -> Claim:
-    return Claim(
-        run_id=event.run_id,
-        task_id=observation.task_id,
-        statement=_fallback_claim_statement(observation, branch),
-        confidence=confidence,
-        evidence_observation_ids=[observation.id],
-        sources=observation.sources,
-    )
-
-
 def _is_source_meta_claim(statement: str) -> bool:
     text = statement.casefold()
     source_meta_patterns = (
@@ -1877,7 +1907,203 @@ def _is_source_meta_claim(statement: str) -> bool:
     return any(pattern in text for pattern in source_meta_patterns)
 
 
+def _is_market_snapshot_claim_statement(statement: str) -> bool:
+    text = statement.casefold().strip()
+    return text.startswith("market data snapshot") or text.startswith("marketsnapshot")
+
+
+def _is_portfolio_advice_claim(statement: str) -> bool:
+    text = statement.casefold()
+    advice_patterns = (
+        "you should buy",
+        "you should sell",
+        "should i buy",
+        "buy recommendation",
+        "sell recommendation",
+        "portfolio advice",
+        "allocate your portfolio",
+        "personalized investment advice",
+    )
+    return any(pattern in text for pattern in advice_patterns)
+
+
+SUBSTANTIVE_ECONOMIC_TERMS = (
+    "basis point",
+    "cut",
+    "cuts",
+    "discount rate",
+    "duration",
+    "earnings",
+    "fomc",
+    "growth",
+    "inflation",
+    "policy rate",
+    "rate differential",
+    "real yield",
+    "short-rate",
+    "treasury",
+    "yield",
+)
+
+
+def _is_source_meta_observation(observation: Observation, artifacts: list[Artifact]) -> bool:
+    if is_data_gap_observation(observation, artifacts) or is_market_snapshot_observation(
+        observation, artifacts
+    ):
+        return False
+    summary = getattr(observation, "summary", "")
+    text = summary.casefold()
+    if not _is_source_meta_claim(summary):
+        return False
+    if "strongest evidence snippets:" in text:
+        snippet_text = text.split("strongest evidence snippets:", 1)[1].split(
+            "source quality:", 1
+        )[0]
+        if (
+            len(snippet_text.split()) >= 12
+            and "provider returned no sources" not in snippet_text
+            and not _is_source_meta_claim(snippet_text)
+        ):
+            return False
+    return not any(term in text for term in SUBSTANTIVE_ECONOMIC_TERMS)
+
+
+def _asset_from_branch(branch: str) -> str:
+    return {
+        "macro/rates": "rates",
+        "market/equities": "equities",
+        "market/fx": "fx",
+        "market/gold": "gold",
+        "market/bonds": "bonds",
+    }.get(branch, "cross_asset")
+
+
+def _claim_type_from_text(statement: str) -> str:
+    text = statement.casefold()
+    if any(term in text for term in ("risk", "offset", "scare", "depends on")):
+        return "risk"
+    if any(term in text for term in ("rose", "fell", "increased", "decreased", "%", "bps")):
+        return "data_point"
+    if any(term in text for term in ("forecast", "expect", "priced", "path")):
+        return "forecast_context"
+    if any(term in text for term in ("market", "equities", "gold", "usd", "bonds")):
+        return "market_reaction"
+    return "mechanism"
+
+
+def _direction_from_text(statement: str) -> str:
+    text = statement.casefold()
+    if any(term in text for term in ("mixed", "depends", "offset")):
+        return "mixed"
+    if any(term in text for term in ("lower", "fall", "falls", "fell", "reduce", "weaken")):
+        return "down"
+    if any(term in text for term in ("higher", "rise", "rises", "rose", "increase", "support")):
+        return "up"
+    return "unknown"
+
+
+def _valid_metadata(value: Any, allowed: set[str], fallback: str) -> str:
+    if isinstance(value, str):
+        normalized = value.strip().casefold().replace(" ", "_")
+        if normalized in allowed:
+            return normalized
+    return fallback
+
+
+def _claim_candidates_from_model_result(
+    result: Any,
+    event: EventEnvelope,
+    observation: Observation,
+    branch: str,
+) -> list[Claim]:
+    if not isinstance(result, dict):
+        raise LLMOutputError("claim-extractor returned non-object JSON")
+    raw_candidates = result.get("claims")
+    if isinstance(raw_candidates, list):
+        candidate_items = raw_candidates
+    elif "statement" in result:
+        candidate_items = [result]
+    else:
+        raise KeyError("claims")
+
+    claims: list[Claim] = []
+    seen: set[str] = set()
+    for item in candidate_items[:3]:
+        if not isinstance(item, dict):
+            continue
+        statement = compact_text(text_from_model_field(item.get("statement", "")), max_chars=360)
+        key = " ".join(statement.casefold().split())
+        if (
+            not statement
+            or key in seen
+            or _is_source_meta_claim(statement)
+            or _is_market_snapshot_claim_statement(statement)
+            or _is_portfolio_advice_claim(statement)
+        ):
+            continue
+        seen.add(key)
+        try:
+            confidence = score_from_model_field(item.get("confidence", 0.35))
+        except (TypeError, ValueError):
+            confidence = 0.35
+        asset = _valid_metadata(
+            item.get("asset"),
+            {"rates", "equities", "fx", "gold", "bonds", "cross_asset"},
+            _asset_from_branch(branch),
+        )
+        claim_type = _valid_metadata(
+            item.get("claim_type"),
+            {"mechanism", "market_reaction", "risk", "data_point", "forecast_context"},
+            _claim_type_from_text(statement),
+        )
+        direction = _valid_metadata(
+            item.get("direction"),
+            {"up", "down", "mixed", "neutral", "unknown"},
+            _direction_from_text(statement),
+        )
+        time_horizon = text_from_model_field(item.get("time_horizon", "unspecified")).strip()
+        claims.append(
+            Claim(
+                run_id=event.run_id,
+                task_id=observation.task_id,
+                statement=statement,
+                confidence=confidence,
+                evidence_observation_ids=[observation.id],
+                sources=observation.sources,
+                claim_type=claim_type,
+                asset=asset,
+                direction=direction,
+                time_horizon=time_horizon[:80] or "unspecified",
+            )
+        )
+    return claims
+
+
+def _fallback_claim(
+    event: EventEnvelope,
+    observation: Observation,
+    branch: str,
+    *,
+    confidence: float = 0.35,
+) -> Claim:
+    statement = _fallback_claim_statement(observation, branch)
+    return Claim(
+        run_id=event.run_id,
+        task_id=observation.task_id,
+        statement=statement,
+        confidence=confidence,
+        evidence_observation_ids=[observation.id],
+        sources=observation.sources,
+        claim_type=_claim_type_from_text(statement),
+        asset=_asset_from_branch(branch),
+        direction=_direction_from_text(statement),
+        time_horizon="unspecified",
+    )
+
+
 async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
+    if await run_is_terminal(runtime, event.run_id):
+        return
     observations = await runtime.blackboard.list_models(event.run_id, "observations", Observation)
     observation = next(
         (value for value in observations if str(value.id) == event.payload.get("observation_id")),
@@ -1931,34 +2157,59 @@ async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
             runtime, event.run_id, trigger="claim.skipped_market_snapshot"
         )
         return
-    claim: Claim
+    if _is_source_meta_observation(observation, observation_artifacts):
+        await persist_action(
+            runtime,
+            event.run_id,
+            PrincipalActionType.REQUEST_VERIFICATION,
+            (
+                "Skipped claim extraction for source/provider metadata observation; "
+                "source titles, source counts, missing dates, retrieval contents, and "
+                "quality-score metadata remain caveats instead of normal claims."
+            ),
+            required_role="research_agent",
+            target_branch=branch,
+            expected_information_gain=InformationGain.LOW,
+            priority=4,
+            producer="worker-agents",
+        )
+        await evaluate_principal_policy_safely(
+            runtime, event.run_id, trigger="claim.skipped_source_meta"
+        )
+        return
+    claims: list[Claim]
     try:
         result = await runtime.llm.json(
             event.run_id,
             AgentRole.RESEARCH,
             "claim-extractor",
             SYSTEM,
-            f"Create one narrow, verifiable claim supported only by this observation. "
-            f"Do not create portfolio advice, causal claims, or claims about data "
-            f"availability unless directly stated by a source. Do not create claims "
-            f"about source titles, retrieval contents, source counts, publication-date "
-            f"metadata, provider metadata, or quality-score metadata; turn the observation "
-            f"into an economic mechanism or market claim instead. "
-            f'Return {{"statement":"...","confidence":0.0}}. Observation: '
+            "Extract 1-3 atomic, asset-specific investment research claims supported "
+            "only by this observation. One claim must equal one verifiable proposition. "
+            "Do not create portfolio advice. Do not create claims about source titles, "
+            "EvidenceEngine retrieval metadata, source counts, missing publication dates, "
+            "provider metadata, quality scores, or market snapshot metadata. Prefer "
+            "economic mechanism or market-reaction claims. Avoid overstrong words such "
+            "as primary, structural, systematically, directly, or decisively unless a "
+            "source explicitly supports them. Return strict JSON matching "
+            '{"claims":[{"statement":"...",'
+            '"claim_type":"mechanism|market_reaction|risk|data_point|forecast_context",'
+            '"asset":"rates|equities|fx|gold|bonds|cross_asset",'
+            '"direction":"up|down|mixed|neutral|unknown",'
+            '"time_horizon":"3 months|historical|current|unspecified",'
+            '"confidence":0.0}]}. Observation: '
             f"{observation.summary}",
         )
-        statement = compact_text(text_from_model_field(result["statement"]), max_chars=700)
-        confidence = score_from_model_field(result["confidence"])
-        if _is_source_meta_claim(statement):
-            statement = _mechanism_claim_statement(branch)
-            confidence = min(confidence, 0.45)
+        claims = _claim_candidates_from_model_result(result, event, observation, branch)
+        if not claims:
+            claims = [_fallback_claim(event, observation, branch, confidence=0.35)]
             await persist_action(
                 runtime,
                 event.run_id,
                 PrincipalActionType.REQUEST_VERIFICATION,
                 (
-                    "Claim extractor produced source/provider metadata; replaced it "
-                    "with a branch mechanism claim before verification."
+                    "Claim extractor returned no usable atomic economic claims; created "
+                    "a deterministic branch mechanism claim instead."
                 ),
                 required_role="research_agent",
                 target_branch=branch,
@@ -1966,14 +2217,6 @@ async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
                 priority=4,
                 producer="worker-agents",
             )
-        claim = Claim(
-            run_id=event.run_id,
-            task_id=observation.task_id,
-            statement=statement,
-            confidence=confidence,
-            evidence_observation_ids=[observation.id],
-            sources=observation.sources,
-        )
     except BudgetExceeded:
         raise
     except Exception as exc:
@@ -1986,7 +2229,7 @@ async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
                 runtime, task, branch, "claim_generation", exc, producer="worker-agents"
             )
             return
-        claim = _fallback_claim(event, observation, branch)
+        claims = [_fallback_claim(event, observation, branch)]
         await persist_action(
             runtime,
             event.run_id,
@@ -2001,7 +2244,6 @@ async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
             priority=4,
             producer="worker-agents",
         )
-    await runtime.blackboard.put_claim(claim)
     depends_on = [
         value.id
         for value in observation_artifacts
@@ -2009,25 +2251,42 @@ async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
         and value.legacy_object_type == "observation"
         and value.legacy_object_id == observation.id
     ]
-    await persist_artifact(
-        runtime,
-        Artifact(
-            run_id=event.run_id,
-            artifact_type=ArtifactType.CLAIM,
-            branch=branch,
-            text_or_summary=claim.statement,
-            tags=tags_for_text(claim.statement),
-            visibility=VisibilityScope.PUBLIC_UNVERIFIED,
-            status=ArtifactStatus.UNVERIFIED,
-            confidence=claim.confidence,
-            source_refs=claim.sources,
-            legacy_object_type="claim",
-            legacy_object_id=claim.id,
-            depends_on_artifact_ids=depends_on[:1],
-        ),
-        "worker-agents",
-    )
-    emit(runtime, EventType.CLAIM_CREATED, event.run_id, "worker-agents", claim_id=str(claim.id))
+    for claim in claims:
+        await runtime.blackboard.put_claim(claim)
+        await persist_artifact(
+            runtime,
+            Artifact(
+                run_id=event.run_id,
+                artifact_type=ArtifactType.CLAIM,
+                branch=branch,
+                text_or_summary=claim.statement,
+                tags=sorted(
+                    set(
+                        tags_for_text(claim.statement)
+                        + [
+                            f"claim_type:{claim.claim_type or 'mechanism'}",
+                            f"asset:{claim.asset or _asset_from_branch(branch)}",
+                            f"direction:{claim.direction or 'unknown'}",
+                        ]
+                    )
+                ),
+                visibility=VisibilityScope.PUBLIC_UNVERIFIED,
+                status=ArtifactStatus.UNVERIFIED,
+                confidence=claim.confidence,
+                source_refs=claim.sources,
+                legacy_object_type="claim",
+                legacy_object_id=claim.id,
+                depends_on_artifact_ids=depends_on[:1],
+            ),
+            "worker-agents",
+        )
+        emit(
+            runtime,
+            EventType.CLAIM_CREATED,
+            event.run_id,
+            "worker-agents",
+            claim_id=str(claim.id),
+        )
     await evaluate_principal_policy_safely(runtime, event.run_id, trigger="claim.created")
 
 
@@ -2074,6 +2333,113 @@ def _verification_branch_for_claim(claim: Claim, claim_artifacts: list[Artifact]
         if artifact.branch:
             return artifact.branch
     return infer_semantic_branch(claim.statement)
+
+
+def _claim_statement_key(statement: str) -> str:
+    return " ".join(statement.casefold().split())
+
+
+async def create_supported_part_subclaims(
+    runtime: Runtime,
+    run: Run,
+    source_claim: Claim,
+    verification: Verification,
+    existing_claims: list[Claim],
+    claim_artifacts: list[Artifact],
+    branch: str,
+) -> list[Claim]:
+    if verification.verdict != "uncertain" or not verification.supported_parts:
+        return []
+    existing_keys = {_claim_statement_key(claim.statement) for claim in existing_claims}
+    source_key = _claim_statement_key(source_claim.statement)
+    route_for_verification = _has_verification_capacity(run)
+    dependencies = [artifact.id for artifact in claim_artifacts]
+    created: list[Claim] = []
+    for supported_part in verification.supported_parts[:3]:
+        statement = compact_text(supported_part, max_chars=360)
+        key = _claim_statement_key(statement)
+        if (
+            not statement
+            or key in existing_keys
+            or key == source_key
+            or _is_source_meta_claim(statement)
+            or _is_market_snapshot_claim_statement(statement)
+            or _is_portfolio_advice_claim(statement)
+        ):
+            continue
+        claim = Claim(
+            run_id=run.id,
+            task_id=source_claim.task_id,
+            statement=statement,
+            evidence_observation_ids=source_claim.evidence_observation_ids,
+            sources=source_claim.sources,
+            confidence=min(max(verification.confidence, 0.35), 0.7),
+            claim_type=_claim_type_from_text(statement),
+            asset=source_claim.asset or _asset_from_branch(branch),
+            direction=_direction_from_text(statement),
+            time_horizon=source_claim.time_horizon or "unspecified",
+            derived_from_verification_id=verification.id,
+        )
+        await runtime.blackboard.put_claim(claim)
+        await persist_artifact(
+            runtime,
+            Artifact(
+                run_id=run.id,
+                artifact_type=ArtifactType.CLAIM,
+                branch=branch,
+                text_or_summary=claim.statement,
+                tags=sorted(
+                    set(
+                        tags_for_text(claim.statement)
+                        + [
+                            "supported_part_subclaim",
+                            "derived_from_supported_parts",
+                            f"claim_type:{claim.claim_type or 'mechanism'}",
+                            f"asset:{claim.asset or _asset_from_branch(branch)}",
+                            f"direction:{claim.direction or 'unknown'}",
+                        ]
+                    )
+                ),
+                visibility=VisibilityScope.PUBLIC_UNVERIFIED,
+                status=ArtifactStatus.UNVERIFIED,
+                confidence=claim.confidence,
+                source_refs=claim.sources,
+                legacy_object_type="claim",
+                legacy_object_id=claim.id,
+                depends_on_artifact_ids=dependencies[:3],
+            ),
+            "verifier-agent",
+        )
+        created.append(claim)
+        existing_keys.add(key)
+        if route_for_verification:
+            emit(
+                runtime,
+                EventType.CLAIM_CREATED,
+                run.id,
+                "verifier-agent",
+                claim_id=str(claim.id),
+                derived_from_verification_id=str(verification.id),
+            )
+    if created:
+        await persist_action(
+            runtime,
+            run.id,
+            PrincipalActionType.REQUEST_VERIFICATION,
+            (
+                f"Created {len(created)} atomic subclaim candidate(s) from verifier "
+                "supported_parts; candidates remain unverified until routed through "
+                "normal source verification."
+            ),
+            required_role="source_verifier_agent",
+            target_branch="trust/source_verifier",
+            expected_information_gain=InformationGain.MEDIUM
+            if route_for_verification
+            else InformationGain.LOW,
+            priority=6 if route_for_verification else 4,
+            producer="verifier-agent",
+        )
+    return created
 
 
 def build_claim_verification_evidence_request(
@@ -2295,6 +2661,29 @@ def _append_unique(values: list[str], value: str) -> None:
         values.append(value)
 
 
+NON_MATERIAL_CONTRADICTION_PATTERNS = (
+    r"^none\.?$",
+    r"^none\s+material\.?$",
+    r"^no\s+contradictions?\.?$",
+    r"^no\s+direct\s+contradictions?\.?$",
+    r"^no\s+material\s+contradictions?\.?$",
+    r"^not\s+a\s+contradiction\.?$",
+    r"does\s+not\s+directly\s+refute",
+    r"contextual,\s*not\s+contradictory",
+    r"no\s+high-quality\s+source\s+directly\s+refutes",
+)
+
+
+def is_material_contradiction(text: str) -> bool:
+    normalized = " ".join(text.casefold().strip().split())
+    if not normalized:
+        return False
+    return not any(
+        re.search(pattern, normalized)
+        for pattern in NON_MATERIAL_CONTRADICTION_PATTERNS
+    )
+
+
 def normalize_verification_result(
     raw_result: dict[str, Any],
     support_bundle: EvidenceBundle | None,
@@ -2333,9 +2722,13 @@ def normalize_verification_result(
         "unsupported_parts": _string_list_from_model_field(
             raw_result.get("unsupported_parts", [])
         ),
-        "contradictions": _string_list_from_model_field(
-            raw_result.get("contradictions", [])
-        ),
+        "contradictions": [
+            value
+            for value in _string_list_from_model_field(
+                raw_result.get("contradictions", [])
+            )
+            if is_material_contradiction(value)
+        ],
         "required_caveats": _string_list_from_model_field(
             raw_result.get("required_caveats", [])
         ),
@@ -2541,6 +2934,8 @@ def _verified_claims_and_artifacts(
 
 
 async def verify_claim(runtime: Runtime, event: EventEnvelope) -> None:
+    if await run_is_terminal(runtime, event.run_id):
+        return
     claims = await runtime.blackboard.list_models(event.run_id, "claims", Claim)
     claim = next(
         (value for value in claims if str(value.id) == event.payload.get("claim_id")), None
@@ -2675,6 +3070,17 @@ async def verify_claim(runtime: Runtime, event: EventEnvelope) -> None:
     await runtime.blackboard.put_observation(observation)
     verification = Verification(run_id=event.run_id, claim_id=claim.id, sources=sources, **result)
     await runtime.blackboard.put_verification(verification)
+    run = await runtime.blackboard.get_run(event.run_id)
+    if run and not is_terminal_run(run):
+        await create_supported_part_subclaims(
+            runtime,
+            run,
+            claim,
+            verification,
+            claims,
+            claim_artifacts,
+            branch,
+        )
     await persist_artifact(
         runtime,
         Artifact(
@@ -2741,7 +3147,6 @@ async def verify_claim(runtime: Runtime, event: EventEnvelope) -> None:
         priority=6,
         producer="verifier-agent",
     )
-    run = await runtime.blackboard.get_run(event.run_id)
     if run:
         tasks = await runtime.blackboard.list_models(event.run_id, "tasks", ResearchTask)
         latest_claims = await runtime.blackboard.list_models(event.run_id, "claims", Claim)
@@ -2902,6 +3307,8 @@ async def skeptic_review(runtime: Runtime, event: EventEnvelope) -> None:
 
 
 async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
+    if await run_is_terminal(runtime, event.run_id):
+        return
     tasks = await runtime.blackboard.list_models(event.run_id, "tasks", ResearchTask)
     verifications = await runtime.blackboard.list_models(
         event.run_id, "verifications", Verification
@@ -2911,17 +3318,17 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
     claims = await runtime.blackboard.list_models(event.run_id, "claims", Claim)
     checked_claim_ids = {verification.claim_id for verification in verifications}
     unchecked_claims = [claim for claim in claims if claim.id not in checked_claim_ids]
+    run = await runtime.blackboard.get_run(event.run_id)
+    if not run:
+        return
     if (
         not tasks
-        or (not event.payload.get("force") and (pending_tasks or unchecked_claims))
+        or (not event.payload.get("force") and pending_tasks)
         or (existing_final and not should_reaggregate_after_followup(existing_final, tasks))
     ):
         return
     verified_ids = {value.claim_id for value in verifications if value.verdict == "verified"}
     verified = [claim for claim in claims if claim.id in verified_ids]
-    run = await runtime.blackboard.get_run(event.run_id)
-    if not run:
-        return
     if unchecked_claims and _has_verification_capacity(run):
         await evaluate_principal_policy_safely(
             runtime, event.run_id, trigger="aggregate.unverified_claims"
@@ -2967,7 +3374,7 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
             settings=getattr(runtime, "settings", None),
         )
         if not utilization.terminal_final_allowed:
-            await create_zero_verified_diagnostic(
+            diagnostic = await create_zero_verified_diagnostic(
                 runtime,
                 run,
                 tasks=tasks,
@@ -2976,6 +3383,8 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
                 artifacts=artifacts,
                 utilization=utilization,
             )
+            if diagnostic:
+                artifacts = [*artifacts, diagnostic]
             if await request_zero_verified_followup_wave(
                 runtime,
                 run,
@@ -2988,7 +3397,7 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
                 runtime, event.run_id, trigger="aggregate.terminal_blocked_by_budget_policy"
             )
             return
-        await create_zero_verified_diagnostic(
+        diagnostic = await create_zero_verified_diagnostic(
             runtime,
             run,
             tasks=tasks,
@@ -2997,12 +3406,24 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
             artifacts=artifacts,
             utilization=utilization,
         )
+        if diagnostic:
+            artifacts = [*artifacts, diagnostic]
         if await request_zero_verified_followup_wave(
             runtime,
             run,
             tasks=tasks,
             claims=claims,
             verifications=verifications,
+        ):
+            return
+        if await _write_caveated_evidence_final(
+            runtime,
+            run,
+            tasks=tasks,
+            claims=claims,
+            verifications=verifications,
+            artifacts=artifacts,
+            utilization=utilization,
         ):
             return
         await _write_no_verified_evidence_final(
@@ -3115,10 +3536,28 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
     await evaluate_principal_policy_safely(runtime, event.run_id, trigger="final.created")
 
 
+def _append_judge_payoff(answer: str, score: float, feedback: str | None) -> str:
+    if "## Judge payoff" in answer:
+        return answer
+    feedback_text = compact_text(feedback or "Judge completed without feedback.", max_chars=700)
+    return "\n".join(
+        [
+            answer.rstrip(),
+            "",
+            "## Judge payoff",
+            "",
+            f"- Score: {score:.2f}",
+            f"- Feedback: {feedback_text}",
+        ]
+    )
+
+
 async def judge(runtime: Runtime, event: EventEnvelope) -> None:
     final = await runtime.blackboard.get_final(event.run_id)
     run = await runtime.blackboard.get_run(event.run_id)
     if not final or not run:
+        return
+    if final.judge_score is not None or is_terminal_run(run):
         return
     tasks = await runtime.blackboard.list_models(event.run_id, "tasks", ResearchTask)
     actions = await runtime.blackboard.list_models(
@@ -3134,6 +3573,7 @@ async def judge(runtime: Runtime, event: EventEnvelope) -> None:
     )
     final.judge_score = score_from_model_field(result["score"])
     final.judge_feedback = text_from_model_field(result["feedback"])
+    final.answer = _append_judge_payoff(final.answer, final.judge_score, final.judge_feedback)
     await runtime.blackboard.put_final(final)
     await persist_artifact(
         runtime,
@@ -3171,10 +3611,9 @@ async def judge(runtime: Runtime, event: EventEnvelope) -> None:
             return
 
     run.status = RunStatus.COMPLETED
-    await persist_action(
+    await persist_stop_action_once(
         runtime,
         event.run_id,
-        PrincipalActionType.STOP_RUN,
         "Completed run after judge payoff score was recorded.",
         required_role="judge_agent",
         target_branch="synthesis/judge",
@@ -3290,6 +3729,339 @@ async def create_zero_verified_diagnostic(
     return artifact
 
 
+def _strongly_caveated_evidence_exists(verifications: list[Verification]) -> bool:
+    return any(
+        verification.supported_parts
+        or verification.unsupported_parts
+        or verification.required_caveats
+        or verification.confidence >= 0.45
+        for verification in verifications
+    )
+
+
+def _aggregator_budget_remains(
+    run: Run, utilization: BudgetUtilizationDecision
+) -> bool:
+    budget_remaining = run.budget.limit_usd - run.budget.spent_usd - run.budget.reserved_usd
+    return (
+        run.models.aggregator is not None
+        and budget_remaining > 0.05
+        and utilization.aggregator_utilization_ratio < 1
+    )
+
+
+def _judge_budget_remains(run: Run, utilization: BudgetUtilizationDecision) -> bool:
+    budget_remaining = run.budget.limit_usd - run.budget.spent_usd - run.budget.reserved_usd
+    return (
+        run.models.judge is not None
+        and budget_remaining > 0.05
+        and utilization.judge_utilization_ratio < 1
+    )
+
+
+def _conversion_quality_metrics(
+    run: Run,
+    claims: list[Claim],
+    verifications: list[Verification],
+    artifacts: list[Artifact],
+    final: FinalReport | None = None,
+) -> dict[str, Any]:
+    verified_ids = {
+        verification.claim_id for verification in verifications if verification.verdict == "verified"
+    }
+    verified_artifact_ids = {
+        artifact.legacy_object_id or artifact.id
+        for artifact in artifacts
+        if artifact.status == ArtifactStatus.VERIFIED
+        and artifact.artifact_type in {ArtifactType.CLAIM, ArtifactType.FORECAST}
+    }
+    verified_count = len(verified_ids | verified_artifact_ids)
+    tavily_used = run.budget.tools.tavily_credits_used
+    disputed_artifacts = sum(
+        1 for artifact in artifacts if artifact.status == ArtifactStatus.DISPUTED
+    )
+    disputed_claims = len(
+        {
+            verification.claim_id
+            for verification in verifications
+            if verification.verdict == "uncertain"
+        }
+        | {
+            artifact.legacy_object_id or artifact.id
+            for artifact in artifacts
+            if artifact.status == ArtifactStatus.DISPUTED
+            and artifact.artifact_type in {ArtifactType.CLAIM, ArtifactType.FORECAST}
+        }
+    )
+    source_distribution: dict[str, int] = {}
+    for verification in verifications:
+        text = verification.source_quality_summary.casefold().replace("-", "_")
+        for tier in (
+            "primary",
+            "high_quality_secondary",
+            "news",
+            "blog_or_opinion",
+            "unknown",
+            "weak",
+        ):
+            matched = False
+            for match in re.finditer(rf"(\d+)\s+{re.escape(tier)}", text):
+                source_distribution[tier] = source_distribution.get(tier, 0) + int(
+                    match.group(1)
+                )
+                matched = True
+            if not matched and tier in text:
+                source_distribution[tier] = source_distribution.get(tier, 0) + 1
+    supported_part_claim_ids = {
+        claim.id for claim in claims if claim.derived_from_verification_id is not None
+    }
+    supported_part_claim_ids.update(
+        artifact.legacy_object_id
+        for artifact in artifacts
+        if artifact.artifact_type == ArtifactType.CLAIM
+        and artifact.legacy_object_type == "claim"
+        and artifact.legacy_object_id is not None
+        and (
+            "supported_part_subclaim" in artifact.tags
+            or "derived_from_supported_parts" in artifact.tags
+        )
+    )
+    return {
+        "tavily_used": tavily_used,
+        "verified_claims": verified_count,
+        "verified_claims_per_10_tavily": round((verified_count / tavily_used) * 10, 2)
+        if tavily_used
+        else 0.0,
+        "disputed_claims": disputed_claims,
+        "disputed_artifacts": disputed_artifacts,
+        "source_quality_distribution": source_distribution,
+        "claims_created_from_supported_parts": len(supported_part_claim_ids),
+        "aggregator_used": bool(
+            final
+            or any(
+                artifact.artifact_type == ArtifactType.FINAL_REPORT
+                or (
+                    artifact.artifact_type == ArtifactType.DATA_GAP
+                    and "evidence_gap_planner" in artifact.tags
+                )
+                for artifact in artifacts
+            )
+        ),
+        "judge_used": bool(
+            final
+            and final.judge_score is not None
+            or any(
+                artifact.artifact_type == ArtifactType.JUDGE_FEEDBACK
+                for artifact in artifacts
+            )
+        ),
+    }
+
+
+def _conversion_quality_lines(
+    run: Run,
+    claims: list[Claim],
+    verifications: list[Verification],
+    artifacts: list[Artifact],
+    final: FinalReport | None = None,
+) -> list[str]:
+    metrics = _conversion_quality_metrics(run, claims, verifications, artifacts, final)
+    source_distribution = metrics["source_quality_distribution"]
+    distribution_text = (
+        ", ".join(
+            f"{tier}={count}" for tier, count in sorted(source_distribution.items())
+        )
+        if source_distribution
+        else "not recorded"
+    )
+    return [
+        f"- Tavily credits used: {metrics['tavily_used']}",
+        f"- Verified claims: {metrics['verified_claims']}",
+        f"- Verified claims per 10 Tavily credits: {metrics['verified_claims_per_10_tavily']:.2f}",
+        f"- Disputed claims: {metrics['disputed_claims']}",
+        f"- Disputed artifacts: {metrics['disputed_artifacts']}",
+        f"- Source quality distribution: {distribution_text}",
+        f"- Claims created from supported_parts: {metrics['claims_created_from_supported_parts']}",
+        f"- Aggregator used: {'yes' if metrics['aggregator_used'] else 'no'}",
+        f"- Judge used: {'yes' if metrics['judge_used'] else 'no'}",
+        (
+            f"- Conversion quality: {metrics['tavily_used']} Tavily credits produced "
+            f"{metrics['verified_claims']} verified claim(s) and "
+            f"{metrics['disputed_artifacts']} disputed artifact(s)."
+        ),
+    ]
+
+
+def _append_conversion_quality_section(
+    answer: str,
+    run: Run,
+    claims: list[Claim],
+    verifications: list[Verification],
+    artifacts: list[Artifact],
+    final: FinalReport | None = None,
+) -> str:
+    if "## Conversion quality" in answer:
+        return answer
+    return "\n".join(
+        [
+            answer.rstrip(),
+            "",
+            "## Conversion quality",
+            "",
+            *_conversion_quality_lines(run, claims, verifications, artifacts, final),
+        ]
+    )
+
+
+async def _write_caveated_evidence_final(
+    runtime: Runtime,
+    run: Run,
+    *,
+    tasks: list[ResearchTask],
+    claims: list[Claim],
+    verifications: list[Verification],
+    artifacts: list[Artifact],
+    utilization: BudgetUtilizationDecision,
+) -> bool:
+    if run.budget.tools.tavily_credits_used < run.budget.tools.tavily_max_credits:
+        return False
+    if not _strongly_caveated_evidence_exists(verifications):
+        return False
+    if not _aggregator_budget_remains(run, utilization):
+        return False
+
+    verification_payload = [
+        {
+            "claim": next(
+                (claim.statement for claim in claims if claim.id == verification.claim_id),
+                "<claim missing>",
+            ),
+            "verdict": verification.verdict,
+            "confidence": verification.confidence,
+            "supported_parts": verification.supported_parts,
+            "unsupported_parts": verification.unsupported_parts,
+            "contradictions": verification.contradictions,
+            "required_caveats": verification.required_caveats,
+            "source_quality_summary": verification.source_quality_summary,
+            "sources": verification.sources,
+        }
+        for verification in verifications[:16]
+    ]
+    try:
+        result = await runtime.llm.json(
+            run.id,
+            AgentRole.AGGREGATOR,
+            "caveated-partial-aggregator",
+            SYSTEM,
+            "Search budget is exhausted and no normal claim is public-verified. "
+            "Produce a caveated diagnostic synthesis only; do not present disputed "
+            "or unsupported material as verified, do not give portfolio advice, and "
+            "make clear that this is not decision-grade. Include the strongest "
+            "verifier-supported fragments, unsupported gaps, and what would be needed "
+            'for a decision-grade answer. Return {"answer":"..."}. '
+            f"Question: {run.question}. Verification evidence: "
+            f"{json.dumps(verification_payload)[:16000]}. Conversion metrics: "
+            f"{json.dumps(_conversion_quality_metrics(run, claims, verifications, artifacts))}",
+        )
+        answer_text = text_from_model_field(result["answer"])
+    except BudgetExceeded:
+        raise
+    except Exception as exc:
+        await persist_action(
+            runtime,
+            run.id,
+            PrincipalActionType.REQUEST_AGGREGATION,
+            (
+                "Caveated aggregator synthesis failed; deterministic evidence-limited "
+                f"fallback may be used if terminal policy allows it: {concise_exception(exc)}"
+            ),
+            required_role="aggregator_agent",
+            target_branch="synthesis/aggregator",
+            expected_information_gain=InformationGain.LOW,
+            priority=5,
+            status=ActionStatus.FAILED,
+            producer="aggregator-agent",
+        )
+        return False
+
+    caveated_sources = _caveated_evidence_sources(verifications, artifacts)
+    caveated_dependencies = _caveated_evidence_artifact_ids(verifications, artifacts)
+    answer = _append_conversion_quality_section(
+        answer_text,
+        run,
+        claims,
+        verifications,
+        artifacts,
+    )
+    final = FinalReport(
+        run_id=run.id,
+        answer=answer,
+        verified_claim_ids=[],
+        sources=caveated_sources,
+        partial=True,
+        wave_number=max_task_wave(tasks),
+    )
+    await runtime.blackboard.put_final(final)
+    await persist_artifact(
+        runtime,
+        Artifact(
+            run_id=run.id,
+            artifact_type=ArtifactType.FINAL_REPORT,
+            branch="synthesis/aggregator",
+            text_or_summary=answer,
+            tags=[
+                "synthesis",
+                "final",
+                "caveated_aggregator_synthesis",
+                "insufficient_verified_evidence",
+                f"wave:{final.wave_number}",
+            ],
+            visibility=VisibilityScope.PUBLIC_VERIFIED,
+            status=ArtifactStatus.VERIFIED,
+            source_refs=final.sources,
+            legacy_object_type="final_report",
+            legacy_object_id=run.id,
+            depends_on_artifact_ids=caveated_dependencies[:24],
+        ),
+        "aggregator-agent",
+    )
+    await persist_action(
+        runtime,
+        run.id,
+        PrincipalActionType.REQUEST_AGGREGATION,
+        "Produced caveated diagnostic synthesis after search exhaustion.",
+        required_role="aggregator_agent",
+        target_branch="synthesis/aggregator",
+        expected_information_gain=InformationGain.MEDIUM,
+        priority=5,
+        producer="aggregator-agent",
+    )
+    run.final_answer = answer
+    run.failure_reason = None
+    if _judge_budget_remains(run, utilization):
+        run.status = RunStatus.RUNNING
+        await runtime.blackboard.put_run(run)
+        emit(runtime, EventType.FINAL_CREATED, run.id, "aggregator-agent")
+    else:
+        await persist_stop_action_once(
+            runtime,
+            run.id,
+            (
+                "Completed with a caveated evidence-limited final after search was "
+                "exhausted and no judge capacity remained."
+            ),
+            required_role="principal_policy",
+            target_branch="synthesis/aggregator",
+            expected_information_gain=InformationGain.LOW,
+            priority=4,
+            producer="aggregator-agent",
+        )
+        run.status = RunStatus.COMPLETED
+        await runtime.blackboard.put_run(run)
+    await evaluate_principal_policy_safely(runtime, run.id, trigger="final.caveated")
+    return True
+
+
 async def _write_no_verified_evidence_final(
     runtime: Runtime,
     run: Run,
@@ -3301,8 +4073,14 @@ async def _write_no_verified_evidence_final(
     utilization: BudgetUtilizationDecision,
 ) -> None:
     """Create a deterministic final when research produced no synthesis-safe claims."""
-    answer = _no_verified_evidence_answer(
-        run, tasks, claims, verifications, artifacts, utilization
+    answer = _append_conversion_quality_section(
+        _no_verified_evidence_answer(
+            run, tasks, claims, verifications, artifacts, utilization
+        ),
+        run,
+        claims,
+        verifications,
+        artifacts,
     )
     caveated_sources = _caveated_evidence_sources(verifications, artifacts)
     caveated_dependencies = _caveated_evidence_artifact_ids(verifications, artifacts)
@@ -3322,7 +4100,13 @@ async def _write_no_verified_evidence_final(
             artifact_type=ArtifactType.FINAL_REPORT,
             branch="synthesis/aggregator",
             text_or_summary=answer,
-            tags=["synthesis", "final", "insufficient_verified_evidence", "caveated_evidence"],
+            tags=[
+                "synthesis",
+                "final",
+                "insufficient_verified_evidence",
+                "caveated_evidence",
+                f"wave:{final.wave_number}",
+            ],
             visibility=VisibilityScope.PUBLIC_VERIFIED,
             status=ArtifactStatus.VERIFIED,
             source_refs=final.sources,
@@ -3350,10 +4134,9 @@ async def _write_no_verified_evidence_final(
         await runtime.blackboard.put_run(run)
         emit(runtime, EventType.FINAL_CREATED, run.id, "aggregator-agent")
     else:
-        await persist_action(
+        await persist_stop_action_once(
             runtime,
             run.id,
-            PrincipalActionType.STOP_RUN,
             (
                 "Completed with an evidence-limited final: no synthesis-safe verified "
                 "claims were available and no judge capacity remained."
@@ -3670,6 +4453,8 @@ async def deterministic_partial(runtime: Runtime, run_id: UUID, reason: str) -> 
     run = await runtime.blackboard.get_run(run_id)
     if not run or run.status in {RunStatus.COMPLETED, RunStatus.PARTIAL_BUDGET_EXHAUSTED}:
         return
+    if await runtime.blackboard.get_final(run_id):
+        return
     claims = await runtime.blackboard.list_models(run_id, "claims", Claim)
     verifications = await runtime.blackboard.list_models(run_id, "verifications", Verification)
     verified_ids = {item.claim_id for item in verifications if item.verdict == "verified"}
@@ -3717,10 +4502,9 @@ async def deterministic_partial(runtime: Runtime, run_id: UUID, reason: str) -> 
         priority=4,
         producer="aggregator-agent",
     )
-    await persist_action(
+    await persist_stop_action_once(
         runtime,
         run_id,
-        PrincipalActionType.STOP_RUN,
         f"Stopped after budget block: {reason}",
         required_role="principal_policy",
         target_branch="root",

@@ -496,6 +496,28 @@ def test_source_quality_classifies_major_news_domains() -> None:
         }
 
 
+def test_source_quality_classifies_institutional_finance_domains_as_secondary() -> None:
+    for url in (
+        "https://www.blackrock.com/us/individual/insights/fed-policy",
+        "https://am.jpmorgan.com/us/en/asset-management/adv/insights/market-insights/",
+        "https://www.pimco.com/us/en/insights/fed-cuts-and-duration",
+        "https://www.vanguard.com/investor/insights/market-commentary",
+        "https://www.morningstar.com/markets/fed-rate-cuts",
+        "https://www.reuters.com/markets/rates/fed-policy-2026-07-01/",
+        "https://www.bloomberg.com/news/articles/2026-07-01/fed-cuts-rates",
+    ):
+        quality = score_source_quality(
+            source_url=url,
+            source_title="Fed policy market commentary",
+            snippet="Markets priced a 25 bps rate cut after the release.",
+            published_at="2026-07-01",
+            retrieved_at=RETRIEVED_AT,
+        )
+
+        assert quality.source_tier == SourceTier.HIGH_QUALITY_SECONDARY
+        assert "high-quality institutional secondary source domain" in quality.reason
+
+
 def test_source_quality_classifies_unknown_domain_as_unknown() -> None:
     quality = score_source_quality(
         source_url="https://research.example.com/macro-note",
