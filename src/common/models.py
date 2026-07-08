@@ -375,6 +375,21 @@ class CapacitySummary(BaseModel):
     verifier_budget_remaining: float = Field(ge=0)
     aggregator_budget_protected_remaining: float = Field(ge=0)
     judge_budget_protected_remaining: float = Field(ge=0)
+    llm_utilization_ratio: float = Field(default=0, ge=0, le=1)
+    tavily_utilization_ratio: float = Field(default=0, ge=0, le=1)
+    market_data_utilization_ratio: float = Field(default=0, ge=0, le=1)
+    verifier_utilization_ratio: float = Field(default=0, ge=0, le=1)
+    aggregator_utilization_ratio: float = Field(default=0, ge=0, le=1)
+    judge_utilization_ratio: float = Field(default=0, ge=0, le=1)
+    useful_capacity_remaining: bool = False
+    should_continue_research: bool = False
+    terminal_final_allowed: bool = False
+    terminal_final_reasons: list[str] = Field(default_factory=list)
+    terminal_final_blockers: list[str] = Field(default_factory=list)
+    repair_waves_attempted: int = Field(default=0, ge=0)
+    min_repair_waves_before_partial_final: int = Field(default=0, ge=0)
+    branches_repaired: list[str] = Field(default_factory=list)
+    under_researched_branches: list[str] = Field(default_factory=list)
     search_exhausted: bool = False
     market_data_exhausted: bool = False
     useful_action_available: bool = False

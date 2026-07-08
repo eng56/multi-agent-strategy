@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Iterable
@@ -176,7 +177,7 @@ def _candidate_rules(snapshot: PrincipalSnapshot) -> list[PrincipalActionCandida
     if snapshot.dead_letters:
         candidates.extend(_dead_letter_candidates(snapshot, has_verified_knowledge))
 
-    if snapshot.organization_plan is None:
+    if snapshot.organization_plan is None and snapshot.final is None and not snapshot.tasks:
         candidates.append(
             PrincipalActionCandidate(
                 action_type=PrincipalActionType.SPAWN_AGENT,
@@ -208,7 +209,7 @@ def _candidate_rules(snapshot: PrincipalSnapshot) -> list[PrincipalActionCandida
         candidates.append(
             PrincipalActionCandidate(
                 action_type=PrincipalActionType.REQUEST_TOOL_CALL,
-                reason=f"Pending task needs tool evidence: {task.title}",
+                reason=f"Pending task needs tool evidence: {task.title} (task_id={task.id})",
                 expected_information_gain=InformationGain.HIGH,
                 estimated_cost=_tool_call_cost(task),
                 target_branch=_branch_for_task(task, snapshot.agent_specs),
@@ -303,24 +304,27 @@ def _candidate_rules(snapshot: PrincipalSnapshot) -> list[PrincipalActionCandida
     elif zero_verified_terminal_aggregation:
         candidates.append(_aggregation_candidate(snapshot, PolicyDecisionReason.PARTIAL_AGGREGATION))
 
-    if snapshot.final and snapshot.final.partial:
-        candidates.append(
-            _stop_candidate(
-                snapshot,
-                "Evidence-limited partial final is terminal; judge is suppressed for partial finals.",
-            )
-        )
-    elif snapshot.final and snapshot.run.models.judge and snapshot.final.judge_score is None:
+    if snapshot.final and snapshot.run.models.judge and snapshot.final.judge_score is None:
         candidates.append(
             PrincipalActionCandidate(
                 action_type=PrincipalActionType.REQUEST_TOOL_CALL,
-                reason="A final report exists without a judge score; run the judge before stopping.",
+                reason=(
+                    "A final or evidence-limited report exists without a judge score; "
+                    "run the judge before stopping."
+                ),
                 expected_information_gain=InformationGain.MEDIUM,
                 estimated_cost=_estimated_cost(snapshot.run, "judge_agent"),
                 target_branch="synthesis/judge",
                 required_role="judge_agent",
                 priority=8,
                 decision_reason=PolicyDecisionReason.REQUEST_JUDGE,
+            )
+        )
+    elif snapshot.final and snapshot.final.partial:
+        candidates.append(
+            _stop_candidate(
+                snapshot,
+                "Evidence-limited partial final has completed required evaluation.",
             )
         )
 
@@ -367,9 +371,11 @@ def _validate_candidate(
     if snapshot.run_state.budget_remaining <= 0 and not _allowed_when_budget_empty(candidate):
         return "budget is exhausted"
 
-    if candidate.action_type == PrincipalActionType.REQUEST_FOLLOWUP and _max_task_wave(
-        snapshot.tasks
-    ) >= MAX_FOLLOWUP_WAVES:
+    if (
+        candidate.action_type == PrincipalActionType.REQUEST_FOLLOWUP
+        and _max_task_wave(snapshot.tasks) >= MAX_FOLLOWUP_WAVES
+        and not _zero_verified_repair_ready(snapshot)
+    ):
         return "follow-up wave already used"
 
     if candidate.action_type in {
@@ -420,12 +426,28 @@ def _duplicates_recent_action(
         if action.status != ActionStatus.EXECUTED:
             continue
         if (
+            candidate.action_type == PrincipalActionType.REQUEST_FOLLOWUP
+            and candidate.target_branch == "research/recovery"
+            and action.action_type == PrincipalActionType.REQUEST_FOLLOWUP
+            and action.target_branch == "research/recovery"
+        ):
+            action_wave = _wave_number_from_reason(action.reason)
+            if action_wave is not None and action_wave < _max_task_wave(snapshot.tasks) + 1:
+                continue
+        if (
             action.action_type == candidate.action_type
             and action.target_branch == candidate.target_branch
             and action.required_role == candidate.required_role
         ):
             return True
     return False
+
+
+def _wave_number_from_reason(reason: str) -> int | None:
+    match = re.search(r"wave\s+(\d+)", reason, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return int(match.group(1))
 
 
 def _branch_has_pending_equivalent(
@@ -679,12 +701,20 @@ def _zero_verified_terminal_aggregation_ready(snapshot: PrincipalSnapshot) -> bo
         return False
     if not snapshot.tasks or any(task.status == "created" for task in snapshot.tasks):
         return False
-    if _max_task_wave(snapshot.tasks) < MAX_FOLLOWUP_WAVES:
+    if (
+        snapshot.run_state.capacity
+        and not snapshot.run_state.capacity.terminal_final_allowed
+    ):
         return False
     if any(verification.verdict == "verified" for verification in snapshot.verifications):
         return False
     checked_claim_ids = {verification.claim_id for verification in snapshot.verifications}
-    claim_ids = {claim.id for claim in snapshot.claims}
+    artifact_by_claim_id = _claim_artifacts_by_legacy_id(snapshot.artifacts)
+    claim_ids = {
+        claim.id
+        for claim in snapshot.claims
+        if not _is_market_snapshot_claim(claim, artifact_by_claim_id.get(claim.id))
+    }
     return claim_ids <= checked_claim_ids
 
 
@@ -693,16 +723,23 @@ def _zero_verified_repair_ready(snapshot: PrincipalSnapshot) -> bool:
         return False
     if not snapshot.tasks or any(task.status == "created" for task in snapshot.tasks):
         return False
-    if _max_task_wave(snapshot.tasks) >= MAX_FOLLOWUP_WAVES:
-        return False
     if any(verification.verdict == "verified" for verification in snapshot.verifications):
         return False
     if snapshot.run_state.capacity and snapshot.run_state.capacity.search_exhausted:
         return False
     if snapshot.run_state.budget_remaining < MIN_USEFUL_ACTION_BUDGET_USD:
         return False
+    if snapshot.run_state.capacity and not snapshot.run_state.capacity.should_continue_research:
+        return False
     checked_claim_ids = {verification.claim_id for verification in snapshot.verifications}
-    claim_ids = {claim.id for claim in snapshot.claims}
+    artifact_by_claim_id = _claim_artifacts_by_legacy_id(snapshot.artifacts)
+    claim_ids = {
+        claim.id
+        for claim in snapshot.claims
+        if not _is_market_snapshot_claim(claim, artifact_by_claim_id.get(claim.id))
+    }
+    if claim_ids and not claim_ids <= checked_claim_ids:
+        return False
     failed_claim_tasks = [
         task
         for task in snapshot.tasks
@@ -710,7 +747,14 @@ def _zero_verified_repair_ready(snapshot: PrincipalSnapshot) -> bool:
         and task.reason
         and "claim_generation" in task.reason.lower()
     ]
-    return bool(claim_ids and claim_ids <= checked_claim_ids) or bool(failed_claim_tasks)
+    return (
+        bool(claim_ids and claim_ids <= checked_claim_ids)
+        or bool(failed_claim_tasks)
+        or bool(
+            snapshot.run_state.capacity
+            and snapshot.run_state.capacity.under_researched_branches
+        )
+    )
 
 
 def _max_task_wave(tasks: list[ResearchTask]) -> int:

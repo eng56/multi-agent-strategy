@@ -240,7 +240,7 @@ def test_low_judge_score_without_followup_requests_followup() -> None:
     assert selected.action_type == PrincipalActionType.REQUEST_FOLLOWUP
 
 
-def test_partial_evidence_limited_final_suppresses_judge_candidate() -> None:
+def test_partial_evidence_limited_final_requests_judge_candidate() -> None:
     current_run = run()
     final = FinalReport(
         run_id=current_run.id,
@@ -253,14 +253,17 @@ def test_partial_evidence_limited_final_suppresses_judge_candidate() -> None:
 
     actions = propose_principal_actions(policy_snapshot)
 
-    assert PrincipalActionType.REQUEST_TOOL_CALL not in {
-        action.action_type for action in actions
-    }
-    assert all(action.required_role != "judge_agent" for action in actions)
-    assert PrincipalActionType.STOP_RUN in {action.action_type for action in actions}
+    judge_actions = [
+        action
+        for action in actions
+        if action.action_type == PrincipalActionType.REQUEST_TOOL_CALL
+        and action.required_role == "judge_agent"
+    ]
+    assert judge_actions
+    assert PrincipalActionType.STOP_RUN not in {action.action_type for action in actions}
 
 
-def test_zero_verified_followup_completion_requests_partial_aggregation() -> None:
+def test_one_zero_verified_followup_wave_requests_more_repair() -> None:
     current_run = run()
     current_task = task(current_run, status="completed")
     current_task.wave_number = 1
@@ -288,8 +291,114 @@ def test_zero_verified_followup_completion_requests_partial_aggregation() -> Non
     selected = select_principal_action(policy_snapshot)
 
     assert selected is not None
+    assert selected.action_type == PrincipalActionType.REQUEST_FOLLOWUP
+    assert "evidence repair" in selected.reason
+
+
+def test_prior_zero_verified_followup_action_does_not_block_next_repair_wave() -> None:
+    current_run = run()
+    current_task = task(current_run, status="completed")
+    current_task.wave_number = 1
+    claim = Claim(
+        run_id=current_run.id,
+        task_id=current_task.id,
+        statement="A broad cross-asset claim remains uncertain.",
+        evidence_observation_ids=[uuid4()],
+        confidence=0.7,
+    )
+    verification = Verification(
+        run_id=current_run.id,
+        claim_id=claim.id,
+        verdict="uncertain",
+        rationale="Partly supported but not synthesis-safe.",
+        confidence=0.6,
+    )
+    prior_followup = PrincipalAction(
+        run_id=current_run.id,
+        action_type=PrincipalActionType.REQUEST_FOLLOWUP,
+        reason="Zero claims passed verification; requesting targeted evidence recovery wave 1.",
+        target_branch="research/recovery",
+        required_role="principal_policy",
+        status=ActionStatus.EXECUTED,
+    )
+    _, policy_snapshot = snapshot(
+        current_run,
+        tasks=[current_task],
+        claims=[claim],
+        verifications=[verification],
+        principal_actions=[prior_followup],
+    )
+
+    selected = select_principal_action(policy_snapshot)
+
+    assert selected is not None
+    assert selected.action_type == PrincipalActionType.REQUEST_FOLLOWUP
+
+
+def test_zero_verified_repair_waves_exhausted_requests_partial_aggregation() -> None:
+    current_run = run()
+    current_task = task(current_run, status="completed")
+    current_task.wave_number = 2
+    claim = Claim(
+        run_id=current_run.id,
+        task_id=current_task.id,
+        statement="A broad cross-asset claim remains uncertain.",
+        evidence_observation_ids=[uuid4()],
+        confidence=0.7,
+    )
+    verification = Verification(
+        run_id=current_run.id,
+        claim_id=claim.id,
+        verdict="uncertain",
+        rationale="Partly supported but not synthesis-safe.",
+        confidence=0.6,
+    )
+    _, policy_snapshot = snapshot(
+        current_run,
+        tasks=[current_task],
+        claims=[claim],
+        verifications=[verification],
+    )
+
+    selected = select_principal_action(policy_snapshot)
+
+    assert selected is not None
     assert selected.action_type == PrincipalActionType.REQUEST_AGGREGATION
     assert "evidence-limited final" in selected.reason
+
+
+def test_zero_verified_terminal_aggregation_allowed_when_search_exhausted() -> None:
+    current_run = run()
+    current_run.budget.tools = ToolBudget(tavily_max_credits=2, tavily_credits_used=2)
+    current_task = task(current_run, status="completed")
+    claim = Claim(
+        run_id=current_run.id,
+        task_id=current_task.id,
+        statement="A broad cross-asset claim remains uncertain.",
+        evidence_observation_ids=[uuid4()],
+        confidence=0.7,
+    )
+    verification = Verification(
+        run_id=current_run.id,
+        claim_id=claim.id,
+        verdict="uncertain",
+        rationale="Search capacity is exhausted.",
+        confidence=0.4,
+    )
+    state, policy_snapshot = snapshot(
+        current_run,
+        tasks=[current_task],
+        claims=[claim],
+        verifications=[verification],
+    )
+
+    selected = select_principal_action(policy_snapshot)
+
+    assert state.capacity is not None
+    assert state.capacity.terminal_final_allowed is True
+    assert "search budget is exhausted" in state.capacity.terminal_final_reasons
+    assert selected is not None
+    assert selected.action_type == PrincipalActionType.REQUEST_AGGREGATION
 
 
 def test_zero_verified_before_repair_requests_followup_when_search_capacity_remains() -> None:

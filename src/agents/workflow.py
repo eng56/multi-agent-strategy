@@ -1,9 +1,15 @@
 import json
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
+from src.agents.budget_utilization import (
+    BudgetUtilizationDecision,
+    evaluate_budget_utilization,
+    settings_from_object,
+)
 from src.agents.state import (
     FOLLOWUP_JUDGE_SCORE_THRESHOLD,
     MAX_FOLLOWUP_WAVES,
@@ -122,6 +128,29 @@ async def persist_artifact(runtime: Runtime, artifact: Artifact, producer: str) 
         runtime, EventType.ARTIFACT_CREATED, artifact.run_id, producer, artifact_id=str(artifact.id)
     )
     return artifact
+
+
+async def persist_tool_dispatch_marker(
+    runtime: Runtime,
+    task: ResearchTask,
+    branch: str,
+    *,
+    producer: str,
+    reason_prefix: str = "Dispatched tool task",
+) -> PrincipalAction:
+    return await persist_action(
+        runtime,
+        task.run_id,
+        PrincipalActionType.REQUEST_TOOL_CALL,
+        f"{reason_prefix}: {task.title} (task_id={task.id})",
+        required_role="tool_runner",
+        target_branch=branch,
+        expected_information_gain=InformationGain.HIGH,
+        estimated_cost=0.01 if task.tool == "market_data" else 0.02,
+        priority=7,
+        status=ActionStatus.EXECUTED,
+        producer=producer,
+    )
 
 
 async def fail_task(
@@ -802,6 +831,13 @@ async def plan(runtime: Runtime, event: EventEnvelope) -> None:
                 priority=8,
                 producer="planner-agent",
             )
+            await persist_tool_dispatch_marker(
+                runtime,
+                task,
+                branch_for_task(task),
+                producer="planner-agent",
+                reason_prefix="Planner dispatched tool task",
+            )
             emit(runtime, EventType.TASK_CREATED, run.id, "planner-agent", task_id=str(task.id))
             created_count += 1
         return created_count
@@ -872,6 +908,13 @@ async def request_followup_wave(
             priority=8,
             producer="judge-agent",
         )
+        await persist_tool_dispatch_marker(
+            runtime,
+            task,
+            branch_for_task(task),
+            producer="judge-agent",
+            reason_prefix=f"Follow-up wave {wave_number} dispatched tool task",
+        )
         emit(
             runtime,
             EventType.TASK_CREATED,
@@ -929,6 +972,81 @@ def _claim_generation_recovery_candidates(tasks: list[ResearchTask]) -> list[Res
     return [task for task in tasks if task.status == "failed"]
 
 
+@dataclass(frozen=True)
+class SearchRepairAllocation:
+    branch: str
+    mode: str
+    instruction: str
+
+
+REPAIR_SEARCH_MODES: tuple[tuple[str, str], ...] = (
+    ("primary_source", "search primary/date-bearing sources and official releases"),
+    ("historical", "search historical episodes and dated market reactions"),
+    ("verification", "search directly supportive evidence for atomic subclaims"),
+    ("contradiction", "run contradiction search for disconfirming evidence"),
+    ("mechanism", "search economic mechanism evidence and transmission channels"),
+    ("recent_news", "search recent news or dated source context when available"),
+)
+
+
+def repair_search_allocation_plan(
+    run: Run,
+    branches: list[str],
+    existing_tasks: list[ResearchTask],
+) -> list[SearchRepairAllocation]:
+    tavily_remaining = max(
+        0, run.budget.tools.tavily_max_credits - run.budget.tools.tavily_credits_used
+    )
+    if tavily_remaining <= 0 or not branches:
+        return []
+    unique_branches = _unique_nonempty_strings(branches)
+    modes_by_branch = _repair_modes_already_requested(existing_tasks)
+    depth_per_branch = max(
+        1,
+        min(
+            len(REPAIR_SEARCH_MODES),
+            tavily_remaining // max(1, len(unique_branches) * 4),
+        ),
+    )
+    target_count = min(tavily_remaining, len(unique_branches) * depth_per_branch)
+    allocations: list[SearchRepairAllocation] = []
+    mode_index = 0
+    while len(allocations) < target_count and mode_index < len(REPAIR_SEARCH_MODES):
+        mode, instruction = REPAIR_SEARCH_MODES[mode_index]
+        for branch in unique_branches:
+            if len(allocations) >= target_count:
+                break
+            if mode in modes_by_branch.get(branch, set()):
+                continue
+            allocations.append(
+                SearchRepairAllocation(
+                    branch=branch,
+                    mode=mode,
+                    instruction=instruction,
+                )
+            )
+        mode_index += 1
+    return allocations
+
+
+def _repair_modes_already_requested(tasks: list[ResearchTask]) -> dict[str, set[str]]:
+    modes_by_branch: dict[str, set[str]] = {}
+    for task in tasks:
+        if task.wave_number <= 0:
+            continue
+        branch = branch_for_task(task)
+        text = f"{task.title} {task.question} {task.reason or ''}".casefold()
+        branch_modes = modes_by_branch.setdefault(branch, set())
+        matched = False
+        for mode, _instruction in REPAIR_SEARCH_MODES:
+            if f"search mode: {mode}" in text:
+                branch_modes.add(mode)
+                matched = True
+        if not matched:
+            branch_modes.add("primary_source")
+    return modes_by_branch
+
+
 def zero_verified_followup_task_items(
     run: Run,
     tasks: list[ResearchTask],
@@ -945,16 +1063,25 @@ def zero_verified_followup_task_items(
         run, tasks, claims, verifications, artifacts
     )
     items: list[dict[str, Any]] = []
-    for branch, context_lines in list(branch_context.items())[:capacity]:
+    allocations = repair_search_allocation_plan(
+        run, list(branch_context.keys()), tasks
+    )
+    for allocation in allocations[:capacity]:
+        branch = allocation.branch
+        context_lines = branch_context.get(branch, [])
         context = "\n".join(f"- {line}" for line in context_lines[:6])
         if not context:
             context = "- No branch-specific claim text was available; use observations and the original question."
-        title = f"Evidence repair: {title_from_branch(branch)}"[:80].rstrip()
+        title = (
+            f"Evidence repair: {title_from_branch(branch)} "
+            f"{allocation.mode.replace('_', ' ')}"
+        )[:80].rstrip()
         items.append(
             {
                 "title": title,
                 "question": (
                     f"Repair evidence for branch {branch}. Original question: {run.question}\n"
+                    f"Search mode: {allocation.mode}. Use this mode to {allocation.instruction}.\n"
                     f"Failed/disputed evidence state:\n{context}\n"
                     "Required repair behavior: split broad claims into atomic claims; "
                     "search primary/date-bearing sources; search higher-quality secondary "
@@ -967,7 +1094,7 @@ def zero_verified_followup_task_items(
                 "wave_number": wave_number,
                 "reason": (
                     "Zero claims passed verification; branch-distributed evidence repair "
-                    f"for {branch} before terminal synthesis."
+                    f"for {branch} before terminal synthesis. Search mode: {allocation.mode}."
                 ),
             }
         )
@@ -1034,11 +1161,10 @@ def _zero_verified_repair_context_by_branch(
             ),
         )
 
-    if context_by_branch:
-        return _prioritize_repair_branches(context_by_branch, run.question)
-
     for branch in semantic_branches(run.question):
         if branch.startswith(("root", "trust/", "synthesis/")):
+            continue
+        if branch in context_by_branch:
             continue
         add(branch, "no verified claims; branch needs dated source repair coverage")
     return _prioritize_repair_branches(context_by_branch, run.question)
@@ -1082,20 +1208,18 @@ async def request_zero_verified_followup_wave(
     claims: list[Claim],
     verifications: list[Verification],
 ) -> int:
-    if max_task_wave(tasks) >= MAX_FOLLOWUP_WAVES:
+    policy_settings = settings_from_object(getattr(runtime, "settings", None))
+    if max_task_wave(tasks) >= policy_settings.min_repair_waves_before_partial_final:
         return 0
     if not _has_zero_verified_recovery_capacity(run):
         return 0
     if any(task.status == "created" for task in tasks):
         return 0
-    if any(
-        action.action_type == PrincipalActionType.REQUEST_FOLLOWUP
-        and action.status == ActionStatus.EXECUTED
-        for action in await runtime.blackboard.list_models(run.id, "principal_actions", PrincipalAction)
-    ):
-        return 0
 
-    wave_number = min(max_task_wave(tasks) + 1, MAX_FOLLOWUP_WAVES)
+    wave_number = min(
+        max_task_wave(tasks) + 1,
+        policy_settings.min_repair_waves_before_partial_final,
+    )
     await persist_action(
         runtime,
         run.id,
@@ -1136,6 +1260,13 @@ async def request_zero_verified_followup_wave(
             expected_information_gain=InformationGain.HIGH,
             priority=8,
             producer="aggregator-agent",
+        )
+        await persist_tool_dispatch_marker(
+            runtime,
+            task,
+            branch_for_task(task),
+            producer="aggregator-agent",
+            reason_prefix=f"Zero-verified follow-up wave {wave_number} dispatched tool task",
         )
         emit(
             runtime,
@@ -1191,9 +1322,22 @@ def build_evidence_request(
         task_id=task.id,
         branch=branch,
         objective=task.question,
-        search_mode=SearchMode.EXPLORATORY,
+        search_mode=search_mode_for_task(task),
         max_sources=evidence_max_sources(runtime),
     )
+
+
+def search_mode_for_task(task: ResearchTask) -> SearchMode:
+    text = f"{task.title} {task.question} {task.reason or ''}".casefold()
+    if "search mode: primary_source" in text or "primary/date-bearing" in text:
+        return SearchMode.PRIMARY_SOURCE
+    if "search mode: historical" in text or "historical" in text:
+        return SearchMode.HISTORICAL
+    if "search mode: verification" in text:
+        return SearchMode.VERIFICATION
+    if "search mode: contradiction" in text or "contradiction search" in text:
+        return SearchMode.CONTRADICTION
+    return SearchMode.EXPLORATORY
 
 
 async def search_evidence(runtime: Runtime, request: EvidenceRequest) -> EvidenceBundle:
@@ -1654,9 +1798,38 @@ def _fallback_claim_statement(observation: Observation, branch: str) -> str:
     market_snapshot_claim = _market_snapshot_claim_statement(observation)
     if market_snapshot_claim:
         return market_snapshot_claim
-    return compact_text(
-        f"Evidence observation for {branch}: {observation.summary}",
-        max_chars=700,
+    return _mechanism_claim_statement(branch)
+
+
+def _mechanism_claim_statement(branch: str) -> str:
+    mechanism_by_branch = {
+        "macro/rates": (
+            "Faster-than-expected Fed cuts tend to lower the expected short-rate path "
+            "and Treasury yields, conditional on inflation and growth expectations."
+        ),
+        "market/fx": (
+            "Lower expected U.S. rates tend to weaken the U.S. dollar through narrower "
+            "rate differentials, all else equal."
+        ),
+        "market/gold": (
+            "Lower real yields tend to support gold because the opportunity cost of "
+            "holding non-yielding assets falls."
+        ),
+        "market/bonds": (
+            "Long-duration bonds tend to benefit when expected policy rates and yields fall, "
+            "though the move depends on inflation and term-premium changes."
+        ),
+        "market/equities": (
+            "Equities can benefit from easier expected policy, but the reaction depends on "
+            "whether cuts signal easing support or a growth scare."
+        ),
+    }
+    return mechanism_by_branch.get(
+        branch,
+        (
+            f"Evidence for {title_from_branch(branch)} should be interpreted through "
+            "asset-specific economic mechanisms and verified before synthesis."
+        ),
     )
 
 
@@ -1667,8 +1840,6 @@ def _fallback_claim(
     *,
     confidence: float = 0.35,
 ) -> Claim:
-    if _market_snapshot_claim_statement(observation):
-        confidence = max(confidence, 0.55)
     return Claim(
         run_id=event.run_id,
         task_id=observation.task_id,
@@ -1677,6 +1848,33 @@ def _fallback_claim(
         evidence_observation_ids=[observation.id],
         sources=observation.sources,
     )
+
+
+def _is_source_meta_claim(statement: str) -> bool:
+    text = statement.casefold()
+    source_meta_patterns = (
+        "source title",
+        "evidenceengine retrieval",
+        "evidenceengine observation",
+        "retrieval includes",
+        "provider returned",
+        "provider did not include",
+        "publication date",
+        "published date",
+        "missing publication",
+        "source count",
+        "source(s)",
+        "sources inspected",
+        "source list",
+        "quality score",
+        "source quality",
+        "top score",
+        "average score",
+        "raw provider artifact",
+        "strongest evidence snippets",
+        "source limitations",
+    )
+    return any(pattern in text for pattern in source_meta_patterns)
 
 
 async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
@@ -1742,15 +1940,37 @@ async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
             SYSTEM,
             f"Create one narrow, verifiable claim supported only by this observation. "
             f"Do not create portfolio advice, causal claims, or claims about data "
-            f"availability unless directly stated by a source. "
+            f"availability unless directly stated by a source. Do not create claims "
+            f"about source titles, retrieval contents, source counts, publication-date "
+            f"metadata, provider metadata, or quality-score metadata; turn the observation "
+            f"into an economic mechanism or market claim instead. "
             f'Return {{"statement":"...","confidence":0.0}}. Observation: '
             f"{observation.summary}",
         )
+        statement = compact_text(text_from_model_field(result["statement"]), max_chars=700)
+        confidence = score_from_model_field(result["confidence"])
+        if _is_source_meta_claim(statement):
+            statement = _mechanism_claim_statement(branch)
+            confidence = min(confidence, 0.45)
+            await persist_action(
+                runtime,
+                event.run_id,
+                PrincipalActionType.REQUEST_VERIFICATION,
+                (
+                    "Claim extractor produced source/provider metadata; replaced it "
+                    "with a branch mechanism claim before verification."
+                ),
+                required_role="research_agent",
+                target_branch=branch,
+                expected_information_gain=InformationGain.LOW,
+                priority=4,
+                producer="worker-agents",
+            )
         claim = Claim(
             run_id=event.run_id,
             task_id=observation.task_id,
-            statement=compact_text(text_from_model_field(result["statement"]), max_chars=700),
-            confidence=score_from_model_field(result["confidence"]),
+            statement=statement,
+            confidence=confidence,
             evidence_observation_ids=[observation.id],
             sources=observation.sources,
         )
@@ -2723,6 +2943,7 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
         objective="Synthesize trusted claims into a decision-grade final report.",
     )
     artifacts = await runtime.blackboard.list_models(event.run_id, "artifacts", Artifact)
+    observations = await runtime.blackboard.list_models(event.run_id, "observations", Observation)
     run_state = build_run_state(
         run,
         tasks,
@@ -2730,8 +2951,52 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
         verifications,
         agent_specs=agent_specs or [aggregator_spec],
         artifacts=artifacts,
+        observations=observations,
     )
     if not verified:
+        utilization = evaluate_budget_utilization(
+            run,
+            run_state.budget_summary,
+            tasks=tasks,
+            claims=claims,
+            verifications=verifications,
+            artifacts=artifacts,
+            observations=observations,
+            final=existing_final,
+            active_branches=run_state.active_branches,
+            settings=getattr(runtime, "settings", None),
+        )
+        if not utilization.terminal_final_allowed:
+            await create_zero_verified_diagnostic(
+                runtime,
+                run,
+                tasks=tasks,
+                claims=claims,
+                verifications=verifications,
+                artifacts=artifacts,
+                utilization=utilization,
+            )
+            if await request_zero_verified_followup_wave(
+                runtime,
+                run,
+                tasks=tasks,
+                claims=claims,
+                verifications=verifications,
+            ):
+                return
+            await evaluate_principal_policy_safely(
+                runtime, event.run_id, trigger="aggregate.terminal_blocked_by_budget_policy"
+            )
+            return
+        await create_zero_verified_diagnostic(
+            runtime,
+            run,
+            tasks=tasks,
+            claims=claims,
+            verifications=verifications,
+            artifacts=artifacts,
+            utilization=utilization,
+        )
         if await request_zero_verified_followup_wave(
             runtime,
             run,
@@ -2747,6 +3012,7 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
             claims=claims,
             verifications=verifications,
             artifacts=artifacts,
+            utilization=utilization,
         )
         return
     if (
@@ -2920,6 +3186,110 @@ async def judge(runtime: Runtime, event: EventEnvelope) -> None:
     await evaluate_principal_policy_safely(runtime, event.run_id, trigger="judge.completed")
 
 
+def _has_zero_verified_diagnostic(artifacts: list[Artifact], wave_number: int) -> bool:
+    return any(
+        artifact.branch == "synthesis/aggregator"
+        and "evidence_gap_planner" in artifact.tags
+        and f"wave:{wave_number}" in artifact.tags
+        for artifact in artifacts
+    )
+
+
+async def create_zero_verified_diagnostic(
+    runtime: Runtime,
+    run: Run,
+    *,
+    tasks: list[ResearchTask],
+    claims: list[Claim],
+    verifications: list[Verification],
+    artifacts: list[Artifact],
+    utilization: BudgetUtilizationDecision,
+) -> Artifact | None:
+    wave_number = max_task_wave(tasks)
+    if _has_zero_verified_diagnostic(artifacts, wave_number):
+        return None
+    if run.budget.limit_usd - run.budget.spent_usd - run.budget.reserved_usd <= 0.05:
+        return None
+    verification_payload = [
+        {
+            "claim": next(
+                (claim.statement for claim in claims if claim.id == verification.claim_id),
+                "<claim missing>",
+            ),
+            "verdict": verification.verdict,
+            "unsupported_parts": verification.unsupported_parts,
+            "contradictions": verification.contradictions,
+            "required_caveats": verification.required_caveats,
+            "source_quality_summary": verification.source_quality_summary,
+        }
+        for verification in verifications[:12]
+    ]
+    try:
+        result = await runtime.llm.json(
+            run.id,
+            AgentRole.AGGREGATOR,
+            "evidence-gap-planner",
+            SYSTEM,
+            "No claims passed verification. Produce internal diagnostics only, not an "
+            "investment answer. Split broad failures into atomic evidence gaps and targeted "
+            "search recommendations. Return strict JSON "
+            '{"diagnostic":"...","targeted_gaps":["..."],"repair_branches":["..."]}. '
+            f"Question: {run.question}. Budget policy blockers: "
+            f"{json.dumps(utilization.terminal_final_blockers)}. "
+            f"Under-researched branches: {json.dumps(utilization.under_researched_branches)}. "
+            f"Verifications: {json.dumps(verification_payload)[:12000]}",
+        )
+        diagnostic = text_from_model_field(
+            result.get("diagnostic", "Evidence-gap planner completed.")
+        )
+        gaps = _string_list_from_model_field(result.get("targeted_gaps", []))
+        branches = _string_list_from_model_field(result.get("repair_branches", []))
+        lines = [diagnostic]
+        if gaps:
+            lines.append("Targeted gaps: " + "; ".join(gaps[:8]))
+        if branches:
+            lines.append("Repair branches: " + "; ".join(branches[:8]))
+        summary = compact_text("\n\n".join(lines), max_chars=3000)
+        status = ArtifactStatus.VERIFIED
+    except BudgetExceeded:
+        raise
+    except Exception as exc:
+        summary = compact_text(
+            "Evidence-gap planner did not complete; continuing with deterministic "
+            f"repair planning. Failure: {concise_exception(exc)}",
+            max_chars=1000,
+        )
+        status = ArtifactStatus.DISPUTED
+
+    artifact = Artifact(
+        run_id=run.id,
+        artifact_type=ArtifactType.DATA_GAP,
+        branch="synthesis/aggregator",
+        text_or_summary=summary,
+        tags=[
+            "evidence_gap_planner",
+            "diagnostic",
+            "zero_verified",
+            f"wave:{wave_number}",
+        ],
+        visibility=VisibilityScope.PUBLIC_UNVERIFIED,
+        status=status,
+    )
+    await persist_artifact(runtime, artifact, "aggregator-agent")
+    await persist_action(
+        runtime,
+        run.id,
+        PrincipalActionType.REQUEST_AGGREGATION,
+        "Created zero-verified evidence-gap diagnostic before terminal final.",
+        required_role="aggregator_agent",
+        target_branch="synthesis/aggregator",
+        expected_information_gain=InformationGain.MEDIUM,
+        priority=6,
+        producer="aggregator-agent",
+    )
+    return artifact
+
+
 async def _write_no_verified_evidence_final(
     runtime: Runtime,
     run: Run,
@@ -2928,9 +3298,12 @@ async def _write_no_verified_evidence_final(
     claims: list[Claim],
     verifications: list[Verification],
     artifacts: list[Artifact],
+    utilization: BudgetUtilizationDecision,
 ) -> None:
     """Create a deterministic final when research produced no synthesis-safe claims."""
-    answer = _no_verified_evidence_answer(run, tasks, claims, verifications, artifacts)
+    answer = _no_verified_evidence_answer(
+        run, tasks, claims, verifications, artifacts, utilization
+    )
     caveated_sources = _caveated_evidence_sources(verifications, artifacts)
     caveated_dependencies = _caveated_evidence_artifact_ids(verifications, artifacts)
     final = FinalReport(
@@ -2970,21 +3343,29 @@ async def _write_no_verified_evidence_final(
         priority=5,
         producer="aggregator-agent",
     )
-    await persist_action(
-        runtime,
-        run.id,
-        PrincipalActionType.STOP_RUN,
-        "Completed with an evidence-limited final: no synthesis-safe verified claims were available.",
-        required_role="principal_policy",
-        target_branch="synthesis/aggregator",
-        expected_information_gain=InformationGain.LOW,
-        priority=4,
-        producer="aggregator-agent",
-    )
     run.final_answer = answer
-    run.status = RunStatus.COMPLETED
     run.failure_reason = None
-    await runtime.blackboard.put_run(run)
+    if run.models.judge and utilization.judge_utilization_ratio < 1:
+        run.status = RunStatus.RUNNING
+        await runtime.blackboard.put_run(run)
+        emit(runtime, EventType.FINAL_CREATED, run.id, "aggregator-agent")
+    else:
+        await persist_action(
+            runtime,
+            run.id,
+            PrincipalActionType.STOP_RUN,
+            (
+                "Completed with an evidence-limited final: no synthesis-safe verified "
+                "claims were available and no judge capacity remained."
+            ),
+            required_role="principal_policy",
+            target_branch="synthesis/aggregator",
+            expected_information_gain=InformationGain.LOW,
+            priority=4,
+            producer="aggregator-agent",
+        )
+        run.status = RunStatus.COMPLETED
+        await runtime.blackboard.put_run(run)
     await evaluate_principal_policy_safely(runtime, run.id, trigger="final.no_verified")
 
 
@@ -3064,6 +3445,7 @@ def _no_verified_evidence_answer(
     claims: list[Claim],
     verifications: list[Verification],
     artifacts: list[Artifact],
+    utilization: BudgetUtilizationDecision,
 ) -> str:
     verification_by_claim_id = {
         verification.claim_id: verification for verification in verifications
@@ -3112,6 +3494,21 @@ def _no_verified_evidence_answer(
             "No claim reached verified status, so disputed or unverified material cannot be used as final support.",
             "A follow-up run should gather dated primary sources and re-check any missing market-data feeds.",
         ]
+    tavily = run.budget.tools
+    branches_repaired = utilization.branches_repaired or [
+        branch_for_task(task)
+        for task in tasks
+        if task.wave_number > 0
+    ]
+    branches_repaired_text = ", ".join(_unique_nonempty_strings(branches_repaired)) or "none"
+    if utilization.terminal_final_reasons:
+        unused_reason = "; ".join(utilization.terminal_final_reasons)
+    elif utilization.terminal_final_blockers:
+        unused_reason = "policy blockers remained: " + "; ".join(
+            utilization.terminal_final_blockers
+        )
+    else:
+        unused_reason = "no additional useful action was available under the submitted budgets"
 
     return "\n".join(
         [
@@ -3132,6 +3529,20 @@ def _no_verified_evidence_answer(
             f"- Rejected claims: {rejected_count}",
             f"- Disputed / uncertain claims: {uncertain_count}",
             f"- Distinct source references inspected: {source_count}",
+            "",
+            "## Budget utilization at stop",
+            "",
+            f"- Tavily used/max: {tavily.tavily_credits_used}/{tavily.tavily_max_credits} "
+            f"({utilization.tavily_utilization_ratio:.0%})",
+            f"- Market data used/max: {tavily.market_data_requests_used}/{tavily.market_data_max_requests} "
+            f"({utilization.market_data_utilization_ratio:.0%})",
+            f"- LLM spent/limit: ${run.budget.spent_usd:.2f}/${run.budget.limit_usd:.2f} "
+            f"({utilization.llm_utilization_ratio:.0%})",
+            f"- Repair waves attempted/minimum before partial final: "
+            f"{utilization.repair_waves_attempted}/"
+            f"{utilization.min_repair_waves_before_partial_final}",
+            f"- Branches repaired: {branches_repaired_text}",
+            f"- Reason remaining budget was not used: {unused_reason}.",
             "",
             "## Candidate claims not accepted as final support",
             "",
