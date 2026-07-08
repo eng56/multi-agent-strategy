@@ -229,6 +229,11 @@ class Claim(BaseModel):
     evidence_observation_ids: list[UUID]
     sources: list[str] = Field(default_factory=list)
     confidence: float = Field(ge=0, le=1)
+    claim_type: str | None = None
+    asset: str | None = None
+    direction: str | None = None
+    time_horizon: str | None = None
+    derived_from_verification_id: UUID | None = None
 
 
 class Verification(BaseModel):
@@ -419,6 +424,14 @@ class RunState(BaseModel):
     dead_letter_count: int = 0
     stop_reasons: list[str] = Field(default_factory=list)
     next_action_candidates: list[PrincipalAction] = Field(default_factory=list)
+    tavily_used: int = 0
+    verified_claims: int = 0
+    verified_claims_per_10_tavily: float = 0
+    disputed_claims: int = 0
+    source_quality_distribution: dict[str, int] = Field(default_factory=dict)
+    claims_created_from_supported_parts: int = 0
+    aggregator_used: bool = False
+    judge_used: bool = False
 
 
 class RunDetail(BaseModel):

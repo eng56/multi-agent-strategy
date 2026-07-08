@@ -131,6 +131,103 @@ def test_run_state_exposes_budget_summary() -> None:
     assert state.capacity.market_data_exhausted is False
 
 
+def test_run_state_tracks_conversion_quality_metrics() -> None:
+    current_run = run()
+    current_run.budget.tools = ToolBudget(tavily_max_credits=100, tavily_credits_used=100)
+    task = ResearchTask(
+        run_id=current_run.id,
+        title="Fed cuts and rates",
+        question="Find rates evidence",
+        tool="web_search",
+        status="completed",
+    )
+    verified_claim = Claim(
+        run_id=current_run.id,
+        task_id=task.id,
+        statement="Lower expected Fed policy rates tend to reduce front-end Treasury yields.",
+        evidence_observation_ids=[uuid4()],
+        confidence=0.8,
+    )
+    disputed_claim = Claim(
+        run_id=current_run.id,
+        task_id=task.id,
+        statement="Fed cuts guarantee a bullish cross-asset outcome.",
+        evidence_observation_ids=[uuid4()],
+        confidence=0.8,
+        derived_from_verification_id=uuid4(),
+    )
+    verifications = [
+        Verification(
+            run_id=current_run.id,
+            claim_id=verified_claim.id,
+            verdict="verified",
+            rationale="Supported.",
+            confidence=0.82,
+            source_quality_summary="1 primary and 2 high_quality_secondary sources.",
+        ),
+        Verification(
+            run_id=current_run.id,
+            claim_id=disputed_claim.id,
+            verdict="uncertain",
+            rationale="Too broad.",
+            confidence=0.42,
+            source_quality_summary="1 unknown source.",
+        ),
+    ]
+    artifacts = [
+        Artifact(
+            run_id=current_run.id,
+            artifact_type=ArtifactType.CLAIM,
+            text_or_summary=verified_claim.statement,
+            status=ArtifactStatus.VERIFIED,
+            legacy_object_type="claim",
+            legacy_object_id=verified_claim.id,
+        ),
+        Artifact(
+            run_id=current_run.id,
+            artifact_type=ArtifactType.CLAIM,
+            text_or_summary=disputed_claim.statement,
+            status=ArtifactStatus.DISPUTED,
+            tags=["supported_part_subclaim"],
+            legacy_object_type="claim",
+            legacy_object_id=disputed_claim.id,
+        ),
+        Artifact(
+            run_id=current_run.id,
+            artifact_type=ArtifactType.JUDGE_FEEDBACK,
+            text_or_summary="Clear caveats.",
+            status=ArtifactStatus.VERIFIED,
+        ),
+    ]
+    final = FinalReport(
+        run_id=current_run.id,
+        answer="Caveated final.",
+        verified_claim_ids=[verified_claim.id],
+        sources=[],
+        judge_score=0.8,
+    )
+
+    state = build_run_state(
+        current_run,
+        [task],
+        [verified_claim, disputed_claim],
+        verifications,
+        final,
+        artifacts=artifacts,
+    )
+
+    assert state.tavily_used == 100
+    assert state.verified_claims == 1
+    assert state.verified_claims_per_10_tavily == 0.1
+    assert state.disputed_claims == 1
+    assert state.source_quality_distribution["primary"] == 1
+    assert state.source_quality_distribution["high_quality_secondary"] == 2
+    assert state.source_quality_distribution["unknown"] == 1
+    assert state.claims_created_from_supported_parts == 1
+    assert state.aggregator_used is True
+    assert state.judge_used is True
+
+
 def test_run_state_promotes_verified_claims_and_requests_aggregation() -> None:
     current_run = run()
     task = ResearchTask(
