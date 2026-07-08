@@ -486,8 +486,42 @@ def _normal_claims(claims: list[Claim], artifacts: list[Artifact]) -> list[Claim
     return [
         claim
         for claim in claims
-        if not _is_market_snapshot_claim(claim, artifact_by_claim_id.get(claim.id))
+        if not _is_context_only_claim(claim, artifact_by_claim_id.get(claim.id))
     ]
+
+
+def _is_context_only_claim(claim: Claim, artifact: Artifact | None) -> bool:
+    text = claim.statement.casefold()
+    if _is_market_snapshot_claim(claim, artifact):
+        return True
+    if any(
+        pattern in text
+        for pattern in (
+            "evidenceengine",
+            "publication date",
+            "provider",
+            "retrieval",
+            "source count",
+            "source title",
+            "source quality",
+            "quality score",
+        )
+    ):
+        return True
+    if claim.derived_from_verification_id is not None:
+        return True
+    return bool(
+        artifact
+        and any(
+            tag in artifact.tags
+            for tag in (
+                "context_only",
+                "source_meta_claim_rejected",
+                "supported_part_subclaim",
+                "derived_from_supported_parts",
+            )
+        )
+    )
 
 
 def _is_market_snapshot_claim(claim: Claim, artifact: Artifact | None) -> bool:
@@ -517,9 +551,42 @@ def _observations_without_claims(
         observation
         for observation in observations
         if observation.id not in claimed_observation_ids
+        and _is_original_research_observation(observation, artifacts)
         and not _is_market_snapshot_observation(observation, artifacts)
         and not _is_data_gap_observation(observation, artifacts)
     ]
+
+
+def _is_original_research_observation(
+    observation: Observation, artifacts: list[Artifact]
+) -> bool:
+    if observation.tool != "web_search":
+        return False
+    return not any(
+        artifact.legacy_object_type == "observation"
+        and artifact.legacy_object_id == observation.id
+        and (
+            artifact.artifact_type
+            in {
+                ArtifactType.VERIFICATION,
+                ArtifactType.DATA_GAP,
+                ArtifactType.FINAL_REPORT,
+                ArtifactType.JUDGE_FEEDBACK,
+            }
+            or (artifact.branch or "").startswith(("trust/", "synthesis/"))
+            or any(
+                tag in artifact.tags
+                for tag in (
+                    "context_only",
+                    "evidence_gap_planner",
+                    "source_meta_claim_rejected",
+                    "market_snapshot_claim_rejected",
+                    "tool:market_data",
+                )
+            )
+        )
+        for artifact in artifacts
+    )
 
 
 def _is_market_snapshot_observation(observation: Observation, artifacts: list[Artifact]) -> bool:

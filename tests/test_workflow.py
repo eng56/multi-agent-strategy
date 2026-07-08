@@ -1406,10 +1406,205 @@ def test_create_claim_skips_source_meta_observation_without_claim() -> None:
     assert rt.blackboard.claims == []
     assert llm.calls == []
     assert any(
-        action.action_type == PrincipalActionType.REQUEST_VERIFICATION
+        action.action_type == PrincipalActionType.ASSIGN_TASK
         and "Skipped claim extraction for source/provider metadata" in action.reason
         for action in rt.blackboard.actions
     )
+    assert any("source_meta_claim_rejected" in artifact.tags for artifact in rt.blackboard.artifacts)
+
+
+def test_create_claim_rejects_source_meta_model_output_before_verifier() -> None:
+    run = Run(
+        question="What happens to equities if the Fed cuts faster?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="Equity mechanism evidence",
+        question="Fed cuts and U.S. equities",
+        tool="web_search",
+        branch="market/equities",
+    )
+    observation = Observation(
+        run_id=run.id,
+        task_id=task.id,
+        tool="web_search",
+        summary="Lower discount rates can support equities, while weaker earnings expectations can offset that effect.",
+        artifact=ArtifactPointer(uri="gs://bucket/raw.json", size_bytes=2, sha256="0" * 64),
+        sources=["https://example.com/equities"],
+    )
+    llm = QueueLLM(
+        {
+            "claims": [
+                {
+                    "statement": "The source title says financial publications discuss Fed cuts.",
+                    "claim_type": "data_point",
+                    "asset": "equities",
+                    "direction": "unknown",
+                    "time_horizon": "current",
+                    "confidence": 0.8,
+                }
+            ]
+        }
+    )
+    rt = runtime(run, llm)
+    rt.blackboard.tasks.append(task)
+    rt.blackboard.observations.append(observation)
+    rt.blackboard.artifacts.append(
+        Artifact(
+            run_id=run.id,
+            artifact_type=ArtifactType.OBSERVATION,
+            branch="market/equities",
+            text_or_summary=observation.summary,
+            legacy_object_type="observation",
+            legacy_object_id=observation.id,
+        )
+    )
+
+    asyncio.run(
+        create_claim(
+            rt,
+            EventEnvelope(
+                type=EventType.OBSERVATION_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"observation_id": str(observation.id)},
+            ),
+        )
+    )
+
+    assert rt.blackboard.claims == []
+    assert not any(event.type == EventType.CLAIM_CREATED for _topic, event in rt.published)
+    assert any("source_meta_claim_rejected" in artifact.tags for artifact in rt.blackboard.artifacts)
+
+
+def test_create_claim_skips_trust_source_verifier_observation() -> None:
+    run = Run(
+        question="What happens if the Fed cuts faster?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="Verifier observation",
+        question="Verifier rationale",
+        tool="web_search",
+        branch="trust/source_verifier",
+    )
+    observation = Observation(
+        run_id=run.id,
+        task_id=task.id,
+        tool="verification_web_search",
+        summary="Verifier rationale with supported parts.",
+        artifact=ArtifactPointer(uri="gs://bucket/verification.json", size_bytes=2, sha256="0" * 64),
+        sources=["https://example.com/verifier"],
+    )
+    rt = runtime(run, QueueLLM({"statement": "This should not be called.", "confidence": 0.8}))
+    rt.blackboard.tasks.append(task)
+    rt.blackboard.observations.append(observation)
+    rt.blackboard.artifacts.append(
+        Artifact(
+            run_id=run.id,
+            artifact_type=ArtifactType.OBSERVATION,
+            branch="trust/source_verifier",
+            text_or_summary=observation.summary,
+            legacy_object_type="observation",
+            legacy_object_id=observation.id,
+        )
+    )
+
+    asyncio.run(
+        create_claim(
+            rt,
+            EventEnvelope(
+                type=EventType.OBSERVATION_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"observation_id": str(observation.id)},
+            ),
+        )
+    )
+
+    assert rt.llm.calls == []
+    assert rt.blackboard.claims == []
+    assert any("trust-layer observation" in action.reason for action in rt.blackboard.actions)
+
+
+def test_claim_cap_triggers_synthesis_path_without_more_claim_generation() -> None:
+    run = Run(
+        question="What happens if the Fed cuts faster?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="Rates evidence",
+        question="Fed cuts and rates",
+        tool="web_search",
+        branch="macro/rates",
+    )
+    observation = Observation(
+        run_id=run.id,
+        task_id=task.id,
+        tool="web_search",
+        summary="New observation should not produce claim after cap.",
+        artifact=ArtifactPointer(uri="gs://bucket/raw.json", size_bytes=2, sha256="0" * 64),
+        sources=["https://example.com/rates"],
+    )
+    rt = runtime(run, QueueLLM({"statement": "This should not be called.", "confidence": 0.8}))
+    rt.blackboard.tasks.append(task)
+    rt.blackboard.observations.append(observation)
+    for index in range(20):
+        claim = Claim(
+            run_id=run.id,
+            task_id=task.id,
+            statement=f"Existing normal claim {index}.",
+            evidence_observation_ids=[uuid4()],
+            confidence=0.5,
+        )
+        rt.blackboard.claims.append(claim)
+        rt.blackboard.artifacts.append(
+            Artifact(
+                run_id=run.id,
+                artifact_type=ArtifactType.CLAIM,
+                branch="macro/rates" if index < 5 else "market/equities",
+                text_or_summary=claim.statement,
+                legacy_object_type="claim",
+                legacy_object_id=claim.id,
+            )
+        )
+    rt.blackboard.artifacts.append(
+        Artifact(
+            run_id=run.id,
+            artifact_type=ArtifactType.OBSERVATION,
+            branch="macro/rates",
+            text_or_summary=observation.summary,
+            legacy_object_type="observation",
+            legacy_object_id=observation.id,
+        )
+    )
+
+    asyncio.run(
+        create_claim(
+            rt,
+            EventEnvelope(
+                type=EventType.OBSERVATION_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"observation_id": str(observation.id)},
+            ),
+        )
+    )
+
+    assert rt.llm.calls == []
+    assert len(rt.blackboard.claims) == 20
+    assert any(
+        action.action_type == PrincipalActionType.REQUEST_AGGREGATION
+        and "Claim cap reached" in action.reason
+        for action in rt.blackboard.actions
+    )
+    assert any(event.type == EventType.CLAIM_VERIFIED for _topic, event in rt.published)
 
 
 def test_create_claim_skips_market_snapshot_observation_without_claim_or_verification() -> None:
@@ -1472,6 +1667,61 @@ def test_create_claim_skips_market_snapshot_observation_without_claim_or_verific
     assert any(
         action.action_type == PrincipalActionType.ASSIGN_TASK
         and "Skipped claim extraction for market snapshot" in action.reason
+        for action in rt.blackboard.actions
+    )
+
+
+def test_verify_claim_skips_legacy_market_snapshot_claim_without_search() -> None:
+    run = Run(
+        question="What happens to long-duration bonds if the Fed cuts faster?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    claim = Claim(
+        run_id=run.id,
+        task_id=uuid4(),
+        statement="Market data snapshot selected TLT (etf) via massive/stocks.",
+        evidence_observation_ids=[uuid4()],
+        sources=["https://massive.com/stocks/TLT"],
+        confidence=0.7,
+    )
+    claim_artifact = Artifact(
+        run_id=run.id,
+        artifact_type=ArtifactType.CLAIM,
+        branch="market/bonds",
+        text_or_summary=claim.statement,
+        tags=["market_snapshot", "context_only"],
+        legacy_object_type="claim",
+        legacy_object_id=claim.id,
+    )
+    rt = runtime(
+        run,
+        QueueLLM({"verdict": "verified", "rationale": "Should not run", "confidence": 0.9}),
+    )
+    rt.blackboard.claims.append(claim)
+    rt.blackboard.artifacts.append(claim_artifact)
+
+    asyncio.run(
+        verify_claim(
+            rt,
+            EventEnvelope(
+                type=EventType.CLAIM_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"claim_id": str(claim.id)},
+            ),
+        )
+    )
+
+    assert rt.llm.calls == []
+    assert rt.blackboard.verifications == []
+    assert any(
+        "market_snapshot_claim_rejected" in artifact.tags
+        for artifact in rt.blackboard.artifacts
+    )
+    assert any(
+        action.action_type == PrincipalActionType.REQUEST_AGGREGATION
+        and "Skipped context-only/source-meta claim" in action.reason
         for action in rt.blackboard.actions
     )
 
@@ -1858,7 +2108,7 @@ def test_verify_claim_partial_support_adds_required_caveat() -> None:
     assert "Required caveats:" in artifact.text_or_summary
 
 
-def test_verify_claim_promotes_supported_parts_as_reverifiable_subclaims() -> None:
+def test_verify_claim_stores_supported_parts_without_recursive_claims() -> None:
     run = Run(
         question="What happens if the Fed cuts faster?",
         models=model_policy(),
@@ -1889,16 +2139,6 @@ def test_verify_claim_promotes_supported_parts_as_reverifiable_subclaims() -> No
                 "required_caveats": [],
                 "source_quality_summary": "Primary and institutional sources support the rate mechanism.",
             },
-            {
-                "verdict": "verified",
-                "rationale": "Primary and institutional evidence support the atomic rate claim.",
-                "confidence": 0.81,
-                "supported_parts": [],
-                "unsupported_parts": [],
-                "contradictions": ["No material contradiction"],
-                "required_caveats": [],
-                "source_quality_summary": "Primary and high_quality_secondary support.",
-            },
         ),
     )
     rt.blackboard.claims.append(claim)
@@ -1926,39 +2166,18 @@ def test_verify_claim_promotes_supported_parts_as_reverifiable_subclaims() -> No
         )
     )
 
-    subclaims = [
-        item for item in rt.blackboard.claims if item.derived_from_verification_id is not None
-    ]
-    assert len(subclaims) == 1
-    subclaim = subclaims[0]
-    assert subclaim.statement.startswith("Lower expected Fed policy rates")
+    assert rt.blackboard.claims == [claim]
     assert any(
-        artifact.legacy_object_id == subclaim.id
-        and "supported_part_subclaim" in artifact.tags
-        and artifact.status == ArtifactStatus.UNVERIFIED
+        "verifier_supported_part" in artifact.tags
+        and "context_only" in artifact.tags
+        and artifact.status == ArtifactStatus.DISPUTED
+        and artifact.text_or_summary.startswith("Lower expected Fed policy rates")
         for artifact in rt.blackboard.artifacts
     )
-    assert any(
+    assert not any(
         event.type == EventType.CLAIM_CREATED
-        and event.payload.get("claim_id") == str(subclaim.id)
+        and event.payload.get("derived_from_verification_id")
         for _topic, event in rt.published
-    )
-
-    asyncio.run(
-        verify_claim(
-            rt,
-            EventEnvelope(
-                type=EventType.CLAIM_CREATED,
-                run_id=run.id,
-                producer="test",
-                payload={"claim_id": str(subclaim.id)},
-            ),
-        )
-    )
-
-    assert any(
-        verification.claim_id == subclaim.id and verification.verdict == "verified"
-        for verification in rt.blackboard.verifications
     )
 
 
@@ -2190,7 +2409,10 @@ def test_aggregator_prompt_includes_synthesis_role_and_verified_evidence_require
     assert "Evidence rule: Use verified claims and public_verified artifacts as final support" in prompt
     assert "trade-offs" in prompt
     assert 'Return {"answer":"..."}' in prompt
-    assert rt.blackboard.final.answer == "Gold has the cleaner verified setup."
+    assert rt.blackboard.final.answer.startswith("Gold has the cleaner verified setup.")
+    assert "U.S. equities" in rt.blackboard.final.answer
+    assert "long-duration bonds" in rt.blackboard.final.answer
+    assert "Evidence tier used" in rt.blackboard.final.answer
 
 
 def test_aggregator_requests_zero_verified_followup_before_deterministic_final() -> None:
@@ -2236,7 +2458,13 @@ def test_aggregator_requests_zero_verified_followup_before_deterministic_final()
         required_caveats=["The result depends on whether cuts reflect disinflation or recession."],
         sources=["https://example.com/fed"],
     )
-    llm = QueueLLM({"answer": "This should not be called."})
+    llm = QueueLLM(
+        {
+            "diagnostic": "Need another branch-distributed repair wave.",
+            "targeted_gaps": ["Split claims by asset class."],
+            "repair_branches": ["macro/rates", "market/equities"],
+        }
+    )
     rt = runtime(run, llm)
     rt.blackboard.tasks.append(task)
     rt.blackboard.tasks.append(failed_task)
@@ -2495,7 +2723,15 @@ def test_aggregator_writes_deterministic_final_after_zero_verified_repair_waves_
         legacy_object_type="verification",
         legacy_object_id=verification.id,
     )
-    llm = QueueLLM({"answer": "This should not be called."})
+    llm = QueueLLM(
+        {"diagnostic": "Search repair exhausted.", "targeted_gaps": []},
+        {
+            "answer": (
+                "Caveated decision memo: evidence is disputed, but the main supported "
+                "fragment is that Fed cuts can support some rate-sensitive assets."
+            )
+        },
+    )
     rt = runtime(run, llm)
     rt.blackboard.tasks.append(task)
     rt.blackboard.claims.append(claim)
@@ -2506,7 +2742,10 @@ def test_aggregator_writes_deterministic_final_after_zero_verified_repair_waves_
         aggregate(rt, EventEnvelope(type=EventType.CLAIM_VERIFIED, run_id=run.id, producer="test"))
     )
 
-    assert [call["name"] for call in llm.calls] == ["evidence-gap-planner"]
+    assert [call["name"] for call in llm.calls] == [
+        "evidence-gap-planner",
+        "caveated-partial-aggregator",
+    ]
     assert rt.blackboard.final is not None
     assert rt.blackboard.final.partial is True
     assert rt.blackboard.final.verified_claim_ids == []
@@ -2515,13 +2754,11 @@ def test_aggregator_writes_deterministic_final_after_zero_verified_repair_waves_
         "https://example.com/evidence-item",
         "https://example.com/claim-source",
     ]
-    assert "Evidence-limited research result" in rt.blackboard.final.answer
-    assert "Verified claims available for synthesis: 0" in rt.blackboard.final.answer
-    assert "Verifier-supported facts below public-verified threshold" in rt.blackboard.final.answer
-    assert "Fed rate cuts can support some rate-sensitive assets" in rt.blackboard.final.answer
-    assert "guaranteed bullish outcome is not supported" in rt.blackboard.final.answer
-    assert "Budget utilization at stop" in rt.blackboard.final.answer
-    assert "Tavily used/max: 9/20" in rt.blackboard.final.answer
+    assert "Caveated decision memo" in rt.blackboard.final.answer
+    assert "Fed cuts can support some rate-sensitive assets" in rt.blackboard.final.answer
+    assert "U.S. equities" in rt.blackboard.final.answer
+    assert "Evidence tier used" in rt.blackboard.final.answer
+    assert "Conversion quality" in rt.blackboard.final.answer
     assert rt.blackboard.run.status == RunStatus.RUNNING
     assert rt.blackboard.run.final_answer == rt.blackboard.final.answer
     assert not any(action.action_type == PrincipalActionType.STOP_RUN for action in rt.blackboard.actions)

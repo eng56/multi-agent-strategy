@@ -10,6 +10,10 @@ from src.agents.budget_utilization import (
     evaluate_budget_utilization,
     settings_from_object,
 )
+from src.agents.claim_policy import (
+    ClaimLimitSettings,
+    claim_limit_settings_from_object,
+)
 from src.agents.state import (
     FOLLOWUP_JUDGE_SCORE_THRESHOLD,
     MAX_FOLLOWUP_WAVES,
@@ -1728,7 +1732,15 @@ async def execute_tool(runtime: Runtime, event: EventEnvelope) -> None:
         )
     elif task.tool == "market_data":
         artifact_tags = sorted(
-            set(artifact_tags + ["market_snapshot", "tool:market_data", branch.replace("/", ":")])
+            set(
+                artifact_tags
+                + [
+                    "context_only",
+                    "market_snapshot",
+                    "tool:market_data",
+                    branch.replace("/", ":"),
+                ]
+            )
         )
     await persist_artifact(
         runtime,
@@ -1907,9 +1919,37 @@ def _is_source_meta_claim(statement: str) -> bool:
     return any(pattern in text for pattern in source_meta_patterns)
 
 
+def _is_source_meta_or_provider_claim(statement: str) -> bool:
+    text = statement.casefold()
+    source_meta_patterns = (
+        "article list",
+        "evidenceengine",
+        "five sources",
+        "financial publications",
+        "list of firms",
+        "publication date",
+        "publication dates",
+        "publisher",
+        "provider",
+        "retrieval",
+        "source count",
+        "source title",
+        "source titles",
+        "source quality",
+        "quality score",
+    )
+    return _is_source_meta_claim(statement) or any(
+        pattern in text for pattern in source_meta_patterns
+    )
+
+
 def _is_market_snapshot_claim_statement(statement: str) -> bool:
     text = statement.casefold().strip()
-    return text.startswith("market data snapshot") or text.startswith("marketsnapshot")
+    return (
+        text.startswith("market data snapshot")
+        or text.startswith("marketsnapshot")
+        or "market data snapshot selected" in text
+    )
 
 
 def _is_portfolio_advice_claim(statement: str) -> bool:
@@ -2010,12 +2050,19 @@ def _valid_metadata(value: Any, allowed: set[str], fallback: str) -> str:
     return fallback
 
 
+@dataclass(frozen=True)
+class CandidateClaims:
+    claims: list[Claim]
+    rejected_source_meta: list[str]
+    rejected_market_snapshot: list[str]
+
+
 def _claim_candidates_from_model_result(
     result: Any,
     event: EventEnvelope,
     observation: Observation,
     branch: str,
-) -> list[Claim]:
+) -> CandidateClaims:
     if not isinstance(result, dict):
         raise LLMOutputError("claim-extractor returned non-object JSON")
     raw_candidates = result.get("claims")
@@ -2027,17 +2074,23 @@ def _claim_candidates_from_model_result(
         raise KeyError("claims")
 
     claims: list[Claim] = []
+    rejected_source_meta: list[str] = []
+    rejected_market_snapshot: list[str] = []
     seen: set[str] = set()
     for item in candidate_items[:3]:
         if not isinstance(item, dict):
             continue
         statement = compact_text(text_from_model_field(item.get("statement", "")), max_chars=360)
         key = " ".join(statement.casefold().split())
+        if _is_source_meta_or_provider_claim(statement):
+            rejected_source_meta.append(statement)
+            continue
+        if _is_market_snapshot_claim_statement(statement):
+            rejected_market_snapshot.append(statement)
+            continue
         if (
             not statement
             or key in seen
-            or _is_source_meta_claim(statement)
-            or _is_market_snapshot_claim_statement(statement)
             or _is_portfolio_advice_claim(statement)
         ):
             continue
@@ -2076,7 +2129,11 @@ def _claim_candidates_from_model_result(
                 time_horizon=time_horizon[:80] or "unspecified",
             )
         )
-    return claims
+    return CandidateClaims(
+        claims=claims,
+        rejected_source_meta=rejected_source_meta,
+        rejected_market_snapshot=rejected_market_snapshot,
+    )
 
 
 def _fallback_claim(
@@ -2101,6 +2158,232 @@ def _fallback_claim(
     )
 
 
+def _observation_artifact_for_observation(
+    observation: Observation, artifacts: list[Artifact]
+) -> Artifact | None:
+    return next(
+        (
+            artifact
+            for artifact in artifacts
+            if artifact.legacy_object_type == "observation"
+            and artifact.legacy_object_id == observation.id
+        ),
+        None,
+    )
+
+
+def _observation_branch(
+    observation: Observation,
+    task: ResearchTask | None,
+    artifacts: list[Artifact],
+) -> str:
+    observation_artifact = _observation_artifact_for_observation(observation, artifacts)
+    if observation_artifact and observation_artifact.branch:
+        return observation_artifact.branch
+    return branch_for_task(task) if task else infer_semantic_branch(observation.summary)
+
+
+def _is_original_research_observation(
+    observation: Observation,
+    branch: str,
+    artifacts: list[Artifact],
+) -> bool:
+    if getattr(observation, "tool", "web_search") != "web_search":
+        return False
+    if branch.startswith(("trust/", "synthesis/")):
+        return False
+    observation_artifact = _observation_artifact_for_observation(observation, artifacts)
+    if not observation_artifact:
+        return True
+    if observation_artifact.artifact_type in {
+        ArtifactType.VERIFICATION,
+        ArtifactType.DATA_GAP,
+        ArtifactType.FINAL_REPORT,
+        ArtifactType.JUDGE_FEEDBACK,
+    }:
+        return False
+    return not any(
+        tag in observation_artifact.tags
+        for tag in (
+            "evidence_gap_planner",
+            "source_meta_claim_rejected",
+            "source_meta_observation_skipped",
+            "market_snapshot_claim_rejected",
+            "context_only",
+        )
+    )
+
+
+def _claim_artifact_by_claim_id(artifacts: list[Artifact]) -> dict[UUID, Artifact]:
+    return {
+        artifact.legacy_object_id: artifact
+        for artifact in artifacts
+        if artifact.artifact_type == ArtifactType.CLAIM
+        and artifact.legacy_object_type == "claim"
+        and artifact.legacy_object_id is not None
+    }
+
+
+def _is_context_only_claim(claim: Claim, artifact: Artifact | None = None) -> bool:
+    if _is_market_snapshot_claim_statement(claim.statement):
+        return True
+    if _is_source_meta_or_provider_claim(claim.statement):
+        return True
+    if claim.derived_from_verification_id is not None:
+        return True
+    return bool(
+        artifact
+        and any(
+            tag in artifact.tags
+            for tag in (
+                "context_only",
+                "market_snapshot",
+                "tool:market_data",
+                "source_meta_claim_rejected",
+                "supported_part_subclaim",
+                "derived_from_supported_parts",
+            )
+        )
+    )
+
+
+def _normal_claims_for_synthesis(claims: list[Claim], artifacts: list[Artifact]) -> list[Claim]:
+    artifact_by_claim_id = _claim_artifact_by_claim_id(artifacts)
+    return [
+        claim
+        for claim in claims
+        if not _is_context_only_claim(claim, artifact_by_claim_id.get(claim.id))
+    ]
+
+
+def _claim_branch_counts(claims: list[Claim], artifacts: list[Artifact]) -> dict[str, int]:
+    artifact_by_claim_id = _claim_artifact_by_claim_id(artifacts)
+    counts: dict[str, int] = {}
+    for claim in claims:
+        artifact = artifact_by_claim_id.get(claim.id)
+        if _is_context_only_claim(claim, artifact):
+            continue
+        branch = artifact.branch if artifact and artifact.branch else infer_semantic_branch(claim.statement)
+        counts[branch] = counts.get(branch, 0) + 1
+    return counts
+
+
+def _claim_cap_remaining(
+    claims: list[Claim],
+    artifacts: list[Artifact],
+    branch: str,
+    settings: ClaimLimitSettings,
+) -> int:
+    normal_claims = _normal_claims_for_synthesis(claims, artifacts)
+    branch_count = _claim_branch_counts(claims, artifacts).get(branch, 0)
+    return max(
+        0,
+        min(
+            settings.max_claims_per_run - len(normal_claims),
+            settings.max_claims_per_branch - branch_count,
+        ),
+    )
+
+
+def claim_cap_reached(
+    claims: list[Claim],
+    artifacts: list[Artifact],
+    settings: ClaimLimitSettings,
+) -> bool:
+    if len(_normal_claims_for_synthesis(claims, artifacts)) >= settings.max_claims_per_run:
+        return True
+    return any(
+        count >= settings.max_claims_per_branch
+        for count in _claim_branch_counts(claims, artifacts).values()
+    )
+
+
+async def persist_claim_rejection_artifact(
+    runtime: Runtime,
+    run_id: UUID,
+    *,
+    branch: str,
+    summary: str,
+    observation_id: UUID | None,
+    reason_tag: str,
+    producer: str,
+) -> Artifact | None:
+    artifacts = await runtime.blackboard.list_models(run_id, "artifacts", Artifact)
+    if observation_id and any(
+        artifact.legacy_object_type == "observation"
+        and artifact.legacy_object_id == observation_id
+        and reason_tag in artifact.tags
+        for artifact in artifacts
+    ):
+        return None
+    artifact = Artifact(
+        run_id=run_id,
+        artifact_type=ArtifactType.DATA_GAP,
+        branch=branch,
+        text_or_summary=compact_text(summary, max_chars=1000),
+        tags=sorted({"claim_rejected", reason_tag, branch.replace("/", ":")}),
+        visibility=VisibilityScope.PUBLIC_UNVERIFIED,
+        status=ArtifactStatus.UNVERIFIED,
+        legacy_object_type="observation" if observation_id else "claim_rejection",
+        legacy_object_id=observation_id,
+    )
+    return await persist_artifact(runtime, artifact, producer)
+
+
+async def record_claim_cap_reached(
+    runtime: Runtime,
+    run_id: UUID,
+    *,
+    branch: str,
+    settings: ClaimLimitSettings,
+    producer: str,
+) -> None:
+    actions = await runtime.blackboard.list_models(
+        run_id, "principal_actions", PrincipalAction
+    )
+    if any(
+        action.action_type == PrincipalActionType.REQUEST_AGGREGATION
+        and "Claim cap reached" in action.reason
+        and action.status == ActionStatus.EXECUTED
+        for action in actions
+    ):
+        return
+    await persist_action(
+        runtime,
+        run_id,
+        PrincipalActionType.REQUEST_AGGREGATION,
+        (
+            "Claim cap reached; stop claim extraction and proceed to synthesis with "
+            "available verified, disputed, and caveated evidence. "
+            f"Limits: run={settings.max_claims_per_run}, branch={settings.max_claims_per_branch}."
+        ),
+        required_role="aggregator_agent",
+        target_branch="synthesis/aggregator",
+        expected_information_gain=InformationGain.MEDIUM,
+        priority=7,
+        producer=producer,
+    )
+    await persist_claim_rejection_artifact(
+        runtime,
+        run_id,
+        branch=branch,
+        summary=(
+            "Claim generation cap reached. Additional observations should be used as "
+            "caveated context or synthesis inputs, not converted into more normal claims."
+        ),
+        observation_id=None,
+        reason_tag="claim_cap_reached",
+        producer=producer,
+    )
+    emit(
+        runtime,
+        EventType.CLAIM_VERIFIED,
+        run_id,
+        producer,
+        claim_cap_reached=True,
+    )
+
+
 async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
     if await run_is_terminal(runtime, event.run_id):
         return
@@ -2115,10 +2398,10 @@ async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
         )
     tasks = await runtime.blackboard.list_models(event.run_id, "tasks", ResearchTask)
     task = next((value for value in tasks if value.id == observation.task_id), None)
-    branch = branch_for_task(task) if task else infer_semantic_branch(observation.summary)
     observation_artifacts = await runtime.blackboard.list_models(
         event.run_id, "artifacts", Artifact
     )
+    branch = _observation_branch(observation, task, observation_artifacts)
     if is_data_gap_observation(observation, observation_artifacts):
         await persist_action(
             runtime,
@@ -2139,6 +2422,18 @@ async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
         )
         return
     if is_market_snapshot_observation(observation, observation_artifacts):
+        await persist_claim_rejection_artifact(
+            runtime,
+            event.run_id,
+            branch=branch,
+            summary=(
+                "Market snapshot observation kept as context_only; market data metadata "
+                "must not become a normal claim or verifier target."
+            ),
+            observation_id=observation.id,
+            reason_tag="market_snapshot_claim_rejected",
+            producer="worker-agents",
+        )
         await persist_action(
             runtime,
             event.run_id,
@@ -2158,10 +2453,22 @@ async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
         )
         return
     if _is_source_meta_observation(observation, observation_artifacts):
+        await persist_claim_rejection_artifact(
+            runtime,
+            event.run_id,
+            branch=branch,
+            summary=(
+                "Rejected source/provider metadata as a normal claim candidate. "
+                f"Observation: {observation.summary}"
+            ),
+            observation_id=observation.id,
+            reason_tag="source_meta_claim_rejected",
+            producer="worker-agents",
+        )
         await persist_action(
             runtime,
             event.run_id,
-            PrincipalActionType.REQUEST_VERIFICATION,
+            PrincipalActionType.ASSIGN_TASK,
             (
                 "Skipped claim extraction for source/provider metadata observation; "
                 "source titles, source counts, missing dates, retrieval contents, and "
@@ -2175,6 +2482,42 @@ async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
         )
         await evaluate_principal_policy_safely(
             runtime, event.run_id, trigger="claim.skipped_source_meta"
+        )
+        return
+    if not _is_original_research_observation(observation, branch, observation_artifacts):
+        await persist_action(
+            runtime,
+            event.run_id,
+            PrincipalActionType.ASSIGN_TASK,
+            (
+                "Skipped claim extraction for non-research or trust-layer observation; "
+                "only original research observations may create normal claims."
+            ),
+            required_role="research_agent",
+            target_branch=branch,
+            expected_information_gain=InformationGain.LOW,
+            priority=4,
+            producer="worker-agents",
+        )
+        await evaluate_principal_policy_safely(
+            runtime, event.run_id, trigger="claim.skipped_non_research"
+        )
+        return
+    existing_claims = await runtime.blackboard.list_models(event.run_id, "claims", Claim)
+    claim_settings = claim_limit_settings_from_object(getattr(runtime, "settings", None))
+    cap_remaining = _claim_cap_remaining(
+        existing_claims, observation_artifacts, branch, claim_settings
+    )
+    if cap_remaining <= 0:
+        await record_claim_cap_reached(
+            runtime,
+            event.run_id,
+            branch=branch,
+            settings=claim_settings,
+            producer="worker-agents",
+        )
+        await evaluate_principal_policy_safely(
+            runtime, event.run_id, trigger="claim.cap_reached"
         )
         return
     claims: list[Claim]
@@ -2200,8 +2543,48 @@ async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
             '"confidence":0.0}]}. Observation: '
             f"{observation.summary}",
         )
-        claims = _claim_candidates_from_model_result(result, event, observation, branch)
+        candidates = _claim_candidates_from_model_result(result, event, observation, branch)
+        for rejected in candidates.rejected_source_meta:
+            await persist_claim_rejection_artifact(
+                runtime,
+                event.run_id,
+                branch=branch,
+                summary=f"Rejected source/provider metadata claim before verification: {rejected}",
+                observation_id=observation.id,
+                reason_tag="source_meta_claim_rejected",
+                producer="worker-agents",
+            )
+        for rejected in candidates.rejected_market_snapshot:
+            await persist_claim_rejection_artifact(
+                runtime,
+                event.run_id,
+                branch=branch,
+                summary=f"Rejected market snapshot metadata claim before verification: {rejected}",
+                observation_id=observation.id,
+                reason_tag="market_snapshot_claim_rejected",
+                producer="worker-agents",
+            )
+        claims = candidates.claims
         if not claims:
+            if candidates.rejected_source_meta or candidates.rejected_market_snapshot:
+                await persist_action(
+                    runtime,
+                    event.run_id,
+                    PrincipalActionType.ASSIGN_TASK,
+                    (
+                        "Claim extractor returned only source/provider or market snapshot "
+                        "metadata; rejected the candidates before verification."
+                    ),
+                    required_role="research_agent",
+                    target_branch=branch,
+                    expected_information_gain=InformationGain.LOW,
+                    priority=4,
+                    producer="worker-agents",
+                )
+                await evaluate_principal_policy_safely(
+                    runtime, event.run_id, trigger="claim.rejected_meta_candidates"
+                )
+                return
             claims = [_fallback_claim(event, observation, branch, confidence=0.35)]
             await persist_action(
                 runtime,
@@ -2242,6 +2625,15 @@ async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
             target_branch=branch,
             expected_information_gain=InformationGain.LOW,
             priority=4,
+            producer="worker-agents",
+        )
+    if len(claims) > cap_remaining:
+        claims = claims[:cap_remaining]
+        await record_claim_cap_reached(
+            runtime,
+            event.run_id,
+            branch=branch,
+            settings=claim_settings,
             producer="worker-agents",
         )
     depends_on = [
@@ -2286,6 +2678,15 @@ async def create_claim(runtime: Runtime, event: EventEnvelope) -> None:
             event.run_id,
             "worker-agents",
             claim_id=str(claim.id),
+        )
+    latest_claims = [*existing_claims, *claims]
+    if claim_cap_reached(latest_claims, observation_artifacts, claim_settings):
+        await record_claim_cap_reached(
+            runtime,
+            event.run_id,
+            branch=branch,
+            settings=claim_settings,
+            producer="worker-agents",
         )
     await evaluate_principal_policy_safely(runtime, event.run_id, trigger="claim.created")
 
@@ -2347,15 +2748,14 @@ async def create_supported_part_subclaims(
     existing_claims: list[Claim],
     claim_artifacts: list[Artifact],
     branch: str,
-) -> list[Claim]:
+) -> list[Artifact]:
     if verification.verdict != "uncertain" or not verification.supported_parts:
         return []
     existing_keys = {_claim_statement_key(claim.statement) for claim in existing_claims}
     source_key = _claim_statement_key(source_claim.statement)
-    route_for_verification = _has_verification_capacity(run)
     dependencies = [artifact.id for artifact in claim_artifacts]
-    created: list[Claim] = []
-    for supported_part in verification.supported_parts[:3]:
+    created: list[Artifact] = []
+    for supported_part in verification.supported_parts[:2]:
         statement = compact_text(supported_part, max_chars=360)
         key = _claim_statement_key(statement)
         if (
@@ -2367,76 +2767,46 @@ async def create_supported_part_subclaims(
             or _is_portfolio_advice_claim(statement)
         ):
             continue
-        claim = Claim(
+        artifact = Artifact(
             run_id=run.id,
-            task_id=source_claim.task_id,
-            statement=statement,
-            evidence_observation_ids=source_claim.evidence_observation_ids,
-            sources=source_claim.sources,
-            confidence=min(max(verification.confidence, 0.35), 0.7),
-            claim_type=_claim_type_from_text(statement),
-            asset=source_claim.asset or _asset_from_branch(branch),
-            direction=_direction_from_text(statement),
-            time_horizon=source_claim.time_horizon or "unspecified",
-            derived_from_verification_id=verification.id,
-        )
-        await runtime.blackboard.put_claim(claim)
-        await persist_artifact(
-            runtime,
-            Artifact(
-                run_id=run.id,
-                artifact_type=ArtifactType.CLAIM,
-                branch=branch,
-                text_or_summary=claim.statement,
-                tags=sorted(
-                    set(
-                        tags_for_text(claim.statement)
-                        + [
-                            "supported_part_subclaim",
-                            "derived_from_supported_parts",
-                            f"claim_type:{claim.claim_type or 'mechanism'}",
-                            f"asset:{claim.asset or _asset_from_branch(branch)}",
-                            f"direction:{claim.direction or 'unknown'}",
-                        ]
-                    )
-                ),
-                visibility=VisibilityScope.PUBLIC_UNVERIFIED,
-                status=ArtifactStatus.UNVERIFIED,
-                confidence=claim.confidence,
-                source_refs=claim.sources,
-                legacy_object_type="claim",
-                legacy_object_id=claim.id,
-                depends_on_artifact_ids=dependencies[:3],
+            artifact_type=ArtifactType.OBSERVATION,
+            branch="trust/source_verifier",
+            text_or_summary=statement,
+            tags=sorted(
+                set(
+                    tags_for_text(statement)
+                    + [
+                        "verifier_supported_part",
+                        "caveated_evidence",
+                        "context_only",
+                        f"source_claim:{source_claim.id}",
+                    ]
+                )
             ),
-            "verifier-agent",
+            visibility=VisibilityScope.PUBLIC_UNVERIFIED,
+            status=ArtifactStatus.DISPUTED,
+            confidence=min(max(verification.confidence, 0.35), 0.7),
+            source_refs=verification.sources or source_claim.sources,
+            legacy_object_type="verification",
+            legacy_object_id=verification.id,
+            depends_on_artifact_ids=dependencies[:3],
         )
-        created.append(claim)
+        await persist_artifact(runtime, artifact, "verifier-agent")
+        created.append(artifact)
         existing_keys.add(key)
-        if route_for_verification:
-            emit(
-                runtime,
-                EventType.CLAIM_CREATED,
-                run.id,
-                "verifier-agent",
-                claim_id=str(claim.id),
-                derived_from_verification_id=str(verification.id),
-            )
     if created:
         await persist_action(
             runtime,
             run.id,
-            PrincipalActionType.REQUEST_VERIFICATION,
+            PrincipalActionType.REQUEST_AGGREGATION,
             (
-                f"Created {len(created)} atomic subclaim candidate(s) from verifier "
-                "supported_parts; candidates remain unverified until routed through "
-                "normal source verification."
+                f"Stored {len(created)} verifier-supported part(s) as caveated evidence "
+                "metadata instead of recursive normal claims."
             ),
-            required_role="source_verifier_agent",
-            target_branch="trust/source_verifier",
-            expected_information_gain=InformationGain.MEDIUM
-            if route_for_verification
-            else InformationGain.LOW,
-            priority=6 if route_for_verification else 4,
+            required_role="aggregator_agent",
+            target_branch="synthesis/aggregator",
+            expected_information_gain=InformationGain.MEDIUM,
+            priority=5,
             producer="verifier-agent",
         )
     return created
@@ -2949,6 +3319,53 @@ async def verify_claim(runtime: Runtime, event: EventEnvelope) -> None:
     artifacts = await runtime.blackboard.list_models(event.run_id, "artifacts", Artifact)
     claim_artifacts = _claim_artifacts_for_claim(artifacts, claim)
     branch = _verification_branch_for_claim(claim, claim_artifacts)
+    if _is_context_only_claim(claim, claim_artifacts[0] if claim_artifacts else None):
+        for claim_artifact in claim_artifacts:
+            claim_artifact.visibility = VisibilityScope.PUBLIC_UNVERIFIED
+            claim_artifact.status = ArtifactStatus.UNVERIFIED
+            claim_artifact.tags = sorted(set(claim_artifact.tags + ["context_only"]))
+            await runtime.blackboard.put_artifact(claim_artifact)
+        reason_tag = (
+            "market_snapshot_claim_rejected"
+            if _is_market_snapshot_claim_statement(claim.statement)
+            else "source_meta_claim_rejected"
+        )
+        await persist_claim_rejection_artifact(
+            runtime,
+            event.run_id,
+            branch=branch,
+            summary=(
+                "Skipped verification for context-only or source/provider metadata "
+                f"claim: {claim.statement}"
+            ),
+            observation_id=claim.evidence_observation_ids[0]
+            if claim.evidence_observation_ids
+            else None,
+            reason_tag=reason_tag,
+            producer="verifier-agent",
+        )
+        await persist_action(
+            runtime,
+            event.run_id,
+            PrincipalActionType.REQUEST_AGGREGATION,
+            "Skipped context-only/source-meta claim before verifier; proceed with normal evidence.",
+            required_role="aggregator_agent",
+            target_branch="synthesis/aggregator",
+            expected_information_gain=InformationGain.LOW,
+            priority=4,
+            producer="verifier-agent",
+        )
+        emit(
+            runtime,
+            EventType.CLAIM_VERIFIED,
+            event.run_id,
+            "verifier-agent",
+            skipped_context_claim_id=str(claim.id),
+        )
+        await evaluate_principal_policy_safely(
+            runtime, event.run_id, trigger="claim.skipped_context_verification"
+        )
+        return
     support_bundle: EvidenceBundle | None = None
     contradiction_bundle: EvidenceBundle | None = None
     search_error: Exception | None = None
@@ -3316,8 +3733,10 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
     pending_tasks = [task for task in tasks if task.status == "created"]
     existing_final = await runtime.blackboard.get_final(event.run_id)
     claims = await runtime.blackboard.list_models(event.run_id, "claims", Claim)
+    artifacts = await runtime.blackboard.list_models(event.run_id, "artifacts", Artifact)
+    normal_claims = _normal_claims_for_synthesis(claims, artifacts)
     checked_claim_ids = {verification.claim_id for verification in verifications}
-    unchecked_claims = [claim for claim in claims if claim.id not in checked_claim_ids]
+    unchecked_claims = [claim for claim in normal_claims if claim.id not in checked_claim_ids]
     run = await runtime.blackboard.get_run(event.run_id)
     if not run:
         return
@@ -3328,7 +3747,7 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
     ):
         return
     verified_ids = {value.claim_id for value in verifications if value.verdict == "verified"}
-    verified = [claim for claim in claims if claim.id in verified_ids]
+    verified = [claim for claim in normal_claims if claim.id in verified_ids]
     if unchecked_claims and _has_verification_capacity(run):
         await evaluate_principal_policy_safely(
             runtime, event.run_id, trigger="aggregate.unverified_claims"
@@ -3349,8 +3768,12 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
         branch="synthesis/aggregator",
         objective="Synthesize trusted claims into a decision-grade final report.",
     )
-    artifacts = await runtime.blackboard.list_models(event.run_id, "artifacts", Artifact)
     observations = await runtime.blackboard.list_models(event.run_id, "observations", Observation)
+    claim_cap_is_reached = claim_cap_reached(
+        claims,
+        artifacts,
+        claim_limit_settings_from_object(getattr(runtime, "settings", None)),
+    )
     run_state = build_run_state(
         run,
         tasks,
@@ -3374,29 +3797,32 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
             settings=getattr(runtime, "settings", None),
         )
         if not utilization.terminal_final_allowed:
-            diagnostic = await create_zero_verified_diagnostic(
-                runtime,
-                run,
-                tasks=tasks,
-                claims=claims,
-                verifications=verifications,
-                artifacts=artifacts,
-                utilization=utilization,
-            )
-            if diagnostic:
-                artifacts = [*artifacts, diagnostic]
-            if await request_zero_verified_followup_wave(
-                runtime,
-                run,
-                tasks=tasks,
-                claims=claims,
-                verifications=verifications,
-            ):
+            if claim_cap_is_reached:
+                utilization.terminal_final_reasons.append("claim generation cap was reached")
+            else:
+                diagnostic = await create_zero_verified_diagnostic(
+                    runtime,
+                    run,
+                    tasks=tasks,
+                    claims=claims,
+                    verifications=verifications,
+                    artifacts=artifacts,
+                    utilization=utilization,
+                )
+                if diagnostic:
+                    artifacts = [*artifacts, diagnostic]
+                if await request_zero_verified_followup_wave(
+                    runtime,
+                    run,
+                    tasks=tasks,
+                    claims=claims,
+                    verifications=verifications,
+                ):
+                    return
+                await evaluate_principal_policy_safely(
+                    runtime, event.run_id, trigger="aggregate.terminal_blocked_by_budget_policy"
+                )
                 return
-            await evaluate_principal_policy_safely(
-                runtime, event.run_id, trigger="aggregate.terminal_blocked_by_budget_policy"
-            )
-            return
         diagnostic = await create_zero_verified_diagnostic(
             runtime,
             run,
@@ -3408,7 +3834,7 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
         )
         if diagnostic:
             artifacts = [*artifacts, diagnostic]
-        if await request_zero_verified_followup_wave(
+        if not claim_cap_is_reached and await request_zero_verified_followup_wave(
             runtime,
             run,
             tasks=tasks,
@@ -3424,6 +3850,7 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
             verifications=verifications,
             artifacts=artifacts,
             utilization=utilization,
+            claim_cap_reached=claim_cap_is_reached,
         ):
             return
         await _write_no_verified_evidence_final(
@@ -3485,16 +3912,23 @@ async def aggregate(runtime: Runtime, event: EventEnvelope) -> None:
         "aggregator",
         SYSTEM,
         f"{build_agent_instruction_block(aggregator_spec)}\n\n"
-        f"Answer the investment question using verified claims as support. Explicitly "
-        f"consider skeptic/counterargument context when discussing risks, regime changes, "
-        f'calibration, and limitations. Return {{"answer":"..."}}. Question: {run.question}. Claims: '
+        "Answer the investment question using verified claims as support and caveated "
+        "context only as clearly labeled context. For Fed/cross-asset questions, produce "
+        "a decision memo with a directional table covering U.S. equities, U.S. dollar, "
+        "gold, and long-duration bonds. Each row must include expected direction "
+        "(positive/negative/mixed/insufficient), rationale, evidence tier used, confidence, "
+        "and what would change the view. Explicitly consider skeptic/counterargument "
+        "context when discussing risks, regime changes, calibration, and limitations. "
+        'End with no personalized investment advice. Return {"answer":"..."}. '
+        f"Question: {run.question}. Claims: "
         f"{json.dumps([value.model_dump(mode='json') for value in verified])}. "
         f"Routed artifact context: {json.dumps(routed_context)[:12000]}. "
         f"Skeptic/counterargument context: {json.dumps(skeptic_context)[:12000]}",
     )
+    answer = _ensure_directional_asset_table(text_from_model_field(result["answer"]), run.question)
     final = FinalReport(
         run_id=event.run_id,
-        answer=text_from_model_field(result["answer"]),
+        answer=answer,
         verified_claim_ids=[value.id for value in verified],
         sources=sorted({source for value in verified for source in value.sources}),
         wave_number=max_task_wave(tasks),
@@ -3550,6 +3984,56 @@ def _append_judge_payoff(answer: str, score: float, feedback: str | None) -> str
             f"- Feedback: {feedback_text}",
         ]
     )
+
+
+REQUIRED_DIRECTIONAL_ASSETS = (
+    "U.S. equities",
+    "U.S. dollar",
+    "gold",
+    "long-duration bonds",
+)
+
+
+def _requires_directional_asset_table(question: str) -> bool:
+    text = question.casefold()
+    if "fed" in text and any(term in text for term in ("cut", "cuts", "rate", "rates")):
+        return True
+    return all(
+        term in text
+        for term in ("equities", "dollar", "gold")
+    ) or "long-duration bonds" in text
+
+
+def _ensure_directional_asset_table(answer: str, question: str) -> str:
+    if not _requires_directional_asset_table(question):
+        return answer
+    missing_assets = [
+        asset for asset in REQUIRED_DIRECTIONAL_ASSETS if asset.casefold() not in answer.casefold()
+    ]
+    if not missing_assets and "evidence tier" in answer.casefold():
+        return answer
+    lines = [
+        answer.rstrip(),
+        "",
+        "## Directional Table",
+        "",
+        "| Asset class | Expected direction | Rationale | Evidence tier used | Confidence | What would change the view |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for asset in REQUIRED_DIRECTIONAL_ASSETS:
+        lines.append(
+            f"| {asset} | insufficient | Evidence is not strong enough for a higher-confidence directional call. | caveated/insufficient | low | Dated, asset-specific primary or high-quality market evidence. |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Key Caveats",
+            "",
+            "- Directional rows are caveated when verified evidence is thin or disputed.",
+            "- No personalized investment advice.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 async def judge(runtime: Runtime, event: EventEnvelope) -> None:
@@ -3836,6 +4320,18 @@ def _conversion_quality_metrics(
         "disputed_artifacts": disputed_artifacts,
         "source_quality_distribution": source_distribution,
         "claims_created_from_supported_parts": len(supported_part_claim_ids),
+        "claims_per_research_observation": _claims_per_research_observation(
+            claims, artifacts
+        ),
+        "claims_created_from_verifier_outputs": sum(
+            1 for claim in claims if claim.derived_from_verification_id is not None
+        ),
+        "source_meta_claims_rejected": sum(
+            1 for artifact in artifacts if "source_meta_claim_rejected" in artifact.tags
+        ),
+        "market_snapshot_claims_rejected": sum(
+            1 for artifact in artifacts if "market_snapshot_claim_rejected" in artifact.tags
+        ),
         "aggregator_used": bool(
             final
             or any(
@@ -3858,6 +4354,36 @@ def _conversion_quality_metrics(
     }
 
 
+def _claims_per_research_observation(
+    claims: list[Claim],
+    artifacts: list[Artifact],
+) -> float:
+    research_observation_ids = {
+        artifact.legacy_object_id
+        for artifact in artifacts
+        if artifact.artifact_type == ArtifactType.OBSERVATION
+        and artifact.legacy_object_type == "observation"
+        and artifact.legacy_object_id is not None
+        and not (artifact.branch or "").startswith(("trust/", "synthesis/"))
+        and not any(
+            tag in artifact.tags
+            for tag in (
+                "context_only",
+                "market_snapshot",
+                "source_meta_claim_rejected",
+                "market_snapshot_claim_rejected",
+                "tool:market_data",
+            )
+        )
+    }
+    if not research_observation_ids:
+        return 0.0
+    return round(
+        len(_normal_claims_for_synthesis(claims, artifacts)) / len(research_observation_ids),
+        2,
+    )
+
+
 def _conversion_quality_lines(
     run: Run,
     claims: list[Claim],
@@ -3878,6 +4404,10 @@ def _conversion_quality_lines(
         f"- Tavily credits used: {metrics['tavily_used']}",
         f"- Verified claims: {metrics['verified_claims']}",
         f"- Verified claims per 10 Tavily credits: {metrics['verified_claims_per_10_tavily']:.2f}",
+        f"- Claims per research observation: {metrics['claims_per_research_observation']:.2f}",
+        f"- Claims created from verifier outputs: {metrics['claims_created_from_verifier_outputs']}",
+        f"- Source-meta claims rejected: {metrics['source_meta_claims_rejected']}",
+        f"- Market snapshot claims rejected: {metrics['market_snapshot_claims_rejected']}",
         f"- Disputed claims: {metrics['disputed_claims']}",
         f"- Disputed artifacts: {metrics['disputed_artifacts']}",
         f"- Source quality distribution: {distribution_text}",
@@ -3922,11 +4452,8 @@ async def _write_caveated_evidence_final(
     verifications: list[Verification],
     artifacts: list[Artifact],
     utilization: BudgetUtilizationDecision,
+    claim_cap_reached: bool = False,
 ) -> bool:
-    if run.budget.tools.tavily_credits_used < run.budget.tools.tavily_max_credits:
-        return False
-    if not _strongly_caveated_evidence_exists(verifications):
-        return False
     if not _aggregator_budget_remains(run, utilization):
         return False
 
@@ -3954,11 +4481,14 @@ async def _write_caveated_evidence_final(
             "caveated-partial-aggregator",
             SYSTEM,
             "Search budget is exhausted and no normal claim is public-verified. "
-            "Produce a caveated diagnostic synthesis only; do not present disputed "
-            "or unsupported material as verified, do not give portfolio advice, and "
-            "make clear that this is not decision-grade. Include the strongest "
-            "verifier-supported fragments, unsupported gaps, and what would be needed "
-            'for a decision-grade answer. Return {"answer":"..."}. '
+            "Produce a caveated decision memo; do not present disputed or unsupported "
+            "material as verified, do not give portfolio advice, and make clear that "
+            "this is not decision-grade. Include a directional table for U.S. equities, "
+            "U.S. dollar, gold, and long-duration bonds with expected direction "
+            "(positive/negative/mixed/insufficient), rationale, evidence tier used, "
+            "confidence, and what would change the view. Include the strongest "
+            "verifier-supported fragments, unsupported gaps, key caveats, and no "
+            'personalized investment advice. Return {"answer":"..."}. '
             f"Question: {run.question}. Verification evidence: "
             f"{json.dumps(verification_payload)[:16000]}. Conversion metrics: "
             f"{json.dumps(_conversion_quality_metrics(run, claims, verifications, artifacts))}",
@@ -3987,7 +4517,7 @@ async def _write_caveated_evidence_final(
     caveated_sources = _caveated_evidence_sources(verifications, artifacts)
     caveated_dependencies = _caveated_evidence_artifact_ids(verifications, artifacts)
     answer = _append_conversion_quality_section(
-        answer_text,
+        _ensure_directional_asset_table(answer_text, run.question),
         run,
         claims,
         verifications,
@@ -4074,8 +4604,11 @@ async def _write_no_verified_evidence_final(
 ) -> None:
     """Create a deterministic final when research produced no synthesis-safe claims."""
     answer = _append_conversion_quality_section(
-        _no_verified_evidence_answer(
-            run, tasks, claims, verifications, artifacts, utilization
+        _ensure_directional_asset_table(
+            _no_verified_evidence_answer(
+                run, tasks, claims, verifications, artifacts, utilization
+            ),
+            run.question,
         ),
         run,
         claims,

@@ -5,6 +5,7 @@ from src.common.models import (
     AgentRole,
     AgentSpec,
     Artifact,
+    ArtifactPointer,
     ArtifactStatus,
     ArtifactType,
     Budget,
@@ -13,6 +14,7 @@ from src.common.models import (
     EventType,
     FinalReport,
     ModelPolicy,
+    Observation,
     OrganizationPlan,
     PrincipalActionType,
     ResearchTask,
@@ -226,6 +228,81 @@ def test_run_state_tracks_conversion_quality_metrics() -> None:
     assert state.claims_created_from_supported_parts == 1
     assert state.aggregator_used is True
     assert state.judge_used is True
+
+
+def test_run_state_exposes_claim_explosion_and_suppresses_more_extraction() -> None:
+    current_run = run()
+    tasks = [
+        ResearchTask(
+            run_id=current_run.id,
+            title=f"Fed branch {index}",
+            question="Find Fed cut evidence",
+            tool="web_search",
+            branch="macro/rates" if index < 2 else "market/equities",
+            status="completed",
+        )
+        for index in range(4)
+    ]
+    observations = [
+        Observation(
+            run_id=current_run.id,
+            task_id=task.id,
+            tool="web_search",
+            summary=f"Research observation {index}",
+            artifact=ArtifactPointer(uri=f"gs://bucket/{index}.json", size_bytes=2, sha256="0" * 64),
+            sources=["https://example.com/source"],
+        )
+        for index, task in enumerate(tasks)
+    ]
+    claims = [
+        Claim(
+            run_id=current_run.id,
+            task_id=tasks[index % len(tasks)].id,
+            statement=f"Candidate claim {index}.",
+            evidence_observation_ids=[observations[index % len(observations)].id],
+            confidence=0.4,
+        )
+        for index in range(58)
+    ]
+    artifacts = [
+        Artifact(
+            run_id=current_run.id,
+            artifact_type=ArtifactType.OBSERVATION,
+            branch="macro/rates" if index < 2 else "market/equities",
+            text_or_summary=observation.summary,
+            legacy_object_type="observation",
+            legacy_object_id=observation.id,
+        )
+        for index, observation in enumerate(observations)
+    ]
+    artifacts.extend(
+        Artifact(
+            run_id=current_run.id,
+            artifact_type=ArtifactType.CLAIM,
+            branch="macro/rates" if index < 29 else "market/equities",
+            text_or_summary=claim.statement,
+            legacy_object_type="claim",
+            legacy_object_id=claim.id,
+        )
+        for index, claim in enumerate(claims)
+    )
+
+    state = build_run_state(
+        current_run,
+        tasks,
+        claims,
+        [],
+        artifacts=artifacts,
+        observations=observations,
+    )
+
+    assert state.claims_per_research_observation == 14.5
+    assert any("Claim generation cap reached" in reason for reason in state.stop_reasons)
+    assert not any(
+        action.action_type == PrincipalActionType.ASSIGN_TASK
+        and "observation(s) have no extracted claim" in action.reason
+        for action in state.next_action_candidates
+    )
 
 
 def test_run_state_promotes_verified_claims_and_requests_aggregation() -> None:
