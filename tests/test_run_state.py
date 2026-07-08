@@ -283,7 +283,7 @@ def test_low_judge_score_run_state_requests_first_followup_wave() -> None:
     }
 
 
-def test_partial_evidence_limited_final_run_state_does_not_request_judge() -> None:
+def test_partial_evidence_limited_final_run_state_requests_judge() -> None:
     current_run = run()
     final = FinalReport(
         run_id=current_run.id,
@@ -295,14 +295,16 @@ def test_partial_evidence_limited_final_run_state_does_not_request_judge() -> No
 
     state = build_run_state(current_run, [], [], [], final)
 
-    assert state.current_phase == RunPhase.COMPLETED
-    assert PrincipalActionType.REQUEST_TOOL_CALL not in {
-        action.action_type for action in state.next_action_candidates
-    }
-    assert all(action.required_role != "judge_agent" for action in state.next_action_candidates)
-    assert PrincipalActionType.STOP_RUN in {
-        action.action_type for action in state.next_action_candidates
-    }
+    assert state.current_phase == RunPhase.JUDGING
+    judge_actions = [
+        action
+        for action in state.next_action_candidates
+        if action.action_type == PrincipalActionType.REQUEST_TOOL_CALL
+        and action.required_role == "judge_agent"
+    ]
+    assert judge_actions
+    assert state.capacity is not None
+    assert state.capacity.useful_action_available is True
 
 
 def test_followup_run_state_requests_aggregation_then_stop_after_second_low_score() -> None:
@@ -600,6 +602,41 @@ def test_run_state_verified_count_ignores_non_knowledge_artifacts() -> None:
     assert state.verified_claim_count == 0
 
 
+def test_market_snapshot_claim_is_context_only_not_normal_verification_work() -> None:
+    current_run = run()
+    task = ResearchTask(
+        run_id=current_run.id,
+        title="Market data snapshot",
+        question="Fetch market snapshot.",
+        tool="market_data",
+        status="completed",
+        branch="market/bonds",
+    )
+    claim = Claim(
+        run_id=current_run.id,
+        task_id=task.id,
+        statement="Market data snapshot selected TLT (etf) via massive/stocks.",
+        evidence_observation_ids=[uuid4()],
+        confidence=0.6,
+    )
+    artifact = Artifact(
+        run_id=current_run.id,
+        artifact_type=ArtifactType.CLAIM,
+        branch="market/bonds",
+        text_or_summary=claim.statement,
+        tags=["market_snapshot", "context_only", "tool:market_data"],
+        legacy_object_type="claim",
+        legacy_object_id=claim.id,
+    )
+
+    state = build_run_state(current_run, [task], [claim], [], artifacts=[artifact])
+
+    assert state.verified_claim_count == 0
+    assert PrincipalActionType.REQUEST_VERIFICATION not in {
+        action.action_type for action in state.next_action_candidates
+    }
+
+
 def test_run_state_reports_search_exhausted_when_tavily_zero_despite_llm_budget() -> None:
     current_run = run()
     current_run.budget.limit_usd = 20
@@ -637,6 +674,67 @@ def test_run_state_reports_search_exhausted_when_tavily_zero_despite_llm_budget(
         "Search/tool budget exhausted before enough claims passed verification."
         in state.stop_reasons
     )
+
+
+def test_latest_run_like_underutilized_zero_verified_state_has_useful_capacity() -> None:
+    current_run = Run(
+        question=(
+            "If the Fed signals faster rate cuts, compare macro rates, U.S. equities, "
+            "the U.S. dollar, gold, and long-duration bonds."
+        ),
+        status=RunStatus.RUNNING,
+        models=model_policy(),
+        budget=Budget(
+            limit_usd=5,
+            spent_usd=0.06,
+            tools=ToolBudget(
+                tavily_max_credits=100,
+                tavily_credits_used=12,
+                market_data_max_requests=50,
+                market_data_requests_used=1,
+            ),
+        ),
+    )
+    task = ResearchTask(
+        run_id=current_run.id,
+        title="Rates repair",
+        question="Find dated evidence for Fed cuts.",
+        tool="web_search",
+        status="completed",
+        branch="macro/rates",
+        wave_number=1,
+    )
+    claim = Claim(
+        run_id=current_run.id,
+        task_id=task.id,
+        statement="A faster Fed cutting path guarantees a bullish cross-asset outcome.",
+        evidence_observation_ids=[uuid4()],
+        confidence=0.7,
+    )
+    verification = Verification(
+        run_id=current_run.id,
+        claim_id=claim.id,
+        verdict="uncertain",
+        rationale="Too broad for verification.",
+        confidence=0.4,
+        unsupported_parts=["The guaranteed bullish outcome is not supported."],
+        source_quality_summary="No dated primary source.",
+    )
+
+    state = build_run_state(current_run, [task], [claim], [verification])
+
+    assert state.verified_claim_count == 0
+    assert state.capacity is not None
+    assert state.capacity.tavily_utilization_ratio == 0.12
+    assert round(state.capacity.llm_utilization_ratio, 3) == 0.012
+    assert state.capacity.terminal_final_allowed is False
+    assert state.capacity.useful_action_available is True
+    assert "Tavily utilization is below partial-final threshold" in (
+        state.capacity.terminal_final_blockers
+    )
+    assert PrincipalActionType.REQUEST_FOLLOWUP in {
+        action.action_type for action in state.next_action_candidates
+    }
 
 
 def test_run_state_verified_count_includes_claim_artifacts() -> None:

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import re
+from src.agents.budget_utilization import (
+    BudgetUtilizationDecision,
+    evaluate_budget_utilization,
+)
 from src.common.models import (
     AgentRole,
     AgentSpec,
@@ -15,6 +19,7 @@ from src.common.models import (
     OrganizationPlan,
     Observation,
     PrincipalAction,
+    PrincipalActionType,
     ResearchTask,
     Run,
     RunPhase,
@@ -166,6 +171,18 @@ def build_run_state(
     active_branches = _active_branches(tasks, agent_specs, artifacts, organization_plan)
     budget_summary = build_budget_summary(run, tasks, final)
     capacity = build_capacity_summary(run, budget_summary)
+    utilization = evaluate_budget_utilization(
+        run,
+        budget_summary,
+        tasks=tasks,
+        claims=claims,
+        verifications=verifications,
+        artifacts=artifacts,
+        observations=observations,
+        final=final,
+        active_branches=active_branches,
+    )
+    apply_budget_utilization(capacity, utilization)
     budget_remaining = budget_summary.remaining_usd
     stop_reasons = []
     if run.failure_reason:
@@ -227,8 +244,36 @@ def build_run_state(
         observations,
     )
     if state.capacity:
-        state.capacity.useful_action_available = bool(state.next_action_candidates)
+        useful_candidate_exists = any(
+            action.action_type != PrincipalActionType.STOP_RUN
+            for action in state.next_action_candidates
+        )
+        state.capacity.useful_action_available = (
+            state.capacity.useful_capacity_remaining or useful_candidate_exists
+        )
     return state
+
+
+def apply_budget_utilization(
+    capacity: CapacitySummary, utilization: BudgetUtilizationDecision
+) -> None:
+    capacity.llm_utilization_ratio = utilization.llm_utilization_ratio
+    capacity.tavily_utilization_ratio = utilization.tavily_utilization_ratio
+    capacity.market_data_utilization_ratio = utilization.market_data_utilization_ratio
+    capacity.verifier_utilization_ratio = utilization.verifier_utilization_ratio
+    capacity.aggregator_utilization_ratio = utilization.aggregator_utilization_ratio
+    capacity.judge_utilization_ratio = utilization.judge_utilization_ratio
+    capacity.useful_capacity_remaining = utilization.useful_capacity_remaining
+    capacity.should_continue_research = utilization.should_continue_research
+    capacity.terminal_final_allowed = utilization.terminal_final_allowed
+    capacity.terminal_final_reasons = utilization.terminal_final_reasons
+    capacity.terminal_final_blockers = utilization.terminal_final_blockers
+    capacity.repair_waves_attempted = utilization.repair_waves_attempted
+    capacity.min_repair_waves_before_partial_final = (
+        utilization.min_repair_waves_before_partial_final
+    )
+    capacity.branches_repaired = utilization.branches_repaired
+    capacity.under_researched_branches = utilization.under_researched_branches
 
 
 def build_budget_summary(
@@ -432,8 +477,6 @@ def _phase(
         return RunPhase.COMPLETED
     pending_tasks = [task for task in tasks if task.status == "created"]
     completed_tasks = [task for task in tasks if task.status == "completed"]
-    if final and final.partial:
-        return RunPhase.COMPLETED
     if final and judge_score_needs_followup(final):
         if can_request_followup_wave(final, tasks):
             return RunPhase.JUDGING
@@ -443,6 +486,8 @@ def _phase(
             return RunPhase.SYNTHESIZING
     if final and final.judge_score is None and run.models.judge:
         return RunPhase.JUDGING
+    if final and final.partial:
+        return RunPhase.COMPLETED
     if final:
         return RunPhase.COMPLETED
     if tasks and not pending_tasks and max_task_wave(tasks) >= MAX_FOLLOWUP_WAVES:

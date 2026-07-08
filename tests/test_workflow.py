@@ -233,20 +233,22 @@ def pending_policy_runtime(
     return run, task, rt
 
 
-def test_shadow_policy_persists_proposed_action_without_side_effect_event() -> None:
-    run, _task, rt = pending_policy_runtime()
+def test_shadow_policy_safe_active_dispatches_pending_tool_task() -> None:
+    run, task, rt = pending_policy_runtime()
 
     selected = asyncio.run(evaluate_principal_policy(rt, run.id, trigger="test"))
 
     assert selected is not None
     assert len(rt.blackboard.actions) == 1
     action = rt.blackboard.actions[0]
-    assert action.status == ActionStatus.PROPOSED
-    assert action.producer == SHADOW_POLICY_PRODUCER
-    assert action.reason.startswith("shadow policy proposed:")
+    assert action.status == ActionStatus.EXECUTED
+    assert action.producer == ACTIVE_POLICY_PRODUCER
+    assert action.reason.startswith("active policy selected:")
     assert action.action_type == PrincipalActionType.REQUEST_TOOL_CALL
     assert action.idempotency_key
-    assert rt.published == []
+    task_events = [event for _topic, event in rt.published if event.type == EventType.TASK_CREATED]
+    assert len(task_events) == 1
+    assert task_events[0].payload["task_id"] == str(task.id)
 
 
 def test_principal_policy_off_mode_persists_nothing() -> None:
@@ -442,7 +444,7 @@ def test_terminal_run_writes_no_shadow_policy_proposal() -> None:
     assert rt.published == []
 
 
-def test_plan_hook_writes_shadow_policy_action_without_action_created_event() -> None:
+def test_plan_hook_records_tool_dispatch_marker_without_shadow_duplicate() -> None:
     run = Run(
         question="Should I buy SAP stock?",
         models=model_policy(),
@@ -465,20 +467,16 @@ def test_plan_hook_writes_shadow_policy_action_without_action_created_event() ->
 
     asyncio.run(plan(rt, EventEnvelope(type=EventType.RUN_CREATED, run_id=run.id, producer="test")))
 
-    shadow_actions = [
+    assert not any(action.producer == SHADOW_POLICY_PRODUCER for action in rt.blackboard.actions)
+    dispatch_actions = [
         action
         for action in rt.blackboard.actions
-        if action.producer == SHADOW_POLICY_PRODUCER
+        if action.action_type == PrincipalActionType.REQUEST_TOOL_CALL
+        and action.required_role == "tool_runner"
     ]
-    assert len(shadow_actions) == 1
-    assert shadow_actions[0].status == ActionStatus.PROPOSED
-    assert shadow_actions[0].action_type == PrincipalActionType.REQUEST_TOOL_CALL
-    published_action_ids = {
-        event.payload.get("action_id")
-        for _topic, event in rt.published
-        if event.type == EventType.PRINCIPAL_ACTION_CREATED
-    }
-    assert str(shadow_actions[0].id) not in published_action_ids
+    assert len(dispatch_actions) == 1
+    assert dispatch_actions[0].status == ActionStatus.EXECUTED
+    assert "task_id=" in dispatch_actions[0].reason
 
 
 def test_every_workflow_stage_has_an_event_handler() -> None:
@@ -1258,14 +1256,70 @@ def test_create_claim_falls_back_when_claim_extractor_returns_invalid_json() -> 
     )
 
     assert len(rt.blackboard.claims) == 1
-    assert rt.blackboard.claims[0].statement.startswith(
-        "Evidence observation for market/equities"
+    assert rt.blackboard.claims[0].statement == (
+        "Equities can benefit from easier expected policy, but the reaction depends on "
+        "whether cuts signal easing support or a growth scare."
     )
     assert rt.blackboard.tasks[0].status == "created"
     assert any(event.type == EventType.CLAIM_CREATED for _topic, event in rt.published)
     assert any(
         action.action_type == PrincipalActionType.REQUEST_VERIFICATION
         and "Claim extraction model returned invalid output" in action.reason
+        for action in rt.blackboard.actions
+    )
+
+
+def test_create_claim_replaces_source_meta_model_output_with_mechanism_claim() -> None:
+    run = Run(
+        question="What happens to equities if the Fed cuts faster?",
+        models=model_policy(),
+        budget=Budget(limit_usd=1, tools=ToolBudget()),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="Equity evidence",
+        question="Fed cuts and U.S. equities",
+        tool="web_search",
+        branch="market/equities",
+    )
+    observation = Observation(
+        run_id=run.id,
+        task_id=task.id,
+        tool="web_search",
+        summary="EvidenceEngine observation for branch market/equities: 5 source(s).",
+        artifact=ArtifactPointer(uri="gs://bucket/raw.json", size_bytes=2, sha256="0" * 64),
+        sources=["https://example.com/equities"],
+    )
+    llm = QueueLLM(
+        {
+            "statement": "EvidenceEngine retrieval includes 5 sources with missing publication dates.",
+            "confidence": 0.8,
+        }
+    )
+    rt = runtime(run, llm)
+    rt.blackboard.tasks.append(task)
+    rt.blackboard.observations.append(observation)
+
+    asyncio.run(
+        create_claim(
+            rt,
+            EventEnvelope(
+                type=EventType.OBSERVATION_CREATED,
+                run_id=run.id,
+                producer="test",
+                payload={"observation_id": str(observation.id)},
+            ),
+        )
+    )
+
+    assert len(rt.blackboard.claims) == 1
+    claim = rt.blackboard.claims[0]
+    assert "EvidenceEngine retrieval" not in claim.statement
+    assert "missing publication dates" not in claim.statement
+    assert claim.statement.startswith("Equities can benefit from easier expected policy")
+    assert any(
+        action.action_type == PrincipalActionType.REQUEST_VERIFICATION
+        and "source/provider metadata" in action.reason
         for action in rt.blackboard.actions
     )
 
@@ -1939,7 +1993,7 @@ def test_aggregator_requests_zero_verified_followup_before_deterministic_final()
         aggregate(rt, EventEnvelope(type=EventType.CLAIM_VERIFIED, run_id=run.id, producer="test"))
     )
 
-    assert llm.calls == []
+    assert [call["name"] for call in llm.calls] == ["evidence-gap-planner"]
     assert rt.blackboard.final is None
     followups = [task for task in rt.blackboard.tasks if task.wave_number == 1]
     assert len(followups) == 2
@@ -1949,6 +2003,7 @@ def test_aggregator_requests_zero_verified_followup_before_deterministic_final()
     assert all("split broad claims into atomic claims" in task.question for task in followups)
     assert all("search primary/date-bearing sources" in task.question for task in followups)
     assert all("run contradiction search" in task.question for task in followups)
+    assert any("evidence_gap_planner" in artifact.tags for artifact in rt.blackboard.artifacts)
     assert any(
         action.action_type == PrincipalActionType.REQUEST_FOLLOWUP
         and action.status == ActionStatus.EXECUTED
@@ -2031,15 +2086,105 @@ def test_zero_verified_repair_tasks_are_distributed_across_failed_branches() -> 
 
     repair_tasks = [task for task in rt.blackboard.tasks if task.wave_number == 1]
     repair_branches = {task.branch for task in repair_tasks}
-    assert len(repair_tasks) == 4
-    assert len(repair_branches) >= 3
+    assert len(repair_tasks) == 5
+    assert len(repair_branches) >= 5
     assert "market/gold" in repair_branches
+    assert "market/bonds" in repair_branches
     assert repair_branches != {"market/gold"}
     assert all(task.branch for task in repair_tasks)
     assert rt.blackboard.final is None
 
 
-def test_aggregator_writes_deterministic_final_after_zero_verified_followup_wave() -> None:
+def test_latest_run_like_aggregate_blocks_final_and_scales_repair_to_budget() -> None:
+    run = Run(
+        question=(
+            "If the Fed signals faster rate cuts, compare macro rates, U.S. equities, "
+            "the U.S. dollar, gold, and long-duration bonds."
+        ),
+        models=model_policy(),
+        budget=Budget(
+            limit_usd=5,
+            spent_usd=0.06,
+            tools=ToolBudget(
+                tavily_max_credits=100,
+                tavily_credits_used=12,
+                market_data_max_requests=50,
+                market_data_requests_used=1,
+            ),
+        ),
+    )
+    branches = ["macro/rates", "market/equities", "market/fx", "market/gold", "market/bonds"]
+    tasks = [
+        ResearchTask(
+            run_id=run.id,
+            title=f"{branch} first repair",
+            question=f"Find primary evidence for {branch}.",
+            tool="web_search",
+            branch=branch,
+            status="completed",
+            wave_number=1,
+        )
+        for branch in branches
+    ]
+    claims = [
+        Claim(
+            run_id=run.id,
+            task_id=task.id,
+            statement=f"Broad unsupported claim for {task.branch}.",
+            evidence_observation_ids=[uuid4()],
+            confidence=0.7,
+        )
+        for task in tasks
+    ]
+    verifications = [
+        Verification(
+            run_id=run.id,
+            claim_id=claim.id,
+            verdict="uncertain",
+            rationale="Too broad for source verification.",
+            confidence=0.4,
+            unsupported_parts=[f"Unsupported part for {task.branch}"],
+            source_quality_summary="No dated primary source.",
+        )
+        for task, claim in zip(tasks, claims)
+    ]
+    rt = runtime(
+        run,
+        QueueLLM(
+            {
+                "diagnostic": "Need another branch-distributed repair wave.",
+                "targeted_gaps": ["Split claims by asset class."],
+                "repair_branches": branches,
+            }
+        ),
+    )
+    rt.blackboard.tasks.extend(tasks)
+    rt.blackboard.claims.extend(claims)
+    rt.blackboard.verifications.extend(verifications)
+
+    asyncio.run(
+        aggregate(rt, EventEnvelope(type=EventType.CLAIM_VERIFIED, run_id=run.id, producer="test"))
+    )
+
+    repair_tasks = [task for task in rt.blackboard.tasks if task.wave_number == 2]
+    repair_branches = {task.branch for task in repair_tasks}
+    assert rt.blackboard.final is None
+    assert not any(action.action_type == PrincipalActionType.STOP_RUN for action in rt.blackboard.actions)
+    assert [call["name"] for call in rt.llm.calls] == ["evidence-gap-planner"]
+    assert len(repair_tasks) >= 15
+    assert len(repair_branches) == 5
+    assert all(branch in repair_branches for branch in branches)
+    assert max(
+        sum(1 for task in repair_tasks if task.branch == branch) for branch in repair_branches
+    ) < len(repair_tasks)
+    assert any(
+        action.action_type == PrincipalActionType.REQUEST_FOLLOWUP
+        and action.status == ActionStatus.EXECUTED
+        for action in rt.blackboard.actions
+    )
+
+
+def test_aggregator_writes_deterministic_final_after_zero_verified_repair_waves_exhausted() -> None:
     run = Run(
         question="What happens if the Fed cuts faster than expected?",
         models=model_policy(),
@@ -2054,7 +2199,7 @@ def test_aggregator_writes_deterministic_final_after_zero_verified_followup_wave
         question="Find dated primary evidence for faster Fed cuts.",
         tool="web_search",
         status="completed",
-        wave_number=1,
+        wave_number=2,
     )
     claim = Claim(
         run_id=run.id,
@@ -2107,7 +2252,7 @@ def test_aggregator_writes_deterministic_final_after_zero_verified_followup_wave
         aggregate(rt, EventEnvelope(type=EventType.CLAIM_VERIFIED, run_id=run.id, producer="test"))
     )
 
-    assert llm.calls == []
+    assert [call["name"] for call in llm.calls] == ["evidence-gap-planner"]
     assert rt.blackboard.final is not None
     assert rt.blackboard.final.partial is True
     assert rt.blackboard.final.verified_claim_ids == []
@@ -2121,16 +2266,12 @@ def test_aggregator_writes_deterministic_final_after_zero_verified_followup_wave
     assert "Verifier-supported facts below public-verified threshold" in rt.blackboard.final.answer
     assert "Fed rate cuts can support some rate-sensitive assets" in rt.blackboard.final.answer
     assert "guaranteed bullish outcome is not supported" in rt.blackboard.final.answer
-    assert rt.blackboard.run.status == RunStatus.COMPLETED
+    assert "Budget utilization at stop" in rt.blackboard.final.answer
+    assert "Tavily used/max: 9/20" in rt.blackboard.final.answer
+    assert rt.blackboard.run.status == RunStatus.RUNNING
     assert rt.blackboard.run.final_answer == rt.blackboard.final.answer
-    assert any(
-        action.action_type == PrincipalActionType.STOP_RUN
-        and "no synthesis-safe verified claims" in action.reason
-        for action in rt.blackboard.actions
-    )
-    assert not any(
-        action.action_type == PrincipalActionType.REQUEST_FOLLOWUP for action in rt.blackboard.actions
-    )
+    assert not any(action.action_type == PrincipalActionType.STOP_RUN for action in rt.blackboard.actions)
+    assert any(event.type == EventType.FINAL_CREATED for _topic, event in rt.published)
     final_artifact = next(
         artifact
         for artifact in rt.blackboard.artifacts
@@ -2141,6 +2282,60 @@ def test_aggregator_writes_deterministic_final_after_zero_verified_followup_wave
         claim_artifact.id,
         verification_artifact.id,
     }
+
+
+def test_evidence_limited_final_runs_judge_before_terminal_stop() -> None:
+    run = Run(
+        question="What happens if the Fed cuts faster than expected?",
+        models=model_policy(),
+        budget=Budget(limit_usd=5, tools=ToolBudget(tavily_max_credits=2, tavily_credits_used=2)),
+    )
+    task = ResearchTask(
+        run_id=run.id,
+        title="Exhausted search repair",
+        question="Find dated primary evidence for faster Fed cuts.",
+        tool="web_search",
+        status="completed",
+    )
+    claim = Claim(
+        run_id=run.id,
+        task_id=task.id,
+        statement="A faster Fed cutting path guarantees a bullish cross-asset outcome.",
+        evidence_observation_ids=[uuid4()],
+        sources=["https://example.com/claim-source"],
+        confidence=0.8,
+    )
+    verification = Verification(
+        run_id=run.id,
+        claim_id=claim.id,
+        verdict="uncertain",
+        rationale="The evidence supports directionality but not the absolute guarantee.",
+        confidence=0.52,
+        unsupported_parts=["The guaranteed bullish outcome is not supported."],
+        sources=["https://example.com/verifier-source"],
+    )
+    rt = runtime(
+        run,
+        QueueLLM(
+            {"diagnostic": "Search exhausted; judge the partial.", "targeted_gaps": []},
+            {"score": 0.82, "feedback": "Evidence-limited status is clear."},
+        ),
+    )
+    rt.blackboard.tasks.append(task)
+    rt.blackboard.claims.append(claim)
+    rt.blackboard.verifications.append(verification)
+
+    asyncio.run(
+        aggregate(rt, EventEnvelope(type=EventType.CLAIM_VERIFIED, run_id=run.id, producer="test"))
+    )
+    final_event = next(event for _topic, event in rt.published if event.type == EventType.FINAL_CREATED)
+    asyncio.run(judge(rt, final_event))
+
+    assert rt.blackboard.final is not None
+    assert rt.blackboard.final.partial is True
+    assert rt.blackboard.final.judge_score == 0.82
+    assert rt.blackboard.run.status == RunStatus.COMPLETED
+    assert any(action.action_type == PrincipalActionType.STOP_RUN for action in rt.blackboard.actions)
 
 
 def test_forced_evidence_limited_final_links_unverified_claim_sources_when_capacity_exhausted() -> None:

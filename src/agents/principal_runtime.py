@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+import re
 from uuid import UUID
 
 from src.agents.principal_policy import (
@@ -11,7 +12,6 @@ from src.agents.principal_policy import (
 )
 from src.agents.state import (
     FOLLOWUP_JUDGE_SCORE_THRESHOLD,
-    MAX_FOLLOWUP_WAVES,
     branch_for_task,
     build_run_state,
     max_task_wave,
@@ -52,6 +52,7 @@ ACTIVE_EXECUTOR_ACTIONS = {
 }
 SAFE_SHADOW_ACTIVE_ACTIONS = {
     PrincipalActionType.ASSIGN_TASK,
+    PrincipalActionType.REQUEST_TOOL_CALL,
     PrincipalActionType.REQUEST_VERIFICATION,
     PrincipalActionType.REQUEST_AGGREGATION,
     PrincipalActionType.REQUEST_FOLLOWUP,
@@ -81,6 +82,8 @@ async def evaluate_principal_policy(
 
     selected = select_principal_action(runtime_snapshot.snapshot)
     if not selected:
+        return None
+    if dispatch_already_executed(runtime_snapshot.snapshot, selected):
         return None
 
     phase = runtime_snapshot.snapshot.run_state.current_phase
@@ -148,6 +151,21 @@ def is_safe_shadow_active_candidate(
         return selected.reason.startswith("No research tasks exist") or (
             "observation(s) have no extracted claim" in selected.reason
         )
+    if selected.action_type == PrincipalActionType.REQUEST_TOOL_CALL:
+        if snapshot.run.status in {
+            RunStatus.COMPLETED,
+            RunStatus.PARTIAL_BUDGET_EXHAUSTED,
+            RunStatus.FAILED,
+        }:
+            return False
+        task = matching_pending_task(snapshot, selected)
+        if task is None:
+            return False
+        if task_dispatch_already_executed(snapshot, task, selected):
+            return False
+        if task.tool == "market_data":
+            return capacity is None or not capacity.market_data_exhausted
+        return capacity is None or not capacity.search_exhausted
     if selected.action_type == PrincipalActionType.REQUEST_VERIFICATION:
         return first_unverified_claim(snapshot) is not None
     if selected.action_type == PrincipalActionType.REQUEST_AGGREGATION:
@@ -252,16 +270,17 @@ def policy_idempotency_key(
     current_phase: RunPhase,
     wave_number: int | None,
 ) -> str:
-    return "|".join(
-        [
-            str(action.run_id),
-            action.action_type.value,
-            action.target_branch or "",
-            action.required_role or "",
-            current_phase.value,
-            "" if wave_number is None else str(wave_number),
-        ]
-    )
+    parts = [
+        str(action.run_id),
+        action.action_type.value,
+        action.target_branch or "",
+        action.required_role or "",
+        current_phase.value,
+        "" if wave_number is None else str(wave_number),
+    ]
+    if action.action_type == PrincipalActionType.REQUEST_TOOL_CALL:
+        parts.append(_task_id_from_action_reason(action.reason) or action.reason)
+    return "|".join(parts)
 
 
 def policy_wave_number(action: PrincipalAction, snapshot: PrincipalSnapshot) -> int | None:
@@ -419,12 +438,19 @@ async def execute_assign_task(
     if dispatch_already_executed(snapshot, action):
         return False
 
-    from src.agents.workflow import deterministic_task_items
+    from src.agents.workflow import deterministic_task_items, persist_tool_dispatch_marker
 
     created = 0
     for item in deterministic_task_items(snapshot.run.question, snapshot.organization_plan):
         task = ResearchTask(run_id=snapshot.run.id, **item)
         await runtime.blackboard.put_task(task)
+        await persist_tool_dispatch_marker(
+            runtime,
+            task,
+            branch_for_task(task, snapshot.agent_specs),
+            producer=ACTIVE_POLICY_PRODUCER,
+            reason_prefix="Principal dispatched tool task",
+        )
         publish(
             runtime,
             EventType.TASK_CREATED,
@@ -456,6 +482,7 @@ async def execute_followup(
     from src.agents.workflow import (
         followup_already_requested,
         followup_task_items,
+        persist_tool_dispatch_marker,
     )
 
     score = snapshot.final.judge_score
@@ -476,6 +503,13 @@ async def execute_followup(
     for item in followup_task_items(snapshot.run, snapshot.final, wave_number):
         task = ResearchTask(run_id=snapshot.run.id, **item)
         await runtime.blackboard.put_task(task)
+        await persist_tool_dispatch_marker(
+            runtime,
+            task,
+            branch_for_task(task, snapshot.agent_specs),
+            producer=ACTIVE_POLICY_PRODUCER,
+            reason_prefix=f"Principal follow-up wave {wave_number} dispatched tool task",
+        )
         publish(
             runtime,
             EventType.TASK_CREATED,
@@ -518,8 +552,11 @@ async def execute_stop_run(
 def matching_pending_task(
     snapshot: PrincipalSnapshot, action: PrincipalAction
 ) -> ResearchTask | None:
+    task_id = _task_id_from_action_reason(action.reason)
     for task in sorted(snapshot.tasks, key=lambda value: (-value.wave_number, str(value.id))):
         if task.status != "created":
+            continue
+        if task_id and str(task.id) != task_id:
             continue
         if action.target_branch and branch_for_task(task, snapshot.agent_specs) != action.target_branch:
             continue
@@ -621,12 +658,23 @@ def should_dispatch_aggregation(snapshot: PrincipalSnapshot) -> bool:
 def zero_verified_terminal_aggregation_ready(snapshot: PrincipalSnapshot) -> bool:
     if snapshot.final is not None:
         return False
-    if max_task_wave(snapshot.tasks) < MAX_FOLLOWUP_WAVES:
-        return False
     if any(verification.verdict == "verified" for verification in snapshot.verifications):
         return False
+    if snapshot.run_state.capacity and not snapshot.run_state.capacity.terminal_final_allowed:
+        return False
     verified_or_checked_claim_ids = {verification.claim_id for verification in snapshot.verifications}
-    claim_ids = {claim.id for claim in snapshot.claims}
+    claim_artifact_by_id = {
+        artifact.legacy_object_id: artifact
+        for artifact in snapshot.artifacts
+        if artifact.artifact_type == ArtifactType.CLAIM
+        and artifact.legacy_object_type == "claim"
+        and artifact.legacy_object_id is not None
+    }
+    claim_ids = {
+        claim.id
+        for claim in snapshot.claims
+        if not is_market_snapshot_context_claim(claim, claim_artifact_by_id.get(claim.id))
+    }
     return claim_ids <= verified_or_checked_claim_ids
 
 
@@ -640,6 +688,8 @@ def should_reaggregate_after_followup_snapshot(snapshot: PrincipalSnapshot) -> b
 
 
 def useful_action_remains(snapshot: PrincipalSnapshot) -> bool:
+    if snapshot.run_state.capacity and snapshot.run_state.capacity.useful_capacity_remaining:
+        return True
     if any(task.status == "created" for task in snapshot.tasks):
         return True
     if first_unverified_claim(snapshot):
@@ -666,18 +716,40 @@ def task_dispatch_already_executed(
         existing.status == ActionStatus.EXECUTED
         and existing.action_type == action.action_type
         and existing.required_role == action.required_role
-        and existing.target_branch == branch
+        and (
+            _task_id_from_action_reason(existing.reason) == str(task.id)
+            if _task_id_from_action_reason(existing.reason)
+            else existing.target_branch == branch
+        )
         for existing in snapshot.principal_actions
     )
 
 
 def actions_match(existing: PrincipalAction, action: PrincipalAction) -> bool:
+    existing_task_id = _task_id_from_action_reason(existing.reason)
+    action_task_id = _task_id_from_action_reason(action.reason)
+    if (
+        existing.action_type == PrincipalActionType.REQUEST_TOOL_CALL
+        and action.action_type == PrincipalActionType.REQUEST_TOOL_CALL
+        and existing_task_id
+        and action_task_id
+    ):
+        return bool(
+            existing.status == ActionStatus.EXECUTED
+            and existing.required_role == action.required_role
+            and existing_task_id == action_task_id
+        )
     return bool(
         existing.status == ActionStatus.EXECUTED
         and existing.action_type == action.action_type
         and existing.required_role == action.required_role
         and existing.target_branch == action.target_branch
     )
+
+
+def _task_id_from_action_reason(reason: str) -> str | None:
+    match = re.search(r"task_id=([0-9a-fA-F-]{36})", reason)
+    return match.group(1) if match else None
 
 
 def publish(runtime: Runtime, event_type: EventType, run_id: UUID, **payload: object) -> None:
