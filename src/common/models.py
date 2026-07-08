@@ -432,6 +432,11 @@ class RunState(BaseModel):
     claims_created_from_supported_parts: int = 0
     aggregator_used: bool = False
     judge_used: bool = False
+    claims_per_research_observation: float = 0
+    claims_created_from_verifier_outputs: int = 0
+    source_meta_claims_rejected: int = 0
+    market_snapshot_claims_rejected: int = 0
+    terminal_reason: str | None = None
 
 
 class RunDetail(BaseModel):

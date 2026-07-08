@@ -5,6 +5,7 @@ from src.agents.budget_utilization import (
     BudgetUtilizationDecision,
     evaluate_budget_utilization,
 )
+from src.agents.claim_policy import MAX_CLAIMS_PER_RUN
 from src.common.models import (
     AgentRole,
     AgentSpec,
@@ -194,6 +195,10 @@ def build_run_state(
         reason = "Search/tool budget exhausted before enough claims passed verification."
         if reason not in stop_reasons:
             stop_reasons.append(reason)
+    if _normal_claim_count(claims, artifacts) >= MAX_CLAIMS_PER_RUN:
+        reason = f"Claim generation cap reached ({MAX_CLAIMS_PER_RUN} normal claims)."
+        if reason not in stop_reasons:
+            stop_reasons.append(reason)
     if final and final.partial:
         stop_reasons.append("partial final report produced before full synthesis")
     if run.status == RunStatus.COMPLETED:
@@ -241,6 +246,15 @@ def build_run_state(
         ),
         aggregator_used=_aggregator_used(final, artifacts, principal_actions),
         judge_used=_judge_used(final, artifacts),
+        claims_per_research_observation=_claims_per_research_observation(
+            claims, observations, artifacts
+        ),
+        claims_created_from_verifier_outputs=_claims_created_from_verifier_outputs(claims),
+        source_meta_claims_rejected=_rejection_count(artifacts, "source_meta_claim_rejected"),
+        market_snapshot_claims_rejected=_rejection_count(
+            artifacts, "market_snapshot_claim_rejected"
+        ),
+        terminal_reason=_terminal_reason(run, final, stop_reasons, capacity),
     )
     state.next_action_candidates = _next_actions(
         state,
@@ -271,6 +285,140 @@ def _claims_per_10_tavily(verified_claim_count: int, tavily_used: int) -> float:
     if tavily_used <= 0:
         return 0.0
     return round((verified_claim_count / tavily_used) * 10, 2)
+
+
+def _normal_claim_count(claims: list[Claim], artifacts: list[Artifact]) -> int:
+    artifact_by_claim_id = _claim_artifact_by_claim_id(artifacts)
+    return len(
+        [
+            claim
+            for claim in claims
+            if not _is_context_only_or_meta_claim(claim, artifact_by_claim_id.get(claim.id))
+        ]
+    )
+
+
+def _claim_artifact_by_claim_id(artifacts: list[Artifact]) -> dict[object, Artifact]:
+    return {
+        artifact.legacy_object_id: artifact
+        for artifact in artifacts
+        if artifact.artifact_type == ArtifactType.CLAIM
+        and artifact.legacy_object_type == "claim"
+        and artifact.legacy_object_id is not None
+    }
+
+
+def _is_context_only_or_meta_claim(claim: Claim, artifact: Artifact | None) -> bool:
+    text = claim.statement.casefold()
+    if text.startswith("market data snapshot") or text.startswith("marketsnapshot"):
+        return True
+    if any(
+        pattern in text
+        for pattern in (
+            "evidenceengine",
+            "publication date",
+            "provider",
+            "retrieval",
+            "source count",
+            "source title",
+            "source quality",
+            "quality score",
+        )
+    ):
+        return True
+    if claim.derived_from_verification_id is not None:
+        return True
+    return bool(
+        artifact
+        and any(
+            tag in artifact.tags
+            for tag in (
+                "context_only",
+                "market_snapshot",
+                "source_meta_claim_rejected",
+                "supported_part_subclaim",
+                "derived_from_supported_parts",
+                "tool:market_data",
+            )
+        )
+    )
+
+
+def _claims_per_research_observation(
+    claims: list[Claim],
+    observations: list[Observation],
+    artifacts: list[Artifact],
+) -> float:
+    research_observations = [
+        observation
+        for observation in observations
+        if _is_original_research_observation(observation, artifacts)
+    ]
+    if not research_observations:
+        return 0.0
+    return round(_normal_claim_count(claims, artifacts) / len(research_observations), 2)
+
+
+def _is_original_research_observation(
+    observation: Observation, artifacts: list[Artifact]
+) -> bool:
+    if observation.tool != "web_search":
+        return False
+    return not any(
+        artifact.legacy_object_type == "observation"
+        and artifact.legacy_object_id == observation.id
+        and (
+            artifact.artifact_type
+            in {
+                ArtifactType.VERIFICATION,
+                ArtifactType.DATA_GAP,
+                ArtifactType.FINAL_REPORT,
+                ArtifactType.JUDGE_FEEDBACK,
+            }
+            or (artifact.branch or "").startswith(("trust/", "synthesis/"))
+            or any(
+                tag in artifact.tags
+                for tag in (
+                    "context_only",
+                    "market_snapshot",
+                    "evidence_gap_planner",
+                    "source_meta_claim_rejected",
+                    "market_snapshot_claim_rejected",
+                    "tool:market_data",
+                )
+            )
+        )
+        for artifact in artifacts
+    )
+
+
+def _claims_created_from_verifier_outputs(claims: list[Claim]) -> int:
+    return sum(1 for claim in claims if claim.derived_from_verification_id is not None)
+
+
+def _rejection_count(artifacts: list[Artifact], tag: str) -> int:
+    return sum(1 for artifact in artifacts if tag in artifact.tags)
+
+
+def _terminal_reason(
+    run: Run,
+    final: FinalReport | None,
+    stop_reasons: list[str],
+    capacity: CapacitySummary,
+) -> str | None:
+    if run.status == RunStatus.FAILED:
+        return run.failure_reason or "run failed"
+    if final and final.judge_score is not None:
+        return "judge completed"
+    if final and final.partial:
+        return "partial final produced"
+    if capacity.search_exhausted:
+        return "search exhausted"
+    if stop_reasons:
+        return stop_reasons[-1]
+    if run.status == RunStatus.COMPLETED:
+        return "run completed"
+    return None
 
 
 SOURCE_TIER_NAMES = (

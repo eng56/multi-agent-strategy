@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Iterable
 
+from src.agents.claim_policy import MAX_CLAIMS_PER_RUN
 from src.common.models import (
     ActionStatus,
     AgentSpec,
@@ -220,7 +221,11 @@ def _candidate_rules(snapshot: PrincipalSnapshot) -> list[PrincipalActionCandida
         )
 
     missing_claim_observations = _observations_without_claims(snapshot)
-    if missing_claim_observations and snapshot.final is None:
+    if (
+        missing_claim_observations
+        and snapshot.final is None
+        and _normal_claim_count(snapshot) < MAX_CLAIMS_PER_RUN
+    ):
         observation = missing_claim_observations[0]
         branch = _branch_for_observation(observation, snapshot)
         candidates.append(
@@ -586,6 +591,7 @@ def _observations_without_claims(snapshot: PrincipalSnapshot) -> list[Observatio
         observation
         for observation in snapshot.observations
         if observation.id not in claimed_observation_ids
+        and _is_original_research_observation(observation, snapshot)
         and not _is_market_snapshot_observation(observation, snapshot.artifacts)
         and not _is_data_gap_observation(observation, snapshot.artifacts)
     ]
@@ -600,6 +606,21 @@ def _unverified_claim_count(snapshot: PrincipalSnapshot) -> int:
             for claim in snapshot.claims
             if claim.id not in verified_claim_ids
             and not _is_market_snapshot_claim(claim, artifact_by_claim_id.get(claim.id))
+            and not _is_source_meta_claim(claim)
+            and claim.derived_from_verification_id is None
+        ]
+    )
+
+
+def _normal_claim_count(snapshot: PrincipalSnapshot) -> int:
+    artifact_by_claim_id = _claim_artifacts_by_legacy_id(snapshot.artifacts)
+    return len(
+        [
+            claim
+            for claim in snapshot.claims
+            if not _is_market_snapshot_claim(claim, artifact_by_claim_id.get(claim.id))
+            and not _is_source_meta_claim(claim)
+            and claim.derived_from_verification_id is None
         ]
     )
 
@@ -640,6 +661,57 @@ def _is_market_snapshot_claim(claim: Claim, artifact: Artifact | None) -> bool:
             or "context_only" in artifact.tags
             or "tool:market_data" in artifact.tags
         )
+    )
+
+
+def _is_source_meta_claim(claim: Claim) -> bool:
+    text = claim.statement.casefold()
+    return any(
+        pattern in text
+        for pattern in (
+            "evidenceengine",
+            "publication date",
+            "publication dates",
+            "provider",
+            "retrieval",
+            "source count",
+            "source title",
+            "source quality",
+            "quality score",
+        )
+    )
+
+
+def _is_original_research_observation(
+    observation: Observation, snapshot: PrincipalSnapshot
+) -> bool:
+    if observation.tool != "web_search":
+        return False
+    branch = _branch_for_observation(observation, snapshot)
+    if branch.startswith(("trust/", "synthesis/")):
+        return False
+    return not any(
+        artifact.legacy_object_type == "observation"
+        and artifact.legacy_object_id == observation.id
+        and (
+            artifact.artifact_type
+            in {
+                ArtifactType.VERIFICATION,
+                ArtifactType.DATA_GAP,
+                ArtifactType.FINAL_REPORT,
+                ArtifactType.JUDGE_FEEDBACK,
+            }
+            or any(
+                tag in artifact.tags
+                for tag in (
+                    "context_only",
+                    "evidence_gap_planner",
+                    "source_meta_claim_rejected",
+                    "market_snapshot_claim_rejected",
+                )
+            )
+        )
+        for artifact in snapshot.artifacts
     )
 
 
@@ -701,9 +773,11 @@ def _zero_verified_terminal_aggregation_ready(snapshot: PrincipalSnapshot) -> bo
         return False
     if not snapshot.tasks or any(task.status == "created" for task in snapshot.tasks):
         return False
+    claim_cap_reached = _normal_claim_count(snapshot) >= MAX_CLAIMS_PER_RUN
     if (
         snapshot.run_state.capacity
         and not snapshot.run_state.capacity.terminal_final_allowed
+        and not claim_cap_reached
     ):
         return False
     if any(verification.verdict == "verified" for verification in snapshot.verifications):
@@ -714,6 +788,8 @@ def _zero_verified_terminal_aggregation_ready(snapshot: PrincipalSnapshot) -> bo
         claim.id
         for claim in snapshot.claims
         if not _is_market_snapshot_claim(claim, artifact_by_claim_id.get(claim.id))
+        and not _is_source_meta_claim(claim)
+        and claim.derived_from_verification_id is None
     }
     return claim_ids <= checked_claim_ids
 
@@ -722,6 +798,8 @@ def _zero_verified_repair_ready(snapshot: PrincipalSnapshot) -> bool:
     if snapshot.final is not None:
         return False
     if not snapshot.tasks or any(task.status == "created" for task in snapshot.tasks):
+        return False
+    if _normal_claim_count(snapshot) >= MAX_CLAIMS_PER_RUN:
         return False
     if any(verification.verdict == "verified" for verification in snapshot.verifications):
         return False
@@ -737,6 +815,8 @@ def _zero_verified_repair_ready(snapshot: PrincipalSnapshot) -> bool:
         claim.id
         for claim in snapshot.claims
         if not _is_market_snapshot_claim(claim, artifact_by_claim_id.get(claim.id))
+        and not _is_source_meta_claim(claim)
+        and claim.derived_from_verification_id is None
     }
     if claim_ids and not claim_ids <= checked_claim_ids:
         return False
