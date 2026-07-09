@@ -95,6 +95,7 @@ type CapacitySummary = {
   search_exhausted: boolean;
   market_data_exhausted: boolean;
   useful_action_available: boolean;
+  branches_repaired?: string[];
 };
 
 type RunState = {
@@ -117,6 +118,19 @@ type RunState = {
   dead_letter_count: number;
   stop_reasons: string[];
   next_action_candidates: PrincipalAction[];
+  tavily_used?: number;
+  verified_claims?: number;
+  verified_claims_per_10_tavily?: number;
+  disputed_claims?: number;
+  source_quality_distribution?: Record<string, number>;
+  claims_created_from_supported_parts?: number;
+  aggregator_used?: boolean;
+  judge_used?: boolean;
+  claims_per_research_observation?: number;
+  claims_created_from_verifier_outputs?: number;
+  source_meta_claims_rejected?: number;
+  market_snapshot_claims_rejected?: number;
+  terminal_reason?: string | null;
 };
 
 type Claim = {
@@ -184,6 +198,13 @@ const relationConfigs: {kind: RelationKind; title: string; empty: string}[] = [
   {kind: "contradicts", title: "Contradicts links", empty: "No contradicts links recorded yet."},
   {kind: "depends_on", title: "Depends on links", empty: "No depends_on links recorded yet."},
 ];
+const followUpPrompts = [
+  "Focus only on gold and real yields. Use dated primary or high-quality sources.",
+  "Compare USD vs gold under faster Fed cuts, with a 3-month horizon.",
+  "Run a narrower version focused only on long-duration bonds and Treasury yields.",
+  "Ask for a mechanism-only answer, not a directional forecast.",
+  "Ask for a source-quality audit of the evidence.",
+];
 
 function asList<T>(value: T[] | undefined | null): T[] {
   return value ?? [];
@@ -199,6 +220,10 @@ function money(value: number | undefined | null) {
 
 function percent(value: number | undefined | null) {
   return value === undefined || value === null ? "n/a" : `${Math.round(value * 100)}%`;
+}
+
+function formatNumber(value: number | undefined | null, digits = 1) {
+  return value === undefined || value === null ? "n/a" : value.toFixed(digits);
 }
 
 function shortId(id: string) {
@@ -231,6 +256,31 @@ function statusClass(status: string | undefined | null) {
   return `pill status-${(status ?? "unknown").replace(/_/g, "-")}`;
 }
 
+function runStatusBadges(status: string, isPartialFinal: boolean, finalAnswer: string | undefined | null) {
+  const normalized = status.toLowerCase();
+  const badges: {label: string; className: string}[] = [];
+  if (normalized.includes("fail")) {
+    badges.push({label: "Failed", className: "status-failed"});
+  } else if (normalized.includes("running") || normalized.includes("created")) {
+    badges.push({label: "Running", className: "status-running"});
+  } else if (isPartialFinal || normalized.includes("partial") || normalized.includes("evidence")) {
+    badges.push({label: "Evidence-limited", className: "status-partial-budget-exhausted"});
+  } else if (normalized.includes("complete") || finalAnswer) {
+    badges.push({label: "Completed", className: "status-completed"});
+  } else {
+    badges.push({label: label(status), className: `status-${normalized.replace(/_/g, "-")}`});
+  }
+  if (normalized.includes("budget_exhausted") || normalized.includes("budget-exhausted")) {
+    badges.push({label: "Budget exhausted", className: "status-partial-budget-exhausted"});
+  }
+  return badges;
+}
+
+function yesNo(value: boolean | undefined | null) {
+  if (value === undefined || value === null) return "unknown";
+  return value ? "yes" : "no";
+}
+
 function groupArtifacts(artifacts: Artifact[], key: (artifact: Artifact) => string): ArtifactGroup[] {
   const groups = new Map<string, Artifact[]>();
   for (const artifact of artifacts) {
@@ -260,7 +310,7 @@ function Empty({children}: {children: React.ReactNode}) {
   return <p className="muted">{children}</p>;
 }
 
-function ActionTimeline({actions, empty}: {actions: PrincipalAction[]; empty: string}) {
+function ActionTimeline({actions, empty, limit}: {actions: PrincipalAction[]; empty: string; limit?: number}) {
   const ordered = [...actions].sort((a, b) => {
     const left = a.created_at ? new Date(a.created_at).getTime() : 0;
     const right = b.created_at ? new Date(b.created_at).getTime() : 0;
@@ -268,28 +318,33 @@ function ActionTimeline({actions, empty}: {actions: PrincipalAction[]; empty: st
   });
 
   if (ordered.length === 0) return <Empty>{empty}</Empty>;
+  const visible = limit && ordered.length > limit ? ordered.slice(-limit) : ordered;
+  const hiddenCount = ordered.length - visible.length;
 
   return (
-    <ol className="timeline">
-      {ordered.map((action) => (
-        <li key={action.id}>
-          <div className="timeline-dot" />
-          <div className="timeline-body">
-            <div className="row-wrap">
-              <strong>{label(action.action_type)}</strong>
-              <span className={statusClass(action.status)}>{label(action.status)}</span>
-              <span className="pill">priority {action.priority}</span>
-              <span className="pill">{label(action.expected_information_gain)} gain</span>
+    <>
+      {hiddenCount > 0 && <p className="muted">Showing the latest {visible.length} of {ordered.length} actions.</p>}
+      <ol className="timeline">
+        {visible.map((action) => (
+          <li key={action.id}>
+            <div className="timeline-dot" />
+            <div className="timeline-body">
+              <div className="row-wrap">
+                <strong>{label(action.action_type)}</strong>
+                <span className={statusClass(action.status)}>{label(action.status)}</span>
+                <span className="pill">priority {action.priority}</span>
+                <span className="pill">{label(action.expected_information_gain)} gain</span>
+              </div>
+              <p>{action.reason}</p>
+              <small>
+                {formatTime(action.created_at)} · role {action.required_role ?? "any"} · branch{" "}
+                {action.target_branch ?? "none"} · est. {money(action.estimated_cost)}
+              </small>
             </div>
-            <p>{action.reason}</p>
-            <small>
-              {formatTime(action.created_at)} · role {action.required_role ?? "any"} · branch{" "}
-              {action.target_branch ?? "none"} · est. {money(action.estimated_cost)}
-            </small>
-          </div>
-        </li>
-      ))}
-    </ol>
+          </li>
+        ))}
+      </ol>
+    </>
   );
 }
 
@@ -321,6 +376,7 @@ function ArtifactMiniList({groups}: {groups: ArtifactGroup[]}) {
 export default function RunPage({params}: {params: Promise<{id: string}>}) {
   const [id, setId] = useState("");
   const [detail, setDetail] = useState<Detail>();
+  const [copiedPrompt, setCopiedPrompt] = useState("");
 
   useEffect(() => {
     params.then((p) => setId(p.id));
@@ -368,19 +424,20 @@ export default function RunPage({params}: {params: Promise<{id: string}>}) {
   ]);
   const verifiedKnowledgeIds = unique([
     ...asList(detail.final?.verified_claim_ids),
-    ...finalLinkedEvidenceIds.filter((id) => {
-      const artifact = artifactById.get(id);
+    ...finalLinkedEvidenceIds.filter((evidenceId) => {
+      const artifact = artifactById.get(evidenceId);
       return !isPartialFinal && artifact?.status === "verified";
     }),
   ]);
   const caveatedEvidenceIds = unique(
-    finalLinkedEvidenceIds.filter((id) => {
-      const artifact = artifactById.get(id);
+    finalLinkedEvidenceIds.filter((evidenceId) => {
+      const artifact = artifactById.get(evidenceId);
       return isPartialFinal || !artifact || artifact.status !== "verified";
     }),
   );
   const stopReasons = unique([
     detail.run.failure_reason,
+    state?.terminal_reason,
     ...asList(state?.stop_reasons),
     ...asList(summary?.stop_reasons),
   ]);
@@ -390,13 +447,51 @@ export default function RunPage({params}: {params: Promise<{id: string}>}) {
   const rejectedArtifacts = artifacts.filter((artifact) => artifact.status === "rejected").length;
   const disputedArtifacts = artifacts.filter((artifact) => artifact.status === "disputed").length;
   const fallbackBudgetRemaining = Math.max(0, b.limit_usd - b.spent_usd - b.reserved_usd);
+  const tavilyUsed = summary?.tool_usage.tavily_credits?.used ?? b.tools.tavily_credits_used;
+  const tavilyMax = summary?.tool_usage.tavily_credits?.max ?? b.tools.tavily_max_credits;
+  const marketDataUsed = summary?.tool_usage.market_data_requests?.used ?? b.tools.market_data_requests_used;
+  const marketDataMax = summary?.tool_usage.market_data_requests?.max ?? b.tools.market_data_max_requests;
+  const primaryStopReason = stopReasons[0] ?? "No terminal stop reason recorded yet.";
+  const branchesCovered = unique([
+    ...asList(state?.active_branches),
+    ...asList(detail.organization_plan?.branches),
+    ...artifacts.map((artifact) => artifact.branch ?? null),
+  ]).filter((branch) => branch !== "unbranched");
+  const inferredAggregatorUsed = detail.principal_actions.some((action) => action.required_role === "aggregator");
+  const inferredJudgeUsed =
+    detail.final?.judge_score !== undefined ||
+    state?.last_judge_score !== undefined ||
+    detail.principal_actions.some((action) => action.required_role === "judge");
+  const aggregatorUsed = state?.aggregator_used ?? inferredAggregatorUsed;
+  const judgeUsed = state?.judge_used ?? inferredJudgeUsed;
+  const statusBadges = runStatusBadges(detail.run.status, isPartialFinal, finalAnswer);
+  const isEvidenceLimited = statusBadges.some((badge) => badge.label === "Evidence-limited");
+  const isTerminalish = statusBadges.some((badge) =>
+    ["Completed", "Evidence-limited", "Budget exhausted", "Failed"].includes(badge.label),
+  );
+  const disputedOrRejectedCount =
+    (state?.rejected_claim_count ?? rejectedArtifacts) + (state?.disputed_claim_count ?? disputedArtifacts);
+  const finalPreview = finalAnswer ? compact(finalAnswer, 320) : "No final answer has been produced yet.";
+  const interpretation = !finalAnswer
+    ? "The system is still collecting evidence, verifying claims, or waiting for synthesis."
+    : isPartialFinal || isEvidenceLimited
+      ? "The system did not find enough public-verified claims for a decision-grade answer. Review caveated evidence and verifier downgrades below."
+      : disputedOrRejectedCount >= Math.max(6, verifiedKnowledgeClaims * 3)
+        ? "Many candidate claims were disputed. This usually means the evidence is directionally relevant but not specific or high-quality enough."
+        : "Read the final answer together with the verified knowledge claims, caveats, judge feedback, and budget diagnostics.";
 
-  function renderReference(id: string) {
-    const artifact = artifactById.get(id);
+  function renderReference(evidenceId: string) {
+    const artifact = artifactById.get(evidenceId);
     if (artifact) return <ArtifactLink artifact={artifact} />;
-    const claim = claimsById.get(id);
-    if (claim) return <span>legacy claim {shortId(id)} · {compact(claim.statement, 100)}</span>;
-    return <span>unknown artifact {shortId(id)}</span>;
+    const claim = claimsById.get(evidenceId);
+    if (claim) {
+      return (
+        <span>
+          legacy claim {shortId(evidenceId)} · {compact(claim.statement, 100)}
+        </span>
+      );
+    }
+    return <span>unknown artifact {shortId(evidenceId)}</span>;
   }
 
   function relationRows(kind: RelationKind) {
@@ -405,113 +500,128 @@ export default function RunPage({params}: {params: Promise<{id: string}>}) {
     );
   }
 
+  async function copyFollowUpPrompt(prompt: string) {
+    try {
+      await navigator.clipboard.writeText(prompt);
+      setCopiedPrompt(prompt);
+      setTimeout(() => setCopiedPrompt(""), 1800);
+    } catch {
+      setCopiedPrompt("");
+    }
+  }
+
   return (
     <main className="shell run-detail">
-      <a href="/">Back to new run</a>
-      <p className="tag">{detail.run.status.toUpperCase()}</p>
+      <nav className="top-nav">
+        <a href="/">Back to new run</a>
+        <a href="/about">About this prototype</a>
+      </nav>
+      <p className="tag">RUN TRACE</p>
       <h1>{detail.run.question}</h1>
 
-      <div className="grid">
-        <section className="card metric-card">
-          <h2>Run summary</h2>
-          <p>
-            Phase <strong>{state?.current_phase ?? detail.run.status}</strong>
-          </p>
-          <p>
-            {detail.tasks.length} tasks · {detail.claims.length} claims · {detail.verifications.length} checks ·{" "}
-            {artifacts.length} artifacts
-          </p>
-          <p>
-            Verified knowledge claims {verifiedKnowledgeClaims} · Verified artifacts {verifiedArtifacts} · Final report{" "}
-            {finalArtifactStatus}
-          </p>
-          <p>
-            Rejected{" "}
-            {state?.rejected_claim_count ?? rejectedArtifacts} · Disputed{" "}
-            {disputedArtifacts || state?.disputed_claim_count || 0}
-          </p>
-        </section>
-
-        <section className="card metric-card">
-          <h2>Budget summary</h2>
-          <p>
-            {money(summary?.spent_usd ?? b.spent_usd)} spent /{" "}
-            {money(summary?.total_limit_usd ?? b.limit_usd)} limit
-          </p>
-          <p>
-            {money(summary?.reserved_usd ?? b.reserved_usd)} reserved ·{" "}
-            {money(summary?.remaining_usd ?? fallbackBudgetRemaining)} remaining
-          </p>
-          <p>
-            Tavily {summary?.tool_usage.tavily_credits?.used ?? b.tools.tavily_credits_used}/
-            {summary?.tool_usage.tavily_credits?.max ?? b.tools.tavily_max_credits} · Market data{" "}
-            {summary?.tool_usage.market_data_requests?.used ?? b.tools.market_data_requests_used}/
-            {summary?.tool_usage.market_data_requests?.max ?? b.tools.market_data_max_requests}
-          </p>
-          {summary ? (
-            <p>
-              Protected {money(summary.protected_usd)} · {money(summary.protected_remaining_usd)} remaining
-            </p>
-          ) : (
-            <Empty>Detailed role budget summary is not available yet.</Empty>
-          )}
-          {state?.capacity && (
-            <p>
-              Capacity: LLM {money(state.capacity.llm_remaining_usd)} · Verifier{" "}
-              {money(state.capacity.verifier_budget_remaining)} · Aggregator protected{" "}
-              {money(state.capacity.aggregator_budget_protected_remaining)} · Judge protected{" "}
-              {money(state.capacity.judge_budget_protected_remaining)}
-            </p>
-          )}
-        </section>
-      </div>
-
-      {summary && (
-        <section className="card">
-          <h2>Role budget</h2>
-          <div className="table">
-            <div className="table-row table-head">
-              <span>Role</span>
-              <span>Spent</span>
-              <span>Reserved</span>
-              <span>Protected</span>
-            </div>
-            {roleNames.map((role) => (
-              <div className="table-row" key={role}>
-                <span>{role}</span>
-                <span>{money(summary.role_spent_usd[role])}</span>
-                <span>{money(summary.role_reserved_usd[role])}</span>
-                <span>{money(summary.role_protected_usd[role])}</span>
-              </div>
+      <section className="card executive-card">
+        <div className="section-heading">
+          <div>
+            <h2>Executive view</h2>
+            <p className="muted">A readable summary before the raw Principal, artifact, and verification trace.</p>
+          </div>
+          <div className="row-wrap">
+            {statusBadges.map((badge) => (
+              <span className={`pill status-badge ${badge.className}`} key={badge.label}>
+                {badge.label}
+              </span>
             ))}
           </div>
-        </section>
-      )}
+        </div>
 
-      <section className="card">
-        <h2>Principal actions timeline</h2>
-        <ActionTimeline
-          actions={detail.principal_actions ?? []}
-          empty="No executed principal decisions recorded yet."
-        />
-        {asList(state?.next_action_candidates).length > 0 && (
-          <>
-            <h3>Candidate next actions</h3>
-            <ActionTimeline actions={asList(state?.next_action_candidates)} empty="No candidate next actions right now." />
-          </>
-        )}
+        <div className="exec-final">
+          <h3>Final answer / partial final</h3>
+          <p>{finalPreview}</p>
+        </div>
+
+        <div className="exec-metrics">
+          <div>
+            <small>Status</small>
+            <strong>{label(detail.run.status)}</strong>
+          </div>
+          <div>
+            <small>Verified knowledge claims</small>
+            <strong>{verifiedKnowledgeClaims}</strong>
+          </div>
+          <div>
+            <small>Verified artifacts</small>
+            <strong>{verifiedArtifacts}</strong>
+          </div>
+          <div>
+            <small>Disputed / rejected</small>
+            <strong>{disputedOrRejectedCount}</strong>
+          </div>
+          <div>
+            <small>Search budget used</small>
+            <strong>
+              {tavilyUsed}/{tavilyMax}
+            </strong>
+          </div>
+          <div>
+            <small>Market-data used</small>
+            <strong>
+              {marketDataUsed}/{marketDataMax}
+            </strong>
+          </div>
+          <div>
+            <small>LLM budget used</small>
+            <strong>
+              {money(summary?.spent_usd ?? b.spent_usd)} / {money(summary?.total_limit_usd ?? b.limit_usd)}
+            </strong>
+          </div>
+          <div>
+            <small>Branches covered</small>
+            <strong>{branchesCovered.length ? branchesCovered.join(", ") : "none recorded"}</strong>
+          </div>
+          <div>
+            <small>Aggregator used</small>
+            <strong>{yesNo(aggregatorUsed)}</strong>
+          </div>
+          <div>
+            <small>Judge used</small>
+            <strong>{yesNo(judgeUsed)}</strong>
+          </div>
+          <div>
+            <small>Final report artifact</small>
+            <strong>{finalArtifactStatus}</strong>
+          </div>
+          <div className="wide-metric">
+            <small>Primary stop reason</small>
+            <strong>{compact(primaryStopReason, 160)}</strong>
+          </div>
+        </div>
+
+        <div className="interpretation-box">
+          <strong>How to interpret this run</strong>
+          <p>{interpretation}</p>
+        </div>
       </section>
 
       <section className="card">
         <h2>Final answer</h2>
         {finalAnswer ? (
           <>
-            {detail.final?.partial && <p className="pill status-partial-budget-exhausted">partial final</p>}
+            {detail.final?.partial && (
+              <p className="interpretation-box">
+                Evidence-limited final: the system refused to present weak or disputed claims as decision-grade support.
+              </p>
+            )}
             <div className="report">{finalAnswer}</div>
             <div className="meta-grid">
-              <p>Judge score: <strong>{percent(detail.final?.judge_score ?? state?.last_judge_score)}</strong></p>
-              <p>Wave: <strong>{detail.final?.wave_number ?? 0}</strong></p>
-              <p>Sources: <strong>{detail.final?.sources.length ?? 0}</strong></p>
+              <p>
+                Judge score: <strong>{percent(detail.final?.judge_score ?? state?.last_judge_score)}</strong>
+              </p>
+              <p>
+                Wave: <strong>{detail.final?.wave_number ?? 0}</strong>
+              </p>
+              <p>
+                Sources: <strong>{detail.final?.sources.length ?? 0}</strong>
+              </p>
             </div>
             {(detail.final?.judge_feedback ?? state?.last_judge_feedback) && (
               <>
@@ -573,6 +683,210 @@ export default function RunPage({params}: {params: Promise<{id: string}>}) {
         )}
       </section>
 
+      {isTerminalish && (
+        <section className="card">
+          <h2>Try a better follow-up prompt</h2>
+          <p className="muted">Copy a narrower prompt, then start a new run from the landing page.</p>
+          <div className="followup-grid">
+            {followUpPrompts.map((prompt) => (
+              <button className="copy-card" type="button" key={prompt} onClick={() => copyFollowUpPrompt(prompt)}>
+                <span>{prompt}</span>
+                <small>{copiedPrompt === prompt ? "Copied" : "Copy prompt"}</small>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
+      <section className="card">
+        <h2>Budget summary</h2>
+        <div className="exec-metrics">
+          <div>
+            <small>LLM spend</small>
+            <strong>
+              {money(summary?.spent_usd ?? b.spent_usd)} / {money(summary?.total_limit_usd ?? b.limit_usd)}
+            </strong>
+          </div>
+          <div>
+            <small>Reserved</small>
+            <strong>{money(summary?.reserved_usd ?? b.reserved_usd)}</strong>
+          </div>
+          <div>
+            <small>Remaining</small>
+            <strong>{money(summary?.remaining_usd ?? fallbackBudgetRemaining)}</strong>
+          </div>
+          <div>
+            <small>Tavily/search</small>
+            <strong>
+              {tavilyUsed}/{tavilyMax}
+            </strong>
+          </div>
+          <div>
+            <small>Market data</small>
+            <strong>
+              {marketDataUsed}/{marketDataMax}
+            </strong>
+          </div>
+          <div>
+            <small>Protected remaining</small>
+            <strong>{summary ? money(summary.protected_remaining_usd) : "n/a"}</strong>
+          </div>
+        </div>
+        <p className="muted">
+          LLM budget funds model reasoning. Tavily credits fund web evidence search. Market-data requests fund market
+          snapshots. A run can stop because search budget is exhausted even if LLM dollars remain.
+        </p>
+        {state?.capacity && (
+          <div className="meta-grid">
+            <p>
+              LLM capacity: <strong>{money(state.capacity.llm_remaining_usd)}</strong>
+            </p>
+            <p>
+              Verifier: <strong>{money(state.capacity.verifier_budget_remaining)}</strong>
+            </p>
+            <p>
+              Aggregator protected: <strong>{money(state.capacity.aggregator_budget_protected_remaining)}</strong>
+            </p>
+            <p>
+              Judge protected: <strong>{money(state.capacity.judge_budget_protected_remaining)}</strong>
+            </p>
+          </div>
+        )}
+        {summary && (
+          <details className="inline-details" open>
+            <summary>
+              <span>Role budget</span>
+              <span className="pill">protected caps</span>
+            </summary>
+            <div className="table">
+              <div className="table-row table-head">
+                <span>Role</span>
+                <span>Spent</span>
+                <span>Reserved</span>
+                <span>Protected</span>
+              </div>
+              {roleNames.map((role) => (
+                <div className="table-row" key={role}>
+                  <span>{role}</span>
+                  <span>{money(summary.role_spent_usd[role])}</span>
+                  <span>{money(summary.role_reserved_usd[role])}</span>
+                  <span>{money(summary.role_protected_usd[role])}</span>
+                </div>
+              ))}
+            </div>
+          </details>
+        )}
+      </section>
+
+      <details className="card detail-section" open>
+        <summary>
+          <span>Principal actions timeline</span>
+          <span className="pill">{detail.principal_actions.length} actions</span>
+        </summary>
+        <div className="detail-body">
+          <p className="muted">Shows what the controller decided or proposed.</p>
+          <ActionTimeline
+            actions={detail.principal_actions ?? []}
+            empty="No executed principal decisions recorded yet."
+            limit={12}
+          />
+          {asList(state?.next_action_candidates).length > 0 && (
+            <>
+              <h3>Candidate next actions</h3>
+              <ActionTimeline
+                actions={asList(state?.next_action_candidates)}
+                empty="No candidate next actions right now."
+                limit={8}
+              />
+            </>
+          )}
+        </div>
+      </details>
+
+      <section className="card">
+        <h2>Research state</h2>
+        {state ? (
+          <>
+            <p>
+              Branches: <strong>{state.active_branches.join(", ") || "none yet"}</strong>
+            </p>
+            <p>
+              Tools remaining: Tavily{" "}
+              {state.capacity?.tavily_remaining ?? state.tool_budget_remaining.tavily_credits ?? 0} · Market{" "}
+              {state.capacity?.market_data_remaining ?? state.tool_budget_remaining.market_data_requests ?? 0}
+            </p>
+            {state.capacity && (
+              <p>
+                Search exhausted: <strong>{state.capacity.search_exhausted ? "yes" : "no"}</strong> · Market data
+                exhausted: <strong>{state.capacity.market_data_exhausted ? "yes" : "no"}</strong> · Useful action
+                available: <strong>{state.capacity.useful_action_available ? "yes" : "no"}</strong>
+              </p>
+            )}
+            <div className="meta-grid">
+              <p>
+                Verified per 10 Tavily: <strong>{formatNumber(state.verified_claims_per_10_tavily, 2)}</strong>
+              </p>
+              <p>
+                Claims per research observation:{" "}
+                <strong>{formatNumber(state.claims_per_research_observation, 2)}</strong>
+              </p>
+              <p>
+                Claims from verifier outputs: <strong>{state.claims_created_from_verifier_outputs ?? 0}</strong>
+              </p>
+              <p>
+                Source-meta rejected: <strong>{state.source_meta_claims_rejected ?? 0}</strong>
+              </p>
+              <p>
+                Market snapshots rejected: <strong>{state.market_snapshot_claims_rejected ?? 0}</strong>
+              </p>
+              <p>
+                Supported-part claims: <strong>{state.claims_created_from_supported_parts ?? 0}</strong>
+              </p>
+            </div>
+            {state.source_quality_distribution && Object.keys(state.source_quality_distribution).length > 0 && (
+              <>
+                <h3>Source quality distribution</h3>
+                <div className="row-wrap">
+                  {Object.entries(state.source_quality_distribution).map(([tier, count]) => (
+                    <span className="pill" key={tier}>
+                      {label(tier)} {count}
+                    </span>
+                  ))}
+                </div>
+              </>
+            )}
+            <div className="two-col">
+              <div>
+                <h3>Known facts</h3>
+                {state.known_facts.length > 0 ? (
+                  <ul>
+                    {state.known_facts.map((fact) => (
+                      <li key={fact}>{fact}</li>
+                    ))}
+                  </ul>
+                ) : (
+                  <Empty>No verified facts yet.</Empty>
+                )}
+              </div>
+              <div>
+                <h3>Open questions</h3>
+                {state.open_questions.length > 0 ? (
+                  <ul>
+                    {state.open_questions.map((question) => (
+                      <li key={question}>{question}</li>
+                    ))}
+                  </ul>
+                ) : (
+                  <Empty>No open questions recorded.</Empty>
+                )}
+              </div>
+            </div>
+          </>
+        ) : (
+          <Empty>No RunState snapshot is available yet.</Empty>
+        )}
+      </section>
+
       <section className="card">
         <h2>Failure and stop reasons</h2>
         {stopReasons.length > 0 ? (
@@ -596,166 +910,161 @@ export default function RunPage({params}: {params: Promise<{id: string}>}) {
         )}
       </section>
 
-      {state && (
-        <section className="card">
-          <h2>Research state</h2>
-          <p>
-            Branches: <strong>{state.active_branches.join(", ") || "none yet"}</strong>
+      <details className="card detail-section">
+        <summary>
+          <span>Agent organization</span>
+          <span className="pill">{detail.agent_specs.length} AgentSpecs</span>
+        </summary>
+        <div className="detail-body">
+          <p className="muted">
+            Shows the temporary logical research organization. These are AgentSpecs, not Kubernetes pods.
           </p>
-          <p>
-            Tools remaining: Tavily {state.capacity?.tavily_remaining ?? state.tool_budget_remaining.tavily_credits ?? 0} · Market{" "}
-            {state.capacity?.market_data_remaining ?? state.tool_budget_remaining.market_data_requests ?? 0}
-          </p>
-          {state.capacity && (
-            <p>
-              Search exhausted: <strong>{state.capacity.search_exhausted ? "yes" : "no"}</strong> · Market data exhausted:{" "}
-              <strong>{state.capacity.market_data_exhausted ? "yes" : "no"}</strong> · Useful action available:{" "}
-              <strong>{state.capacity.useful_action_available ? "yes" : "no"}</strong>
-            </p>
-          )}
-          <div className="two-col">
-            <div>
-              <h3>Known facts</h3>
-              {state.known_facts.length > 0 ? (
-                <ul>{state.known_facts.map((fact) => <li key={fact}>{fact}</li>)}</ul>
-              ) : (
-                <Empty>No verified facts yet.</Empty>
-              )}
-            </div>
-            <div>
-              <h3>Open questions</h3>
-              {state.open_questions.length > 0 ? (
-                <ul>{state.open_questions.map((question) => <li key={question}>{question}</li>)}</ul>
-              ) : (
-                <Empty>No open questions recorded.</Empty>
-              )}
-            </div>
-          </div>
-        </section>
-      )}
-
-      <section className="card">
-        <h2>Artifact list</h2>
-        <div className="group-grid">
-          <div>
-            <h3>By type</h3>
-            <ArtifactMiniList groups={groupArtifacts(artifacts, (artifact) => artifact.artifact_type)} />
-          </div>
-          <div>
-            <h3>By status</h3>
-            <ArtifactMiniList groups={groupArtifacts(artifacts, (artifact) => artifact.status)} />
-          </div>
-          <div>
-            <h3>By branch</h3>
-            <ArtifactMiniList groups={groupArtifacts(artifacts, (artifact) => artifact.branch ?? "unbranched")} />
-          </div>
-        </div>
-      </section>
-
-      <section className="card">
-        <h2>Evidence graph basics</h2>
-        {relationConfigs.map((config) => {
-          const rows = relationRows(config.kind);
-          return (
-            <div className="relation-block" key={config.kind}>
-              <h3>{config.title}</h3>
-              {rows.length > 0 ? (
-                <div className="relation-list">
-                  {rows.map((row) => (
-                    <div className="relation-row" key={`${config.kind}-${row.from.id}-${row.targetId}`}>
-                      <span>
-                        <ArtifactLink artifact={row.from} />
-                      </span>
-                      <span className="relation-kind">{config.kind}</span>
-                      <span>{renderReference(row.targetId)}</span>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <Empty>{config.empty}</Empty>
-              )}
-            </div>
-          );
-        })}
-      </section>
-
-      <section className="card">
-        <h2>Artifacts</h2>
-        {artifacts.length === 0 && (
-          <Empty>No generic artifacts have been persisted yet; legacy claims are shown below.</Empty>
-        )}
-        {artifacts.map((artifact) => (
-          <article id={`artifact-${artifact.id}`} key={artifact.id}>
-            <div className="row-wrap">
-              <strong>{artifactName(artifact)}</strong>
-              <span className={statusClass(artifact.status)}>{label(artifact.status)}</span>
-              <span className="pill">{artifact.branch ?? "unbranched"}</span>
-              <span className="pill">{label(artifact.visibility)}</span>
-              {artifact.confidence !== undefined && artifact.confidence !== null && (
-                <span className="pill">confidence {percent(artifact.confidence)}</span>
-              )}
-            </div>
-            <p>{artifact.text_or_summary}</p>
-            <small>
-              sources {asList(artifact.source_refs).length} · supports{" "}
-              {asList(artifact.supports_artifact_ids).length} · contradicts{" "}
-              {asList(artifact.contradicts_artifact_ids).length} · depends on{" "}
-              {asList(artifact.depends_on_artifact_ids).length}
-              {artifact.legacy_object_type ? ` · legacy ${artifact.legacy_object_type}` : ""}
-            </small>
-          </article>
-        ))}
-      </section>
-
-      {detail.dead_letters.length > 0 && (
-        <section className="card">
-          <h2>Dead letters</h2>
-          {detail.dead_letters.map((record) => (
-            <article key={record.id}>
-              <strong>{record.event_type}</strong> · {record.worker_role} · {record.classification} · retry{" "}
-              {record.retry_count}/{record.max_retries}
-              <p>
-                {record.error_type}: {record.error_message}
-              </p>
-            </article>
-          ))}
-        </section>
-      )}
-
-      <section className="card">
-        <h2>Agent organization</h2>
-        {detail.organization_plan && <p>Branches: {detail.organization_plan.branches.join(", ")}</p>}
-        {detail.agent_specs.length === 0 && <Empty>No explicit organization plan has been persisted yet.</Empty>}
-        {detail.agent_specs.map((agent) => (
-          <article key={agent.id}>
-            <strong>{agent.name}</strong> · {agent.role_template} · {agent.branch} · {agent.status}
-            <p>{agent.objective}</p>
-            <small>
-              tools: {agent.allowed_tools.join(", ") || "none"} · tags:{" "}
-              {agent.retrieval_tags.join(", ") || "none"} · local budget {money(agent.local_budget_usd)}
-            </small>
-          </article>
-        ))}
-      </section>
-
-      <section className="card">
-        <h2>Legacy evidence</h2>
-        {detail.claims.length === 0 && <Empty>No legacy claims recorded yet.</Empty>}
-        {detail.claims.map((claim) => {
-          const verification = detail.verifications.find((item) => item.claim_id === claim.id);
-          return (
-            <article key={claim.id}>
-              <span className={statusClass(verification?.verdict ?? "pending")}>
-                {label(verification?.verdict ?? "pending")}
-              </span>
-              <p>{claim.statement}</p>
+          {detail.organization_plan && <p>Branches: {detail.organization_plan.branches.join(", ")}</p>}
+          {detail.agent_specs.length === 0 && <Empty>No explicit organization plan has been persisted yet.</Empty>}
+          {detail.agent_specs.map((agent) => (
+            <article key={agent.id}>
+              <div className="row-wrap">
+                <strong>{agent.name}</strong>
+                <span className="pill">{agent.role_template}</span>
+                <span className="pill">{agent.branch}</span>
+                <span className={statusClass(agent.status)}>{label(agent.status)}</span>
+              </div>
+              <p>{agent.objective}</p>
               <small>
-                confidence {percent(claim.confidence)} {verification?.rationale ? `· ${verification.rationale}` : ""}
+                tools: {agent.allowed_tools.join(", ") || "none"} · tags:{" "}
+                {agent.retrieval_tags.join(", ") || "none"} · local budget {money(agent.local_budget_usd)}
               </small>
             </article>
-          );
-        })}
-      </section>
+          ))}
+        </div>
+      </details>
+
+      <details className="card detail-section">
+        <summary>
+          <span>Full artifact list</span>
+          <span className="pill">{artifacts.length} artifacts</span>
+        </summary>
+        <div className="detail-body">
+          <p className="muted">
+            Graph of observations, claims, verifications, final reports, and their dependency links.
+          </p>
+          <div className="group-grid">
+            <div>
+              <h3>By type</h3>
+              <ArtifactMiniList groups={groupArtifacts(artifacts, (artifact) => artifact.artifact_type)} />
+            </div>
+            <div>
+              <h3>By status</h3>
+              <ArtifactMiniList groups={groupArtifacts(artifacts, (artifact) => artifact.status)} />
+            </div>
+            <div>
+              <h3>By branch</h3>
+              <ArtifactMiniList groups={groupArtifacts(artifacts, (artifact) => artifact.branch ?? "unbranched")} />
+            </div>
+          </div>
+          <h3>Raw artifacts</h3>
+          {artifacts.length === 0 && (
+            <Empty>No generic artifacts have been persisted yet; legacy claims are shown below.</Empty>
+          )}
+          {artifacts.map((artifact) => (
+            <article id={`artifact-${artifact.id}`} key={artifact.id}>
+              <div className="row-wrap">
+                <strong>{artifactName(artifact)}</strong>
+                <span className={statusClass(artifact.status)}>{label(artifact.status)}</span>
+                <span className="pill">{artifact.branch ?? "unbranched"}</span>
+                <span className="pill">{label(artifact.visibility)}</span>
+                {artifact.confidence !== undefined && artifact.confidence !== null && (
+                  <span className="pill">confidence {percent(artifact.confidence)}</span>
+                )}
+              </div>
+              <p>{artifact.text_or_summary}</p>
+              <small>
+                sources {asList(artifact.source_refs).length} · supports {asList(artifact.supports_artifact_ids).length} ·
+                contradicts {asList(artifact.contradicts_artifact_ids).length} · depends on{" "}
+                {asList(artifact.depends_on_artifact_ids).length}
+                {artifact.legacy_object_type ? ` · legacy ${artifact.legacy_object_type}` : ""}
+              </small>
+            </article>
+          ))}
+        </div>
+      </details>
+
+      <details className="card detail-section">
+        <summary>
+          <span>Evidence graph basics</span>
+          <span className="pill">links</span>
+        </summary>
+        <div className="detail-body">
+          {relationConfigs.map((config) => {
+            const rows = relationRows(config.kind);
+            return (
+              <div className="relation-block" key={config.kind}>
+                <h3>{config.title}</h3>
+                {rows.length > 0 ? (
+                  <div className="relation-list">
+                    {rows.map((row) => (
+                      <div className="relation-row" key={`${config.kind}-${row.from.id}-${row.targetId}`}>
+                        <span>
+                          <ArtifactLink artifact={row.from} />
+                        </span>
+                        <span className="relation-kind">{config.kind}</span>
+                        <span>{renderReference(row.targetId)}</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <Empty>{config.empty}</Empty>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </details>
+
+      {detail.dead_letters.length > 0 && (
+        <details className="card detail-section">
+          <summary>
+            <span>Dead letters</span>
+            <span className="pill">{detail.dead_letters.length}</span>
+          </summary>
+          <div className="detail-body">
+            {detail.dead_letters.map((record) => (
+              <article key={record.id}>
+                <strong>{record.event_type}</strong> · {record.worker_role} · {record.classification} · retry{" "}
+                {record.retry_count}/{record.max_retries}
+                <p>
+                  {record.error_type}: {record.error_message}
+                </p>
+              </article>
+            ))}
+          </div>
+        </details>
+      )}
+
+      <details className="card detail-section">
+        <summary>
+          <span>Legacy evidence</span>
+          <span className="pill">{detail.claims.length} claims</span>
+        </summary>
+        <div className="detail-body">
+          <p className="muted">Candidate propositions extracted from observations and checked by the trust layer.</p>
+          {detail.claims.length === 0 && <Empty>No legacy claims recorded yet.</Empty>}
+          {detail.claims.map((claim) => {
+            const verification = detail.verifications.find((item) => item.claim_id === claim.id);
+            return (
+              <article key={claim.id}>
+                <span className={statusClass(verification?.verdict ?? "pending")}>
+                  {label(verification?.verdict ?? "pending")}
+                </span>
+                <p>{claim.statement}</p>
+                <small>
+                  confidence {percent(claim.confidence)} {verification?.rationale ? `· ${verification.rationale}` : ""}
+                </small>
+              </article>
+            );
+          })}
+        </div>
+      </details>
     </main>
   );
 }
