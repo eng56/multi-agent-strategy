@@ -1,0 +1,39 @@
+{
+  "questions": [
+    {
+      "id": "fed-cut-gold-usd-equities",
+      "topic": "Fed surprise rate cut",
+      "question": "Evaluate the next 3-month impact of a surprise Fed rate cut on gold, the US dollar, and US equities. Separate the main thesis, verified evidence, risks and counterarguments, what would change the conclusion, confidence level, and time horizon."
+    },
+    {
+      "id": "cpi-upside-rates-gold-equities",
+      "topic": "CPI upside surprise",
+      "question": "Assess how an upside CPI surprise would affect Treasury rates, gold, and US equities over the next 1-3 months. Distinguish inflation-risk repricing from growth-risk repricing and identify evidence that would invalidate the view."
+    },
+    {
+      "id": "oil-supply-shock-inflation-equities-usd",
+      "topic": "Oil supply shock",
+      "question": "Analyze the investment implications of a sudden oil supply shock for crude oil, inflation expectations, equities, and the US dollar. Focus on source-backed transmission channels and cross-asset trade-offs."
+    },
+    {
+      "id": "china-stimulus-commodities-em-fx",
+      "topic": "China stimulus",
+      "question": "Evaluate whether a new China stimulus package is bullish for industrial commodities, emerging-market equities, and EM FX over the next quarter. Separate verified evidence, weak evidence, and key policy execution risks."
+    },
+    {
+      "id": "ai-capex-slowdown-semiconductors-cloud-software",
+      "topic": "AI capex slowdown",
+      "question": "Assess the impact of a slowdown in AI infrastructure capex on semiconductors, cloud platforms, and enterprise software. Identify which segments are most exposed and what evidence would support or reject the thesis."
+    },
+    {
+      "id": "yield-curve-steepening-banks-reits-growth",
+      "topic": "Yield curve steepening",
+      "question": "Analyze how a rapid US yield-curve steepening would affect banks, REITs, and long-duration growth equities. Include historical analogs, verified evidence, and key caveats."
+    },
+    {
+      "id": "usd-shock-gold-em-earnings",
+      "topic": "US dollar shock",
+      "question": "Evaluate the cross-asset impact of a sharp US dollar rally on gold, emerging markets, and multinational earnings. Focus on evidence quality, source traceability, and what would make the conclusion wrong."
+    }
+  ]
+}

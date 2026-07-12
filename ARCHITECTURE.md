@@ -47,6 +47,13 @@ partial report from verified structured evidence without another LLM call.
 Events contain identifiers and routing metadata only; current state lives in Upstash and raw artifacts
 live in GCS.
 
+Workers retry transient handler failures such as provider HTTP 429/5xx responses, timeouts, and
+temporary tool outages by re-publishing the same coordination event with retry metadata in the
+payload. The Confluent coordination topic used here does not provide delayed delivery, so the retry
+payload records a suggested increasing backoff while the requeue itself is immediate. Once the retry
+cap is reached, workers write a `DeadLetterRecord` to the Upstash blackboard and mark the affected
+task or run failed.
+
 ## Control-loop architecture target
 
 The runtime is evolving from a linear agent pipeline into a budgeted epistemic control loop:

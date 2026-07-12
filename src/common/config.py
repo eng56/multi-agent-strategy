@@ -32,9 +32,53 @@ class Settings(BaseSettings):
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     runtime_topic: str = "agent-runtime"
     market_data_base_url: str = Field(default="https://api.massive.com", validation_alias=AliasChoices("MARKET_DATA_BASE_URL", "POLYGON_BASE_URL"))
+    market_data_product_rate_limit_per_minute: int = Field(default=5, ge=1)
+    market_data_enabled_products: str = "stocks"
     tavily_base_url: str = "https://api.tavily.com"
+    brave_search_api_key: str | None = None
+    brave_search_base_url: str = "https://api.search.brave.com/res/v1/web/search"
+    exa_api_key: str | None = None
+    exa_base_url: str = "https://api.exa.ai/search"
+    firecrawl_api_key: str | None = None
+    firecrawl_base_url: str = "https://api.firecrawl.dev/v1/scrape"
     environment: str = "dev"
     default_max_parallel_agents: int = Field(default=10, gt=0)
+    evidence_max_sources: int = Field(default=5, ge=0, le=25)
+    principal_policy_mode: Literal["off", "shadow", "active"] = "shadow"
+    min_tavily_utilization_before_partial_final: float = Field(
+        default=0.60,
+        ge=0,
+        le=1,
+        validation_alias=AliasChoices(
+            "MIN_TAVILY_UTILIZATION_BEFORE_PARTIAL_FINAL",
+            "min_tavily_utilization_before_partial_final",
+        ),
+    )
+    min_llm_utilization_before_partial_final: float = Field(
+        default=0.20,
+        ge=0,
+        le=1,
+        validation_alias=AliasChoices(
+            "MIN_LLM_UTILIZATION_BEFORE_PARTIAL_FINAL",
+            "min_llm_utilization_before_partial_final",
+        ),
+    )
+    min_repair_waves_before_partial_final: int = Field(
+        default=2,
+        ge=0,
+        validation_alias=AliasChoices(
+            "MIN_REPAIR_WAVES_BEFORE_PARTIAL_FINAL",
+            "min_repair_waves_before_partial_final",
+        ),
+    )
+    min_branches_repaired_before_partial_final: int = Field(
+        default=3,
+        ge=0,
+        validation_alias=AliasChoices(
+            "MIN_BRANCHES_REPAIRED_BEFORE_PARTIAL_FINAL",
+            "min_branches_repaired_before_partial_final",
+        ),
+    )
 
 
 @lru_cache

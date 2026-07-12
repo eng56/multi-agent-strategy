@@ -1,0 +1,123 @@
+name: Production Evidence Eval
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Number of eval questions to run"
+        required: false
+        default: "1"
+      budget:
+        description: "LLM budget per run in USD"
+        required: false
+        default: "1"
+      timeout_seconds:
+        description: "Timeout per run"
+        required: false
+        default: "900"
+      poll_seconds:
+        description: "Poll interval"
+        required: false
+        default: "10"
+      max_failures:
+        description: "Allowed runs that fail before final answer"
+        required: false
+        default: "0"
+
+permissions: {contents: read, id-token: write}
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    environment: Production
+    env:
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER || secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_DEPLOY_SERVICE_ACCOUNT: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT || secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
+      GKE_CLUSTER: ${{ vars.GKE_CLUSTER || secrets.GKE_CLUSTER }}
+      GCP_REGION: ${{ vars.GCP_REGION || secrets.GCP_REGION }}
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID }}
+      EVAL_LIMIT: ${{ github.event.inputs.limit || '1' }}
+      EVAL_BUDGET: ${{ github.event.inputs.budget || '1' }}
+      EVAL_TIMEOUT_SECONDS: ${{ github.event.inputs.timeout_seconds || '900' }}
+      EVAL_POLL_SECONDS: ${{ github.event.inputs.poll_seconds || '10' }}
+      EVAL_MAX_FAILURES: ${{ github.event.inputs.max_failures || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate production eval variables
+        run: |
+          missing=()
+          for name in GCP_WORKLOAD_IDENTITY_PROVIDER GCP_DEPLOY_SERVICE_ACCOUNT GKE_CLUSTER GCP_REGION GCP_PROJECT_ID; do
+            if [ -z "${!name}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf 'Missing GitHub Actions variables: %s\n' "${missing[*]}" >&2
+            exit 1
+          fi
+          for name in EVAL_LIMIT EVAL_TIMEOUT_SECONDS EVAL_POLL_SECONDS EVAL_MAX_FAILURES; do
+            if ! [[ "${!name}" =~ ^[0-9]+$ ]]; then
+              printf '%s must be a non-negative integer; got %s\n' "$name" "${!name}" >&2
+              exit 1
+            fi
+          done
+          python - <<'PY'
+          import os
+          budget = float(os.environ["EVAL_BUDGET"])
+          if budget <= 0:
+              raise SystemExit("EVAL_BUDGET must be > 0")
+          PY
+
+      - uses: google-github-actions/auth@v3
+        with: {workload_identity_provider: "${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}", service_account: "${{ env.GCP_DEPLOY_SERVICE_ACCOUNT }}"}
+
+      - uses: google-github-actions/setup-gcloud@v3
+
+      - uses: google-github-actions/get-gke-credentials@v3
+        with: {cluster_name: "${{ env.GKE_CLUSTER }}", location: "${{ env.GCP_REGION }}"}
+
+      - name: Read runtime endpoint and token without printing secrets
+        run: |
+          api_ip="$(kubectl get service orchestrator-api -o jsonpath='{.status.loadBalancer.ingress[0].ip}')"
+          if [ -z "$api_ip" ]; then
+            echo "orchestrator-api LoadBalancer IP is empty" >&2
+            exit 1
+          fi
+          token="$(
+            kubectl exec deploy/orchestrator-api -- python -c 'from pathlib import Path; lines = Path("/var/secrets/runtime-env").read_text().splitlines(); print(next(line.split("=", 1)[1].strip() for line in lines if line.startswith("ORCHESTRATOR_API_TOKEN=")))'
+          )"
+          if [ -z "$token" ]; then
+            echo "ORCHESTRATOR_API_TOKEN was not found in mounted runtime-env" >&2
+            exit 1
+          fi
+          echo "::add-mask::$token"
+          {
+            echo "ORCHESTRATOR_API_URL=http://${api_ip}"
+            echo "ORCHESTRATOR_API_TOKEN=${token}"
+          } >> "$GITHUB_ENV"
+
+      - name: Check deployed health and version
+        run: bash scripts/check-deployment.sh --expect-sha "$GITHUB_SHA"
+
+      - name: Run evidence eval
+        run: |
+          output_dir="evals/output/production-${GITHUB_RUN_ID}"
+          bash scripts/run-evidence-eval.sh \
+            --limit "$EVAL_LIMIT" \
+            --budget "$EVAL_BUDGET" \
+            --timeout-seconds "$EVAL_TIMEOUT_SECONDS" \
+            --poll-seconds "$EVAL_POLL_SECONDS" \
+            --max-failures "$EVAL_MAX_FAILURES" \
+            --output-dir "$output_dir"
+
+      - name: Print eval summary
+        if: always()
+        run: |
+          find evals/output -maxdepth 3 -name summary.json -print -exec cat {} \; || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: production-evidence-eval
+          path: evals/output/
+          if-no-files-found: ignore

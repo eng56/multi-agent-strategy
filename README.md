@@ -2,6 +2,21 @@
 
 A password-locked managed-services-only demo. GKE Autopilot runs the application containers, Vercel
 hosts the private UI, and all infrastructure is consumed as managed APIs. See [ARCHITECTURE.md](ARCHITECTURE.md).
+For day-to-day runbooks, smoke tests, run inspection, and recovery steps, see
+[docs/OPERATING_DEMO.md](docs/OPERATING_DEMO.md).
+For the current control-loop and research-quality internals, see
+[docs/PRINCIPAL_POLICY.md](docs/PRINCIPAL_POLICY.md) and
+[docs/EVIDENCE_ENGINE.md](docs/EVIDENCE_ENGINE.md).
+
+## Paper alignment
+
+This project is inspired by the Principal / environment / observation / payoff loop from the
+AI policymaking papers. It is not a full implementation of those papers. See:
+
+- [docs/PAPER_ALIGNMENT.md](docs/PAPER_ALIGNMENT.md)
+- [docs/DEMO_TALK_TRACK.md](docs/DEMO_TALK_TRACK.md)
+
+EvidenceEngine is an engineering adaptation of the observation layer, not a named paper component.
 
 ## Demo access and model policy
 
@@ -86,9 +101,10 @@ target cluster or temporarily use `roles/container.admin` for the demo deploy se
 
 ## GKE demo cost controls
 
-The deployed demo runs one public orchestrator `LoadBalancer` service and seven always-on Kubernetes
-deployments by default. The orchestrator deployment requests a small pod and exposes a public
-load balancer, while each role-specific worker deployment also keeps one replica ready for a demo run.
+The deployed demo runs one public orchestrator `LoadBalancer` service and eight always-on Kubernetes
+deployments by default: the orchestrator API plus seven role-specific worker deployments. The
+orchestrator deployment requests a small pod and exposes a public load balancer, while each
+role-specific worker deployment also keeps one replica ready for a demo run.
 
 For short idle windows, scale the demo to zero pods without changing secrets, topics, or Vercel settings:
 

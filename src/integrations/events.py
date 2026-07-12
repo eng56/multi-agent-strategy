@@ -18,7 +18,7 @@ class ConfluentEventBus:
         }
         self.producer = Producer(self.config)
 
-    def publish(self, topic: str, event: EventEnvelope) -> None:
+    def publish(self, topic: str, event: EventEnvelope, timeout: float = 10) -> None:
         delivery_errors: list[KafkaError] = []
 
         def on_delivery(error: KafkaError | None, _message: object) -> None:
@@ -31,7 +31,7 @@ class ConfluentEventBus:
             value=event.model_dump_json(),
             callback=on_delivery,
         )
-        remaining = self.producer.flush(10)
+        remaining = self.producer.flush(timeout)
         if delivery_errors:
             raise RuntimeError(f"Confluent publish failed: {delivery_errors[0]}")
         if remaining:

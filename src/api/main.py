@@ -1,5 +1,4 @@
 import logging
-import re
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -7,13 +6,16 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 
-from src.common.config import get_settings
+from src.api.health import health_payload, missing_runtime_payload, readiness_payload
 from src.agents.state import build_run_state
+from src.common.config import get_settings
+from src.common.health import build_version_info
 from src.common.models import (
     AgentSpec,
     Artifact,
     Budget,
     Claim,
+    DeadLetterRecord,
     EventEnvelope,
     EventType,
     Observation,
@@ -28,18 +30,6 @@ from src.integrations.validation import validate_demo_configuration
 from src.runtime import build_runtime
 
 logger = logging.getLogger(__name__)
-
-CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
-
-
-def scrub_jsonable(value):
-    if isinstance(value, str):
-        return CONTROL_CHAR_RE.sub(" ", value)
-    if isinstance(value, list):
-        return [scrub_jsonable(item) for item in value]
-    if isinstance(value, dict):
-        return {key: scrub_jsonable(item) for key, item in value.items()}
-    return value
 
 
 @asynccontextmanager
@@ -57,8 +47,26 @@ def require_api_token(x_api_key: str = Header(default="")) -> None:
 
 
 @app.get("/healthz")
-def healthz() -> dict[str, str]:
-    return {"status": "ok"}
+def healthz() -> dict[str, object]:
+    return health_payload()
+
+
+@app.get("/health")
+def health() -> dict[str, object]:
+    return health_payload()
+
+
+@app.get("/version")
+def version() -> dict[str, str | None]:
+    return build_version_info()
+
+
+@app.get("/ready")
+async def ready() -> JSONResponse:
+    runtime = getattr(app.state, "runtime", None)
+    payload = await readiness_payload(runtime) if runtime else await missing_runtime_payload()
+    status_code = 200 if payload["status"] == "ok" else 503
+    return JSONResponse(status_code=status_code, content=payload)
 
 
 @app.get("/v1/models/openrouter")
@@ -90,8 +98,7 @@ async def create_run(request: RunRequest, _: None = Depends(require_api_token)) 
     except Exception as exc:
         logger.exception("run provider validation failed question=%s", request.question[:120])
         raise HTTPException(
-            status_code=400,
-            detail=f"provider or model validation failed: {type(exc).__name__}: {exc}",
+            status_code=400, detail=f"provider or model validation failed: {type(exc).__name__}: {exc}"
         ) from exc
     run = Run(
         question=request.question,
@@ -143,13 +150,12 @@ async def get_run_detail(run_id: str, _: None = Depends(require_api_token)) -> R
         claims = await blackboard.list_models(run.id, "claims", Claim)
         verifications = await blackboard.list_models(run.id, "verifications", Verification)
         final = await blackboard.get_final(run.id)
-        principal_actions = await blackboard.list_models(
-            run.id, "principal_actions", PrincipalAction
-        )
+        principal_actions = await blackboard.list_models(run.id, "principal_actions", PrincipalAction)
         agent_specs = await blackboard.list_models(run.id, "agent_specs", AgentSpec)
         artifacts = await blackboard.list_models(run.id, "artifacts", Artifact)
+        dead_letters = await blackboard.list_models(run.id, "dead_letters", DeadLetterRecord)
         organization_plan = await blackboard.get_organization_plan(run.id)
-        detail = RunDetail(
+        return RunDetail(
             run=run,
             tasks=tasks,
             observations=observations,
@@ -157,16 +163,24 @@ async def get_run_detail(run_id: str, _: None = Depends(require_api_token)) -> R
             verifications=verifications,
             final=final,
             run_state=build_run_state(
-                run, tasks, claims, verifications, final, agent_specs, artifacts, organization_plan
+                run,
+                tasks,
+                claims,
+                verifications,
+                final,
+                agent_specs,
+                artifacts,
+                organization_plan,
+                dead_letters,
+                principal_actions=principal_actions,
+                observations=observations,
             ),
             principal_actions=principal_actions,
             agent_specs=agent_specs,
             artifacts=artifacts,
+            dead_letters=dead_letters,
             organization_plan=organization_plan,
         )
-        return JSONResponse(content=scrub_jsonable(detail.model_dump(mode="json")))
     except Exception as exc:
         logger.exception("run detail read failed run_id=%s", run_id)
-        raise HTTPException(
-            status_code=502, detail=f"run detail read failed: {type(exc).__name__}: {exc}"
-        ) from exc
+        raise HTTPException(status_code=502, detail=f"run detail read failed: {type(exc).__name__}: {exc}") from exc

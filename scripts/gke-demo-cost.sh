@@ -6,6 +6,7 @@ DEPLOYMENTS=(
   planner-agent
   worker-agents
   verifier-agent
+  skeptic-agent
   aggregator-agent
   judge-agent
   tool-runner

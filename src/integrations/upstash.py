@@ -10,6 +10,7 @@ from src.common.models import (
     AgentSpec,
     Artifact,
     Claim,
+    DeadLetterRecord,
     FinalReport,
     Observation,
     OrganizationPlan,
@@ -93,6 +94,9 @@ class UpstashBlackboard:
 
     async def put_artifact(self, value: Artifact) -> None:
         await self.append_model(value.run_id, "artifacts", value)
+
+    async def put_dead_letter(self, value: DeadLetterRecord) -> None:
+        await self.append_model(value.run_id, "dead_letters", value)
 
     async def put_organization_plan(self, value: OrganizationPlan) -> None:
         await self.put_model(f"run:{value.run_id}:organization_plan", value)

@@ -16,8 +16,10 @@ class AgentRole(StrEnum):
 
 
 class EventType(StrEnum):
+    HEALTH_CHECK = "health.check"
     RUN_CREATED = "run.created"
     TASK_CREATED = "task.created"
+    TASK_FAILED = "task.failed"
     CLAIM_CREATED = "claim.created"
     OBSERVATION_CREATED = "observation.created"
     CLAIM_VERIFIED = "claim.verified"
@@ -60,6 +62,7 @@ class ActionStatus(StrEnum):
     APPROVED = "approved"
     REJECTED = "rejected"
     EXECUTED = "executed"
+    FAILED = "failed"
 
 
 class AgentStatus(StrEnum):
@@ -79,6 +82,7 @@ class VisibilityScope(StrEnum):
 class ArtifactType(StrEnum):
     CLAIM = "claim"
     OBSERVATION = "observation"
+    DATA_GAP = "data_gap"
     FORECAST = "forecast"
     COUNTERARGUMENT = "counterargument"
     OPEN_QUESTION = "open_question"
@@ -134,8 +138,8 @@ class ModelPolicy(BaseModel):
 
 
 class ToolBudget(BaseModel):
-    tavily_max_credits: int = Field(default=50, ge=1)
-    market_data_max_requests: int = Field(default=20, ge=1)
+    tavily_max_credits: int = Field(default=50, ge=0)
+    market_data_max_requests: int = Field(default=20, ge=0)
     tavily_credits_used: int = Field(default=0, ge=0)
     market_data_requests_used: int = Field(default=0, ge=0)
 
@@ -192,7 +196,11 @@ class ResearchTask(BaseModel):
     title: str
     question: str
     tool: Literal["web_search", "market_data"]
+    branch: str | None = None
+    agent_spec_id: UUID | None = None
     status: Literal["created", "completed", "failed", "skipped_budget"] = "created"
+    wave_number: int = Field(default=0, ge=0)
+    reason: str | None = None
 
 
 class ArtifactPointer(BaseModel):
@@ -221,6 +229,11 @@ class Claim(BaseModel):
     evidence_observation_ids: list[UUID]
     sources: list[str] = Field(default_factory=list)
     confidence: float = Field(ge=0, le=1)
+    claim_type: str | None = None
+    asset: str | None = None
+    direction: str | None = None
+    time_horizon: str | None = None
+    derived_from_verification_id: UUID | None = None
 
 
 class Verification(BaseModel):
@@ -230,6 +243,12 @@ class Verification(BaseModel):
     verdict: Literal["verified", "rejected", "uncertain"]
     rationale: str
     confidence: float = Field(ge=0, le=1)
+    supported_parts: list[str] = Field(default_factory=list)
+    unsupported_parts: list[str] = Field(default_factory=list)
+    contradictions: list[str] = Field(default_factory=list)
+    required_caveats: list[str] = Field(default_factory=list)
+    source_quality_summary: str = ""
+    evidence_item_refs: list[str] = Field(default_factory=list)
     sources: list[str] = Field(default_factory=list)
 
 
@@ -239,6 +258,7 @@ class FinalReport(BaseModel):
     verified_claim_ids: list[UUID]
     sources: list[str]
     partial: bool = False
+    wave_number: int = Field(default=0, ge=0)
     judge_score: float | None = Field(default=None, ge=0, le=1)
     judge_feedback: str | None = None
 
@@ -254,6 +274,10 @@ class PrincipalAction(BaseModel):
     required_role: str | None = None
     priority: int = Field(default=5, ge=1, le=10)
     status: ActionStatus = ActionStatus.PROPOSED
+    producer: str | None = None
+    policy_phase: RunPhase | None = None
+    policy_wave_number: int | None = Field(default=None, ge=0)
+    idempotency_key: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -313,6 +337,69 @@ class Artifact(BaseModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+class DeadLetterRecord(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    run_id: UUID
+    event_id: UUID
+    event_type: EventType
+    event_producer: str
+    worker_role: str
+    retry_count: int = Field(default=0, ge=0)
+    max_retries: int = Field(default=0, ge=0)
+    classification: Literal["transient", "permanent", "unknown"]
+    error_type: str
+    error_message: str
+    event_payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class ToolUsageSummary(BaseModel):
+    used: int = Field(ge=0)
+    max: int = Field(ge=0)
+    remaining: int = Field(ge=0)
+
+
+class BudgetSummary(BaseModel):
+    total_limit_usd: float = Field(ge=0)
+    spent_usd: float = Field(ge=0)
+    reserved_usd: float = Field(ge=0)
+    remaining_usd: float = Field(ge=0)
+    role_spent_usd: dict[str, float] = Field(default_factory=dict)
+    role_reserved_usd: dict[str, float] = Field(default_factory=dict)
+    role_protected_usd: dict[str, float] = Field(default_factory=dict)
+    protected_usd: float = Field(default=0, ge=0)
+    protected_remaining_usd: float = Field(default=0, ge=0)
+    tool_usage: dict[str, ToolUsageSummary] = Field(default_factory=dict)
+    stop_reasons: list[str] = Field(default_factory=list)
+
+
+class CapacitySummary(BaseModel):
+    llm_remaining_usd: float = Field(ge=0)
+    tavily_remaining: int = Field(ge=0)
+    market_data_remaining: int = Field(ge=0)
+    verifier_budget_remaining: float = Field(ge=0)
+    aggregator_budget_protected_remaining: float = Field(ge=0)
+    judge_budget_protected_remaining: float = Field(ge=0)
+    llm_utilization_ratio: float = Field(default=0, ge=0, le=1)
+    tavily_utilization_ratio: float = Field(default=0, ge=0, le=1)
+    market_data_utilization_ratio: float = Field(default=0, ge=0, le=1)
+    verifier_utilization_ratio: float = Field(default=0, ge=0, le=1)
+    aggregator_utilization_ratio: float = Field(default=0, ge=0, le=1)
+    judge_utilization_ratio: float = Field(default=0, ge=0, le=1)
+    useful_capacity_remaining: bool = False
+    should_continue_research: bool = False
+    terminal_final_allowed: bool = False
+    terminal_final_reasons: list[str] = Field(default_factory=list)
+    terminal_final_blockers: list[str] = Field(default_factory=list)
+    repair_waves_attempted: int = Field(default=0, ge=0)
+    min_repair_waves_before_partial_final: int = Field(default=0, ge=0)
+    branches_repaired: list[str] = Field(default_factory=list)
+    under_researched_branches: list[str] = Field(default_factory=list)
+    search_exhausted: bool = False
+    market_data_exhausted: bool = False
+    useful_action_available: bool = False
+
+
 class RunState(BaseModel):
     run_id: UUID
     iteration: int = 0
@@ -322,17 +409,34 @@ class RunState(BaseModel):
     active_branches: list[str] = Field(default_factory=list)
     known_facts: list[str] = Field(default_factory=list)
     open_questions: list[str] = Field(default_factory=list)
+    failed_tasks: list[str] = Field(default_factory=list)
     verified_claim_count: int = 0
     rejected_claim_count: int = 0
     disputed_claim_count: int = 0
     coverage_by_topic: dict[str, str] = Field(default_factory=dict)
+    budget_summary: BudgetSummary | None = None
+    capacity: CapacitySummary | None = None
     budget_remaining: float = 0
     tool_budget_remaining: dict[str, int] = Field(default_factory=dict)
     agent_count: int = 0
     last_judge_score: float | None = None
     last_judge_feedback: str | None = None
+    dead_letter_count: int = 0
     stop_reasons: list[str] = Field(default_factory=list)
     next_action_candidates: list[PrincipalAction] = Field(default_factory=list)
+    tavily_used: int = 0
+    verified_claims: int = 0
+    verified_claims_per_10_tavily: float = 0
+    disputed_claims: int = 0
+    source_quality_distribution: dict[str, int] = Field(default_factory=dict)
+    claims_created_from_supported_parts: int = 0
+    aggregator_used: bool = False
+    judge_used: bool = False
+    claims_per_research_observation: float = 0
+    claims_created_from_verifier_outputs: int = 0
+    source_meta_claims_rejected: int = 0
+    market_snapshot_claims_rejected: int = 0
+    terminal_reason: str | None = None
 
 
 class RunDetail(BaseModel):
@@ -346,6 +450,7 @@ class RunDetail(BaseModel):
     principal_actions: list[PrincipalAction] = Field(default_factory=list)
     agent_specs: list[AgentSpec] = Field(default_factory=list)
     artifacts: list[Artifact] = Field(default_factory=list)
+    dead_letters: list[DeadLetterRecord] = Field(default_factory=list)
     organization_plan: OrganizationPlan | None = None
 
 

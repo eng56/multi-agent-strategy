@@ -1,15 +1,24 @@
 from __future__ import annotations
 
 import re
+from src.agents.budget_utilization import (
+    BudgetUtilizationDecision,
+    evaluate_budget_utilization,
+)
+from src.agents.claim_policy import MAX_CLAIMS_PER_RUN
 from src.common.models import (
+    AgentRole,
     AgentSpec,
     Artifact,
     ArtifactStatus,
     ArtifactType,
+    BudgetSummary,
+    CapacitySummary,
     Claim,
+    DeadLetterRecord,
     FinalReport,
-    InformationGain,
     OrganizationPlan,
+    Observation,
     PrincipalAction,
     PrincipalActionType,
     ResearchTask,
@@ -17,22 +26,48 @@ from src.common.models import (
     RunPhase,
     RunState,
     RunStatus,
+    ToolUsageSummary,
     Verification,
 )
 
 BRANCH_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("market/gold", ("gold", "xau")),
-    ("market/fx", ("usd", "dxy", "fx", "eur/usd", "eurusd", "usdjpy", "usd/jpy", "currency")),
+    (
+        "market/fx",
+        (
+            "usd",
+            "dxy",
+            "fx",
+            "eur/usd",
+            "eurusd",
+            "usdjpy",
+            "usd/jpy",
+            "currency",
+            "u.s. dollar",
+            "us dollar",
+        ),
+    ),
     ("market/oil", ("oil", "crude", "wti", "brent")),
     ("market/equities", ("equities", "equity", "stocks", "stock", "spx", "s&p", "nasdaq", "sap")),
+    ("market/bonds", ("bond", "bonds", "duration", "long-duration", "long duration", "tlt")),
     (
         "macro/rates",
         ("rates", "fed", "cut", "cuts", "hike", "hikes", "yield", "yields", "treasury"),
     ),
     ("macro/inflation", ("inflation", "cpi", "pce")),
     ("trust/source_verifier", ("verifier", "verification", "source")),
+    ("trust/skeptic", ("skeptic", "counterargument", "contradict", "risk")),
     ("synthesis/aggregator", ("aggregator", "aggregate", "final", "synthesis")),
     ("synthesis/judge", ("judge", "score", "payoff")),
+)
+FOLLOWUP_JUDGE_SCORE_THRESHOLD = 0.75
+MAX_FOLLOWUP_WAVES = 1
+BUDGET_SUMMARY_ROLES: tuple[AgentRole, ...] = (
+    AgentRole.PLANNER,
+    AgentRole.RESEARCH,
+    AgentRole.VERIFIER,
+    AgentRole.AGGREGATOR,
+    AgentRole.JUDGE,
 )
 
 
@@ -52,6 +87,12 @@ def infer_semantic_branch(text: str, fallback: str = "research/general") -> str:
 
 
 def branch_for_task(task: ResearchTask, agent_specs: list[AgentSpec] | None = None) -> str:
+    if task.branch:
+        return task.branch
+    if task.agent_spec_id:
+        for spec in agent_specs or []:
+            if spec.id == task.agent_spec_id:
+                return spec.branch
     inferred = infer_semantic_branch(f"{task.title} {task.question}", fallback="")
     if inferred:
         for spec in agent_specs or []:
@@ -78,16 +119,23 @@ def build_run_state(
     agent_specs: list[AgentSpec] | None = None,
     artifacts: list[Artifact] | None = None,
     organization_plan: OrganizationPlan | None = None,
+    dead_letters: list[DeadLetterRecord] | None = None,
     iteration: int = 0,
+    principal_actions: list[PrincipalAction] | None = None,
+    observations: list[Observation] | None = None,
 ) -> RunState:
     """Summarize blackboard contents into the Principal's control-state view."""
     artifacts = artifacts or []
     agent_specs = agent_specs or []
+    dead_letters = dead_letters or []
+    principal_actions = principal_actions or []
+    observations = observations or []
     verified_ids = {value.claim_id for value in verifications if value.verdict == "verified"}
     rejected_ids = {value.claim_id for value in verifications if value.verdict == "rejected"}
     uncertain_ids = {value.claim_id for value in verifications if value.verdict == "uncertain"}
     verified_claims = [claim for claim in claims if claim.id in verified_ids]
     pending_tasks = [task for task in tasks if task.status == "created"]
+    failed_tasks = [task for task in tasks if task.status == "failed"]
     verified_artifacts = [value for value in artifacts if value.status == ArtifactStatus.VERIFIED]
     rejected_artifacts = [
         value
@@ -112,7 +160,9 @@ def build_run_state(
     rejected_artifact_ids = {value.legacy_object_id or value.id for value in rejected_artifacts}
     disputed_artifact_ids = {value.legacy_object_id or value.id for value in disputed_artifacts}
     open_question_artifacts = [
-        value for value in artifacts if value.artifact_type == ArtifactType.OPEN_QUESTION
+        value
+        for value in artifacts
+        if value.artifact_type in {ArtifactType.OPEN_QUESTION, ArtifactType.DATA_GAP}
     ]
     coverage_by_topic = {task.title: branch_for_task(task, agent_specs) for task in tasks}
     for artifact in artifacts:
@@ -120,14 +170,41 @@ def build_run_state(
             coverage_by_topic.setdefault(artifact.branch, artifact.status.value)
     phase = _phase(run, tasks, claims, verifications, final)
     active_branches = _active_branches(tasks, agent_specs, artifacts, organization_plan)
-    budget_remaining = max(0, run.budget.limit_usd - run.budget.spent_usd - run.budget.reserved_usd)
+    budget_summary = build_budget_summary(run, tasks, final)
+    capacity = build_capacity_summary(run, budget_summary)
+    utilization = evaluate_budget_utilization(
+        run,
+        budget_summary,
+        tasks=tasks,
+        claims=claims,
+        verifications=verifications,
+        artifacts=artifacts,
+        observations=observations,
+        final=final,
+        active_branches=active_branches,
+    )
+    apply_budget_utilization(capacity, utilization)
+    budget_remaining = budget_summary.remaining_usd
     stop_reasons = []
     if run.failure_reason:
         stop_reasons.append(run.failure_reason)
+    for reason in budget_summary.stop_reasons:
+        if reason not in stop_reasons:
+            stop_reasons.append(reason)
+    if _search_exhausted_before_verification(run, claims, verifications):
+        reason = "Search/tool budget exhausted before enough claims passed verification."
+        if reason not in stop_reasons:
+            stop_reasons.append(reason)
+    if _normal_claim_count(claims, artifacts) >= MAX_CLAIMS_PER_RUN:
+        reason = f"Claim generation cap reached ({MAX_CLAIMS_PER_RUN} normal claims)."
+        if reason not in stop_reasons:
+            stop_reasons.append(reason)
     if final and final.partial:
         stop_reasons.append("partial final report produced before full synthesis")
     if run.status == RunStatus.COMPLETED:
         stop_reasons.append("run completed")
+    if dead_letters:
+        stop_reasons.append(f"{len(dead_letters)} dead-lettered event(s)")
 
     state = RunState(
         run_id=run.id,
@@ -140,30 +217,486 @@ def build_run_state(
         or [claim.statement for claim in verified_claims],
         open_questions=[value.text_or_summary for value in open_question_artifacts]
         + [task.question for task in pending_tasks],
+        failed_tasks=[task.title for task in failed_tasks],
         verified_claim_count=len(verified_ids | verified_artifact_ids),
         rejected_claim_count=len(rejected_ids | rejected_artifact_ids),
         disputed_claim_count=len(uncertain_ids | disputed_artifact_ids),
         coverage_by_topic=coverage_by_topic,
+        budget_summary=budget_summary,
+        capacity=capacity,
         budget_remaining=budget_remaining,
         tool_budget_remaining={
-            "tavily_credits": max(
-                0, run.budget.tools.tavily_max_credits - run.budget.tools.tavily_credits_used
-            ),
-            "market_data_requests": max(
-                0,
-                run.budget.tools.market_data_max_requests
-                - run.budget.tools.market_data_requests_used,
-            ),
+            key: value.remaining for key, value in budget_summary.tool_usage.items()
         },
         agent_count=len(agent_specs),
         last_judge_score=final.judge_score if final else None,
         last_judge_feedback=final.judge_feedback if final else None,
+        dead_letter_count=len(dead_letters),
         stop_reasons=stop_reasons,
+        tavily_used=run.budget.tools.tavily_credits_used,
+        verified_claims=len(verified_ids | verified_artifact_ids),
+        verified_claims_per_10_tavily=_claims_per_10_tavily(
+            len(verified_ids | verified_artifact_ids),
+            run.budget.tools.tavily_credits_used,
+        ),
+        disputed_claims=len(uncertain_ids | disputed_artifact_ids),
+        source_quality_distribution=_source_quality_distribution(verifications, artifacts),
+        claims_created_from_supported_parts=_claims_created_from_supported_parts(
+            claims, artifacts
+        ),
+        aggregator_used=_aggregator_used(final, artifacts, principal_actions),
+        judge_used=_judge_used(final, artifacts),
+        claims_per_research_observation=_claims_per_research_observation(
+            claims, observations, artifacts
+        ),
+        claims_created_from_verifier_outputs=_claims_created_from_verifier_outputs(claims),
+        source_meta_claims_rejected=_rejection_count(artifacts, "source_meta_claim_rejected"),
+        market_snapshot_claims_rejected=_rejection_count(
+            artifacts, "market_snapshot_claim_rejected"
+        ),
+        terminal_reason=_terminal_reason(run, final, stop_reasons, capacity),
     )
     state.next_action_candidates = _next_actions(
-        state, run, tasks, claims, verifications, final, artifacts
+        state,
+        run,
+        tasks,
+        claims,
+        verifications,
+        final,
+        artifacts,
+        agent_specs,
+        organization_plan,
+        dead_letters,
+        principal_actions,
+        observations,
     )
+    if state.capacity:
+        useful_candidate_exists = any(
+            action.action_type != PrincipalActionType.STOP_RUN
+            for action in state.next_action_candidates
+        )
+        state.capacity.useful_action_available = (
+            state.capacity.useful_capacity_remaining or useful_candidate_exists
+        )
     return state
+
+
+def _claims_per_10_tavily(verified_claim_count: int, tavily_used: int) -> float:
+    if tavily_used <= 0:
+        return 0.0
+    return round((verified_claim_count / tavily_used) * 10, 2)
+
+
+def _normal_claim_count(claims: list[Claim], artifacts: list[Artifact]) -> int:
+    artifact_by_claim_id = _claim_artifact_by_claim_id(artifacts)
+    return len(
+        [
+            claim
+            for claim in claims
+            if not _is_context_only_or_meta_claim(claim, artifact_by_claim_id.get(claim.id))
+        ]
+    )
+
+
+def _claim_artifact_by_claim_id(artifacts: list[Artifact]) -> dict[object, Artifact]:
+    return {
+        artifact.legacy_object_id: artifact
+        for artifact in artifacts
+        if artifact.artifact_type == ArtifactType.CLAIM
+        and artifact.legacy_object_type == "claim"
+        and artifact.legacy_object_id is not None
+    }
+
+
+def _is_context_only_or_meta_claim(claim: Claim, artifact: Artifact | None) -> bool:
+    text = claim.statement.casefold()
+    if text.startswith("market data snapshot") or text.startswith("marketsnapshot"):
+        return True
+    if any(
+        pattern in text
+        for pattern in (
+            "evidenceengine",
+            "publication date",
+            "provider",
+            "retrieval",
+            "source count",
+            "source title",
+            "source quality",
+            "quality score",
+        )
+    ):
+        return True
+    if claim.derived_from_verification_id is not None:
+        return True
+    return bool(
+        artifact
+        and any(
+            tag in artifact.tags
+            for tag in (
+                "context_only",
+                "market_snapshot",
+                "source_meta_claim_rejected",
+                "supported_part_subclaim",
+                "derived_from_supported_parts",
+                "tool:market_data",
+            )
+        )
+    )
+
+
+def _claims_per_research_observation(
+    claims: list[Claim],
+    observations: list[Observation],
+    artifacts: list[Artifact],
+) -> float:
+    research_observations = [
+        observation
+        for observation in observations
+        if _is_original_research_observation(observation, artifacts)
+    ]
+    if not research_observations:
+        return 0.0
+    return round(_normal_claim_count(claims, artifacts) / len(research_observations), 2)
+
+
+def _is_original_research_observation(
+    observation: Observation, artifacts: list[Artifact]
+) -> bool:
+    if observation.tool != "web_search":
+        return False
+    return not any(
+        artifact.legacy_object_type == "observation"
+        and artifact.legacy_object_id == observation.id
+        and (
+            artifact.artifact_type
+            in {
+                ArtifactType.VERIFICATION,
+                ArtifactType.DATA_GAP,
+                ArtifactType.FINAL_REPORT,
+                ArtifactType.JUDGE_FEEDBACK,
+            }
+            or (artifact.branch or "").startswith(("trust/", "synthesis/"))
+            or any(
+                tag in artifact.tags
+                for tag in (
+                    "context_only",
+                    "market_snapshot",
+                    "evidence_gap_planner",
+                    "source_meta_claim_rejected",
+                    "market_snapshot_claim_rejected",
+                    "tool:market_data",
+                )
+            )
+        )
+        for artifact in artifacts
+    )
+
+
+def _claims_created_from_verifier_outputs(claims: list[Claim]) -> int:
+    return sum(1 for claim in claims if claim.derived_from_verification_id is not None)
+
+
+def _rejection_count(artifacts: list[Artifact], tag: str) -> int:
+    return sum(1 for artifact in artifacts if tag in artifact.tags)
+
+
+def _terminal_reason(
+    run: Run,
+    final: FinalReport | None,
+    stop_reasons: list[str],
+    capacity: CapacitySummary,
+) -> str | None:
+    if run.status == RunStatus.FAILED:
+        return run.failure_reason or "run failed"
+    if final and final.judge_score is not None:
+        return "judge completed"
+    if final and final.partial:
+        return "partial final produced"
+    if capacity.search_exhausted:
+        return "search exhausted"
+    if stop_reasons:
+        return stop_reasons[-1]
+    if run.status == RunStatus.COMPLETED:
+        return "run completed"
+    return None
+
+
+SOURCE_TIER_NAMES = (
+    "primary",
+    "high_quality_secondary",
+    "news",
+    "blog_or_opinion",
+    "unknown",
+    "weak",
+)
+
+
+def _source_quality_distribution(
+    verifications: list[Verification], artifacts: list[Artifact]
+) -> dict[str, int]:
+    counts = {tier: 0 for tier in SOURCE_TIER_NAMES}
+    for verification in verifications:
+        text = verification.source_quality_summary.casefold().replace("-", "_")
+        for tier in SOURCE_TIER_NAMES:
+            found_numbered = False
+            for match in re.finditer(rf"(\d+)\s+{re.escape(tier)}", text):
+                counts[tier] += int(match.group(1))
+                found_numbered = True
+            if not found_numbered and tier in text:
+                counts[tier] += 1
+    for artifact in artifacts:
+        for tag in artifact.tags:
+            if tag.startswith("source_tier:"):
+                tier = tag.split(":", 1)[1]
+                if tier in counts:
+                    counts[tier] += 1
+    return {tier: count for tier, count in counts.items() if count > 0}
+
+
+def _claims_created_from_supported_parts(
+    claims: list[Claim], artifacts: list[Artifact]
+) -> int:
+    derived_claim_ids = {
+        claim.id for claim in claims if claim.derived_from_verification_id is not None
+    }
+    derived_claim_ids.update(
+        artifact.legacy_object_id
+        for artifact in artifacts
+        if artifact.artifact_type == ArtifactType.CLAIM
+        and artifact.legacy_object_type == "claim"
+        and artifact.legacy_object_id is not None
+        and (
+            "supported_part_subclaim" in artifact.tags
+            or "derived_from_supported_parts" in artifact.tags
+        )
+    )
+    return len(derived_claim_ids)
+
+
+def _aggregator_used(
+    final: FinalReport | None,
+    artifacts: list[Artifact],
+    principal_actions: list[PrincipalAction],
+) -> bool:
+    return bool(
+        final
+        or any(
+            artifact.artifact_type in {ArtifactType.FINAL_REPORT, ArtifactType.DATA_GAP}
+            and (
+                artifact.branch == "synthesis/aggregator"
+                or "evidence_gap_planner" in artifact.tags
+                or "caveated_aggregator_synthesis" in artifact.tags
+            )
+            for artifact in artifacts
+        )
+        or any(
+            action.action_type == PrincipalActionType.REQUEST_AGGREGATION
+            and action.status == "executed"
+            for action in principal_actions
+        )
+    )
+
+
+def _judge_used(final: FinalReport | None, artifacts: list[Artifact]) -> bool:
+    return bool(
+        final
+        and final.judge_score is not None
+        or any(artifact.artifact_type == ArtifactType.JUDGE_FEEDBACK for artifact in artifacts)
+    )
+
+
+def apply_budget_utilization(
+    capacity: CapacitySummary, utilization: BudgetUtilizationDecision
+) -> None:
+    capacity.llm_utilization_ratio = utilization.llm_utilization_ratio
+    capacity.tavily_utilization_ratio = utilization.tavily_utilization_ratio
+    capacity.market_data_utilization_ratio = utilization.market_data_utilization_ratio
+    capacity.verifier_utilization_ratio = utilization.verifier_utilization_ratio
+    capacity.aggregator_utilization_ratio = utilization.aggregator_utilization_ratio
+    capacity.judge_utilization_ratio = utilization.judge_utilization_ratio
+    capacity.useful_capacity_remaining = utilization.useful_capacity_remaining
+    capacity.should_continue_research = utilization.should_continue_research
+    capacity.terminal_final_allowed = utilization.terminal_final_allowed
+    capacity.terminal_final_reasons = utilization.terminal_final_reasons
+    capacity.terminal_final_blockers = utilization.terminal_final_blockers
+    capacity.repair_waves_attempted = utilization.repair_waves_attempted
+    capacity.min_repair_waves_before_partial_final = (
+        utilization.min_repair_waves_before_partial_final
+    )
+    capacity.branches_repaired = utilization.branches_repaired
+    capacity.under_researched_branches = utilization.under_researched_branches
+
+
+def build_budget_summary(
+    run: Run,
+    tasks: list[ResearchTask],
+    final: FinalReport | None = None,
+) -> BudgetSummary:
+    """Build a compact budget view for API serialization and Principal control state."""
+    budget = run.budget
+    role_spent = _role_amounts(budget.role_spent_usd)
+    role_reserved = _role_amounts(budget.role_reserved_usd)
+    role_protected = _role_protected_amounts(run)
+    protected_remaining = 0.0
+    for role_name, protected in role_protected.items():
+        protected_remaining += max(
+            0,
+            protected - role_spent.get(role_name, 0) - role_reserved.get(role_name, 0),
+        )
+    tool_usage = {
+        "tavily_credits": ToolUsageSummary(
+            used=budget.tools.tavily_credits_used,
+            max=budget.tools.tavily_max_credits,
+            remaining=max(0, budget.tools.tavily_max_credits - budget.tools.tavily_credits_used),
+        ),
+        "market_data_requests": ToolUsageSummary(
+            used=budget.tools.market_data_requests_used,
+            max=budget.tools.market_data_max_requests,
+            remaining=max(
+                0,
+                budget.tools.market_data_max_requests - budget.tools.market_data_requests_used,
+            ),
+        ),
+    }
+    return BudgetSummary(
+        total_limit_usd=budget.limit_usd,
+        spent_usd=budget.spent_usd,
+        reserved_usd=budget.reserved_usd,
+        remaining_usd=max(0, budget.limit_usd - budget.spent_usd - budget.reserved_usd),
+        role_spent_usd=role_spent,
+        role_reserved_usd=role_reserved,
+        role_protected_usd=role_protected,
+        protected_usd=sum(role_protected.values()),
+        protected_remaining_usd=protected_remaining,
+        tool_usage=tool_usage,
+        stop_reasons=_budget_stop_reasons(run, tasks, final),
+    )
+
+
+def build_capacity_summary(run: Run, budget_summary: BudgetSummary) -> CapacitySummary:
+    role_spent = budget_summary.role_spent_usd
+    role_reserved = budget_summary.role_reserved_usd
+    role_protected = budget_summary.role_protected_usd
+
+    def role_remaining(role: AgentRole) -> float:
+        policy = getattr(run.models, role.value, None)
+        cap = policy.cap_usd if policy and policy.cap_usd is not None else run.budget.limit_usd
+        return max(
+            0.0,
+            float(cap)
+            - role_spent.get(role.value, 0.0)
+            - role_reserved.get(role.value, 0.0),
+        )
+
+    def protected_remaining(role: AgentRole) -> float:
+        protected = role_protected.get(role.value, 0.0)
+        return max(
+            0.0,
+            protected
+            - role_spent.get(role.value, 0.0)
+            - role_reserved.get(role.value, 0.0),
+        )
+
+    tavily = budget_summary.tool_usage.get("tavily_credits")
+    market = budget_summary.tool_usage.get("market_data_requests")
+    tavily_remaining = tavily.remaining if tavily else 0
+    market_remaining = market.remaining if market else 0
+    return CapacitySummary(
+        llm_remaining_usd=budget_summary.remaining_usd,
+        tavily_remaining=tavily_remaining,
+        market_data_remaining=market_remaining,
+        verifier_budget_remaining=role_remaining(AgentRole.VERIFIER),
+        aggregator_budget_protected_remaining=protected_remaining(AgentRole.AGGREGATOR),
+        judge_budget_protected_remaining=protected_remaining(AgentRole.JUDGE),
+        search_exhausted=tavily_remaining <= 0,
+        market_data_exhausted=market_remaining <= 0,
+    )
+
+
+def _role_amounts(values: dict[AgentRole, float]) -> dict[str, float]:
+    amounts = {role.value: float(values.get(role, values.get(role.value, 0))) for role in BUDGET_SUMMARY_ROLES}
+    for key, value in values.items():
+        role_name = key.value if isinstance(key, AgentRole) else str(key)
+        amounts.setdefault(role_name, float(value))
+    return amounts
+
+
+def _role_protected_amounts(run: Run) -> dict[str, float]:
+    amounts: dict[str, float] = {}
+    for role in BUDGET_SUMMARY_ROLES:
+        policy = getattr(run.models, role.value, None)
+        if policy and policy.protected_usd > 0:
+            amounts[role.value] = policy.protected_usd
+    return amounts
+
+
+def _budget_stop_reasons(
+    run: Run,
+    tasks: list[ResearchTask],
+    final: FinalReport | None,
+) -> list[str]:
+    reasons: list[str] = []
+    if run.status == RunStatus.PARTIAL_BUDGET_EXHAUSTED:
+        if run.failure_reason:
+            reasons.append(run.failure_reason)
+        elif final and final.partial:
+            reasons.append("budget exhausted before full synthesis")
+        else:
+            reasons.append("budget exhausted")
+    skipped_tasks = [task for task in tasks if task.status == "skipped_budget"]
+    if skipped_tasks:
+        details = []
+        for task in skipped_tasks[:3]:
+            details.append(task.reason or f"Budget skipped task: {task.title}")
+        suffix = "; ".join(details)
+        if len(skipped_tasks) > 3:
+            suffix += f"; {len(skipped_tasks) - 3} more"
+        reasons.append(f"{len(skipped_tasks)} task(s) skipped due to budget: {suffix}")
+    return reasons
+
+
+def _search_exhausted_before_verification(
+    run: Run,
+    claims: list[Claim],
+    verifications: list[Verification],
+) -> bool:
+    if run.budget.tools.tavily_credits_used < run.budget.tools.tavily_max_credits:
+        return False
+    if (run.budget.limit_usd - run.budget.spent_usd - run.budget.reserved_usd) <= 0:
+        return False
+    verified_ids = {
+        verification.claim_id for verification in verifications if verification.verdict == "verified"
+    }
+    checked_ids = {verification.claim_id for verification in verifications}
+    return not verified_ids or any(claim.id not in checked_ids for claim in claims)
+
+
+def max_task_wave(tasks: list[ResearchTask]) -> int:
+    return max((task.wave_number for task in tasks), default=0)
+
+
+def has_followup_wave(tasks: list[ResearchTask]) -> bool:
+    return max_task_wave(tasks) > 0
+
+
+def judge_score_needs_followup(final: FinalReport | None) -> bool:
+    return bool(
+        final
+        and final.judge_score is not None
+        and final.judge_score < FOLLOWUP_JUDGE_SCORE_THRESHOLD
+    )
+
+
+def can_request_followup_wave(final: FinalReport | None, tasks: list[ResearchTask]) -> bool:
+    return judge_score_needs_followup(final) and max_task_wave(tasks) < MAX_FOLLOWUP_WAVES
+
+
+def should_reaggregate_after_followup(
+    final: FinalReport | None, tasks: list[ResearchTask]
+) -> bool:
+    return judge_score_needs_followup(final) and max_task_wave(tasks) > (
+        final.wave_number if final else 0
+    )
 
 
 def _active_branches(
@@ -193,11 +726,29 @@ def _phase(
         return RunPhase.FAILED
     if run.status in {RunStatus.COMPLETED, RunStatus.PARTIAL_BUDGET_EXHAUSTED}:
         return RunPhase.COMPLETED
+    pending_tasks = [task for task in tasks if task.status == "created"]
+    completed_tasks = [task for task in tasks if task.status == "completed"]
+    if final and judge_score_needs_followup(final):
+        if can_request_followup_wave(final, tasks):
+            return RunPhase.JUDGING
+        if pending_tasks:
+            return RunPhase.RESEARCHING
+        if should_reaggregate_after_followup(final, tasks) and completed_tasks:
+            return RunPhase.SYNTHESIZING
     if final and final.judge_score is None and run.models.judge:
         return RunPhase.JUDGING
+    if final and final.partial:
+        return RunPhase.COMPLETED
     if final:
         return RunPhase.COMPLETED
-    if verifications and len(verifications) >= max(1, len(tasks)):
+    if tasks and not pending_tasks and max_task_wave(tasks) >= MAX_FOLLOWUP_WAVES:
+        checked_claim_ids = {verification.claim_id for verification in verifications}
+        claim_ids = {claim.id for claim in claims}
+        if claim_ids <= checked_claim_ids:
+            return RunPhase.SYNTHESIZING
+    if tasks and all(task.status == "failed" for task in tasks):
+        return RunPhase.FAILED
+    if verifications and not pending_tasks and len(verifications) >= max(1, len(completed_tasks)):
         return RunPhase.SYNTHESIZING
     if claims:
         return RunPhase.VERIFYING
@@ -216,88 +767,29 @@ def _next_actions(
     verifications: list[Verification],
     final: FinalReport | None,
     artifacts: list[Artifact],
+    agent_specs: list[AgentSpec] | None = None,
+    organization_plan: OrganizationPlan | None = None,
+    dead_letters: list[DeadLetterRecord] | None = None,
+    principal_actions: list[PrincipalAction] | None = None,
+    observations: list[Observation] | None = None,
 ) -> list[PrincipalAction]:
-    if run.status in {RunStatus.COMPLETED, RunStatus.PARTIAL_BUDGET_EXHAUSTED, RunStatus.FAILED}:
-        return []
-    actions: list[PrincipalAction] = []
-    pending_tasks = [task for task in tasks if task.status == "created"]
-    if not tasks:
-        actions.append(
-            PrincipalAction(
-                run_id=run.id,
-                action_type=PrincipalActionType.ASSIGN_TASK,
-                reason="No research tasks exist yet; the Principal should decompose the objective.",
-                expected_information_gain=InformationGain.HIGH,
-                required_role="principal_policy",
-                priority=9,
-            )
-        )
-    elif pending_tasks:
-        actions.append(
-            PrincipalAction(
-                run_id=run.id,
-                action_type=PrincipalActionType.REQUEST_TOOL_CALL,
-                reason=f"{len(pending_tasks)} planned task(s) still need tool evidence.",
-                expected_information_gain=InformationGain.HIGH,
-                target_branch=branch_for_task(pending_tasks[0]),
-                required_role="tool_runner",
-                priority=8,
-            )
-        )
-    unverified_claim_ids = {claim.id for claim in claims} - {
-        verification.claim_id for verification in verifications
-    }
-    if unverified_claim_ids:
-        actions.append(
-            PrincipalAction(
-                run_id=run.id,
-                action_type=PrincipalActionType.REQUEST_VERIFICATION,
-                reason=f"{len(unverified_claim_ids)} claim(s) need trust-layer review before synthesis.",
-                expected_information_gain=InformationGain.MEDIUM,
-                required_role="source_verifier_agent",
-                target_branch="trust/source_verifier",
-                priority=7,
-            )
-        )
-    has_counterargument = any(
-        value.artifact_type == ArtifactType.COUNTERARGUMENT for value in artifacts
+    from src.agents.principal_policy import build_principal_snapshot, propose_principal_actions
+
+    snapshot = build_principal_snapshot(
+        run,
+        state,
+        organization_plan,
+        agent_specs=agent_specs,
+        tasks=tasks,
+        observations=observations,
+        claims=claims,
+        verifications=verifications,
+        artifacts=artifacts,
+        principal_actions=principal_actions,
+        dead_letters=dead_letters,
+        final=final,
     )
-    if state.verified_claim_count >= 2 and not has_counterargument and state.budget_remaining > 0:
-        actions.append(
-            PrincipalAction(
-                run_id=run.id,
-                action_type=PrincipalActionType.REQUEST_SKEPTIC_REVIEW,
-                reason="Multiple claims have been verified but no adversarial counterargument has been produced yet.",
-                expected_information_gain=InformationGain.MEDIUM,
-                required_role="skeptic_agent",
-                target_branch="trust/skeptic",
-                priority=6,
-            )
-        )
-    if tasks and not pending_tasks and not final:
-        actions.append(
-            PrincipalAction(
-                run_id=run.id,
-                action_type=PrincipalActionType.REQUEST_AGGREGATION,
-                reason="All planned tasks have finished; synthesize only trusted artifacts into an answer.",
-                expected_information_gain=InformationGain.MEDIUM,
-                required_role="aggregator_agent",
-                target_branch="synthesis/aggregator",
-                priority=5,
-            )
-        )
-    if final and final.judge_score is not None:
-        actions.append(
-            PrincipalAction(
-                run_id=run.id,
-                action_type=PrincipalActionType.STOP_RUN,
-                reason="The payoff layer scored the final report; stop unless a follow-up threshold is configured.",
-                expected_information_gain=InformationGain.LOW,
-                target_branch="synthesis/judge",
-                priority=3,
-            )
-        )
-    return actions
+    return propose_principal_actions(snapshot)
 
 
 def title_from_branch(branch: str) -> str:
