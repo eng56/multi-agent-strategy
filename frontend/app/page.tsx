@@ -24,15 +24,76 @@ const defaultBudgetUsd = 5;
 const defaultToolLimits = {tavily_max_credits: 50, market_data_max_requests: 20};
 
 const workflowSteps = [
-  "objective",
-  "Principal observes RunState",
-  "Principal selects typed actions",
-  "agents/tools produce observations",
-  "observations become artifacts",
-  "verifier/skeptic updates trust",
-  "aggregator synthesizes",
-  "judge/payoff evaluates",
-  "Principal repairs evidence or stops under budget",
+  {
+    title: "Objective",
+    text: "The user submits an open-world research question and a bounded run budget.",
+  },
+  {
+    title: "Principal observes",
+    text: "The controller reads RunState, budget, artifacts, gaps, and prior decisions.",
+  },
+  {
+    title: "Principal acts",
+    text: "It selects typed actions such as research, verification, aggregation, repair, or stop.",
+  },
+  {
+    title: "Agents gather",
+    text: "Logical agents use web search and market data to produce external observations.",
+  },
+  {
+    title: "Artifacts form",
+    text: "Observations, claims, caveats, and reports are written as inspectable artifacts.",
+  },
+  {
+    title: "Trust updates",
+    text: "Verifier and skeptic stages promote, dispute, reject, or caveat claims.",
+  },
+  {
+    title: "Aggregator synthesizes",
+    text: "The final answer is built from the trusted evidence available to the run.",
+  },
+  {
+    title: "Judge records payoff",
+    text: "Optional judge feedback provides a usefulness and calibration signal.",
+  },
+  {
+    title: "Principal repairs or stops",
+    text: "The controller can launch targeted follow-up work or stop under constraints.",
+  },
+];
+
+const paperLinks = [
+  {
+    title: "Social Environment Design",
+    href: "https://arxiv.org/abs/2402.14090",
+  },
+  {
+    title: "Large Legislative Models",
+    href: "https://arxiv.org/abs/2410.08345",
+  },
+  {
+    title: "Creating a Cooperative AI Policymaking Platform",
+    href: "https://arxiv.org/abs/2412.06936",
+  },
+];
+
+const traceItems = [
+  {
+    title: "Temporary organization",
+    text: "AgentSpecs are logical research roles, not dynamic infrastructure.",
+  },
+  {
+    title: "Evidence trail",
+    text: "Search results, market snapshots, claims, and verifications remain inspectable.",
+  },
+  {
+    title: "Trust decisions",
+    text: "Disputed or rejected claims should be read alongside the final answer.",
+  },
+  {
+    title: "Control trace",
+    text: "Principal actions show why the run continued, repaired evidence, or stopped.",
+  },
 ];
 
 const suggestedPrompts = [
@@ -168,64 +229,75 @@ export default function Home() {
 
       <section className="hero-panel">
         <p className="tag">Open-world research control loop</p>
-        <h1>Paper-inspired multi-agent research system</h1>
-        <p className="lede">An open-world prototype of a Principal / environment / observation / payoff loop.</p>
+        <h1>Operationalizing a paper-inspired research loop</h1>
         <p>
-          This is not just an investment chatbot. The system creates a temporary organization of logical agents,
-          gathers observations from web search and market data, writes artifacts, verifies or disputes claims, and
-          exposes the full control trace.
+          This prototype explores how a paper-inspired Principal / environment / observation / payoff loop can be
+          operationalized in an open-world research setting.
         </p>
       </section>
 
-      <section className="workflow-strip" aria-label="Research workflow">
-        {workflowSteps.map((step, index) => (
-          <div className="workflow-step" key={step}>
-            <span className="step-index">{index + 1}</span>
-            <span>{step}</span>
-            {index < workflowSteps.length - 1 && <span className="step-arrow">&rarr;</span>}
-          </div>
-        ))}
-      </section>
-
-      <details className="note-panel" open>
-        <summary>
-          <span>Before you try it</span>
-          <span className="pill">read first</span>
-        </summary>
-        <div className="note-content">
+      <section className="framing-panel" aria-labelledby="research-framing">
+        <div className="framing-copy">
+          <p className="tag">Research framing</p>
+          <h2 id="research-framing">Before submitting a prompt</h2>
           <p>
-            This prototype is designed to show the control loop, not to produce a black-box answer. The most
-            interesting part is the trace: which agents were created, what evidence was gathered, which claims were
-            verified or disputed, how budget was used, and why the Principal continued or stopped.
+            The current demo uses investment-research questions as a testbed. For each run, the system creates a
+            temporary organization of logical agents, gathers observations from web search and market data, writes
+            artifacts, verifies or disputes claims, and exposes the full control trace.
           </p>
-          <div className="two-col">
-            <div>
-              <h3>What this is</h3>
-              <ul>
-                <li>a managed-services multi-agent research prototype</li>
-                <li>a Principal / environment / observation / payoff loop in an open-world setting</li>
-                <li>a system that makes reasoning traces inspectable</li>
-                <li>a tool for experimenting with evidence, verification, and synthesis</li>
-              </ul>
-            </div>
-            <div>
-              <h3>What this is not</h3>
-              <ul>
-                <li>not a production investment advisor</li>
-                <li>not a full implementation of the papers</li>
-                <li>not a learned RL policymaker</li>
-                <li>not a dynamic Kubernetes pod-per-agent system</li>
-                <li>not a guarantee of correct forecasts</li>
-                <li>not personalized financial advice</li>
-              </ul>
-            </div>
-          </div>
           <p>
-            EvidenceEngine is our engineering implementation of the observation layer for web and market-data research.
-            It is not a named component in the papers.
+            It is not a production investment advisor, a full implementation of the papers, a learned RL policymaker,
+            or a guarantee of correct forecasts. The value of the demo is the trace: what was observed, what was
+            trusted, what was rejected, and why the Principal continued or stopped.
           </p>
         </div>
-      </details>
+        <aside className="paper-panel" aria-label="Inspired by">
+          <h3>Inspired by</h3>
+          <ul className="paper-list">
+            {paperLinks.map((paper) => (
+              <li key={paper.href}>
+                <a href={paper.href} rel="noreferrer" target="_blank">
+                  {paper.title}
+                </a>
+              </li>
+            ))}
+          </ul>
+        </aside>
+      </section>
+
+      <section className="section-block" aria-labelledby="loop-map-title">
+        <div className="section-heading section-heading-centered">
+          <div>
+            <p className="tag">Control loop</p>
+            <h2 id="loop-map-title">What happens during a run</h2>
+          </div>
+        </div>
+        <ol className="loop-map">
+          {workflowSteps.map((step) => (
+            <li className="loop-step" key={step.title}>
+              <strong>{step.title}</strong>
+              <span>{step.text}</span>
+            </li>
+          ))}
+        </ol>
+      </section>
+
+      <section className="section-block" aria-labelledby="trace-title">
+        <div className="section-heading section-heading-centered">
+          <div>
+            <p className="tag">How to read results</p>
+            <h2 id="trace-title">Inspect the trace before trusting the answer</h2>
+          </div>
+        </div>
+        <div className="trace-grid">
+          {traceItems.map((item) => (
+            <p key={item.title}>
+              <strong>{item.title}</strong>
+              <span>{item.text}</span>
+            </p>
+          ))}
+        </div>
+      </section>
 
       <section className="section-block">
         <div className="section-heading">
@@ -243,53 +315,6 @@ export default function Home() {
               <span>{item.prompt}</span>
             </button>
           ))}
-        </div>
-      </section>
-
-      <section className="section-block">
-        <div className="section-heading">
-          <div>
-            <p className="tag">Trace guide</p>
-            <h2>How to read results</h2>
-          </div>
-          <a href="/about">Full demo notes</a>
-        </div>
-        <div className="glossary-grid">
-          <p>
-            <strong>Principal action timeline</strong>
-            <span>Shows what the controller decided or proposed.</span>
-          </p>
-          <p>
-            <strong>Agent organization</strong>
-            <span>Shows the temporary logical research organization. These are AgentSpecs, not Kubernetes pods.</span>
-          </p>
-          <p>
-            <strong>EvidenceEngine observations</strong>
-            <span>Search and market-data outputs converted into structured observations.</span>
-          </p>
-          <p>
-            <strong>Claims</strong>
-            <span>Candidate propositions extracted from observations.</span>
-          </p>
-          <p>
-            <strong>Verifications</strong>
-            <span>Trust-layer checks that promote, dispute, or reject claims.</span>
-          </p>
-          <p>
-            <strong>Artifacts</strong>
-            <span>Graph of observations, claims, verifications, final reports, and their dependency links.</span>
-          </p>
-          <p>
-            <strong>Evidence-limited final</strong>
-            <span>
-              This means the system refused to produce a confident synthesis because claims did not pass verification.
-              This is safer than hallucinating.
-            </span>
-          </p>
-          <p>
-            <strong>Budget</strong>
-            <span>Shows LLM spend, search/tool budget, market-data budget, and protected aggregator/judge budget.</span>
-          </p>
         </div>
       </section>
 
