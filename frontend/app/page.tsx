@@ -96,6 +96,86 @@ const traceItems = [
   },
 ];
 
+const architectureFlow = [
+  "User / Frontend",
+  "FastAPI Orchestrator",
+  "Kafka / Confluent event bus",
+  "Kubernetes role workers",
+  "Redis / Upstash blackboard",
+  "Evidence tools + LLMs",
+  "Artifact graph + run detail UI",
+] as const;
+
+const architectureDetails = [
+  {
+    title: "Frontend",
+    items: [
+      "Next.js UI",
+      "creates runs",
+      "displays run detail, Principal actions, artifacts, budgets, final answer",
+    ],
+  },
+  {
+    title: "API / Orchestrator",
+    items: ["FastAPI backend", "validates run requests", "writes run state", "publishes initial run event"],
+  },
+  {
+    title: "Kubernetes / GKE",
+    items: [
+      "runs static role workers",
+      "planner-agent",
+      "worker-agents",
+      "tool-runner",
+      "verifier-agent",
+      "skeptic-agent",
+      "aggregator-agent",
+      "judge-agent",
+      "static role deployments, not one pod per logical agent",
+    ],
+  },
+  {
+    title: "Kafka / Confluent",
+    items: [
+      "coordination event bus",
+      "carries run.created, task.created, observation.created, claim.created, final.created, etc.",
+      "not the source of truth for run state",
+    ],
+  },
+  {
+    title: "Redis / Upstash",
+    items: [
+      "shared blackboard / operational state",
+      "stores runs, tasks, observations, claims, verifications, artifacts, PrincipalActions, AgentSpecs, dead letters, and organization plans",
+    ],
+  },
+  {
+    title: "GCP / GCS",
+    items: ["stores raw artifacts / tool outputs", "GKE hosts the backend and workers"],
+  },
+  {
+    title: "LLM + observability",
+    items: ["OpenRouter for model calls", "Langfuse for tracing / LLM-call observability"],
+  },
+  {
+    title: "Tools",
+    items: [
+      "Tavily / web search for evidence",
+      "Massive market data for market snapshots",
+      "optional Brave / Exa / Firecrawl if configured",
+    ],
+  },
+] as const;
+
+const layerRows = [
+  {logical: "PrincipalPolicy", physical: "GKE deployments"},
+  {logical: "AgentSpec", physical: "Kafka topic"},
+  {logical: "ResearchTask", physical: "Upstash Redis"},
+  {logical: "Artifact", physical: "GCS bucket"},
+  {logical: "RunState", physical: "OpenRouter"},
+  {logical: "PrincipalAction", physical: "Tavily / Massive"},
+  {logical: "", physical: "Langfuse"},
+] as const;
+
 const suggestedPrompts = [
   {
     label: "Macro / cross-asset",
@@ -296,6 +376,62 @@ export default function Home() {
               <span>{item.text}</span>
             </p>
           ))}
+        </div>
+      </section>
+
+      <section className="section-block architecture-section" aria-labelledby="system-architecture-title">
+        <div className="section-heading section-heading-centered">
+          <div>
+            <p className="tag">Runtime architecture</p>
+            <h2 id="system-architecture-title">System architecture</h2>
+          </div>
+        </div>
+        <p className="architecture-intro">
+          The prototype separates logical agents from physical infrastructure. Agents are logical AgentSpecs stored in
+          the run state. Kubernetes runs a fixed set of role workers. Redis stores the blackboard state. Kafka carries
+          coordination events. External tools provide observations.
+        </p>
+        <ol className="architecture-flow" aria-label="Architecture flow">
+          {architectureFlow.map((node) => (
+            <li key={node}>{node}</li>
+          ))}
+        </ol>
+        <div className="architecture-card-grid">
+          {architectureDetails.map((item) => (
+            <article className="architecture-card" key={item.title}>
+              <h3>{item.title}</h3>
+              <ul>
+                {item.items.map((detail) => (
+                  <li key={detail}>{detail}</li>
+                ))}
+              </ul>
+            </article>
+          ))}
+        </div>
+        <aside className="architecture-note">
+          <p>
+            <strong>Logical agents are not Kubernetes pods.</strong> The Principal creates a temporary logical
+            organization of AgentSpecs for each run. These logical agents are executed by a fixed pool of Kubernetes
+            role workers.
+          </p>
+        </aside>
+        <div className="layer-table-wrap">
+          <table className="layer-table">
+            <thead>
+              <tr>
+                <th scope="col">Logical layer</th>
+                <th scope="col">Physical layer</th>
+              </tr>
+            </thead>
+            <tbody>
+              {layerRows.map((row) => (
+                <tr key={`${row.logical}-${row.physical}`}>
+                  <td>{row.logical}</td>
+                  <td>{row.physical}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       </section>
 
