@@ -37,6 +37,21 @@ const limitations = [
   "Forecasts can be wrong; the trace is intended to make uncertainty, evidence quality, and controller behavior inspectable.",
 ];
 
+const paperLinks = [
+  {
+    title: "Social Environment Design",
+    href: "https://arxiv.org/abs/2402.14090",
+  },
+  {
+    title: "Large Legislative Models",
+    href: "https://arxiv.org/abs/2410.08345",
+  },
+  {
+    title: "Creating a Cooperative AI Policymaking Platform",
+    href: "https://arxiv.org/abs/2412.06936",
+  },
+];
+
 export default function AboutPage() {
   return (
     <main className="shell about-page">
@@ -49,15 +64,13 @@ export default function AboutPage() {
         <p className="tag">What this prototype demonstrates</p>
         <h1>Principal / environment / observation / payoff in open-world research</h1>
         <p className="lede">
-          I did not try to reproduce the full economic simulation setting from the papers. Instead, I asked what
-          systems substrate would be needed to operationalize the Principal / environment / observation / payoff loop
-          in an open-world research setting.
+          This prototype explores how a paper-inspired Principal / environment / observation / payoff loop can be
+          operationalized in an open-world research setting.
         </p>
         <p>
-          The prototype creates a temporary agent organization, produces artifacts, verifies or disputes claims, records
-          Principal actions, and exposes the trace in a UI. The current system is conservative: if no claims pass
-          verification, it produces an evidence-limited final rather than hallucinating a forecast. The next step is to
-          improve how the Principal repairs evidence and converts observations into atomic, verifiable claims.
+          The current demo uses investment-research questions as a testbed. For each run, the system creates a
+          temporary organization of logical agents, gathers observations from web search and market data, writes
+          artifacts, verifies or disputes claims, and exposes the full control trace.
         </p>
       </section>
 
@@ -91,6 +104,16 @@ export default function AboutPage() {
             receives observations from an environment, and gets a payoff signal from the judge. The implementation is a
             systems prototype for open-world research, not a claim that the papers specify this exact architecture.
           </p>
+          <h3>Inspired by</h3>
+          <ul className="paper-list">
+            {paperLinks.map((paper) => (
+              <li key={paper.href}>
+                <a href={paper.href} rel="noreferrer" target="_blank">
+                  {paper.title}
+                </a>
+              </li>
+            ))}
+          </ul>
           <p>
             EvidenceEngine is our engineering implementation of the observation layer for web and market-data research.
             It is not a named component in the papers.

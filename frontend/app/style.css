@@ -14,6 +14,7 @@ body {
   background:
     linear-gradient(180deg, rgba(33, 43, 55, 0.82), rgba(13, 17, 23, 0) 360px),
     #0d1117;
+  overflow-x: hidden;
 }
 
 a {
@@ -21,6 +22,7 @@ a {
 }
 
 .shell {
+  width: 100%;
   max-width: 1180px;
   margin: 0 auto;
   padding: 48px 24px 72px;
@@ -73,12 +75,14 @@ h1 {
   line-height: 1.05;
   margin: 10px 0 24px;
   letter-spacing: 0;
+  text-wrap: balance;
 }
 
 h2 {
   margin: 0 0 14px;
   font-size: 22px;
   letter-spacing: 0;
+  text-wrap: balance;
 }
 
 h3 {
@@ -89,6 +93,7 @@ h3 {
 
 p {
   line-height: 1.55;
+  overflow-wrap: break-word;
 }
 
 ul {
@@ -380,8 +385,18 @@ summary {
   padding: 12px 0 20px;
 }
 
+.landing .hero-panel {
+  margin: 0 auto;
+  text-align: center;
+}
+
 .hero-panel p {
   max-width: 760px;
+}
+
+.landing .hero-panel p {
+  margin-left: auto;
+  margin-right: auto;
 }
 
 .lede {
@@ -394,42 +409,129 @@ summary {
   margin: 24px 0;
 }
 
-.workflow-strip {
+.framing-panel {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-  gap: 10px;
-  margin: 24px 0;
+  grid-template-columns: minmax(0, 1.45fr) minmax(280px, 0.75fr);
+  gap: 24px;
+  align-items: stretch;
+  margin: 26px auto 34px;
+  padding: 26px;
+  border: 1px solid #435146;
+  border-radius: 8px;
+  background: #121916;
+  max-width: 1040px;
 }
 
-.workflow-step {
-  position: relative;
-  min-height: 98px;
-  padding: 14px;
+.framing-panel > *,
+.paper-list a,
+.loop-step,
+.trace-grid > *,
+.prompt-card,
+.copy-card {
+  min-width: 0;
+}
+
+.framing-copy h2 {
+  margin-bottom: 16px;
+  font-size: 28px;
+}
+
+.framing-copy p:last-child {
+  margin-bottom: 0;
+}
+
+.paper-panel {
+  padding: 18px;
+  border: 1px solid #303946;
+  border-radius: 8px;
+  background: #0f151d;
+}
+
+.paper-panel h3 {
+  margin-top: 0;
+}
+
+.paper-list {
+  display: grid;
+  gap: 10px;
+  padding: 0;
+  margin: 14px 0 0;
+  list-style: none;
+}
+
+.paper-list li {
+  margin: 0;
+}
+
+.paper-list a {
+  display: block;
+  padding: 12px;
   border: 1px solid #303946;
   border-radius: 8px;
   background: #141922;
   color: #dfe6ef;
+  text-decoration: none;
+  overflow-wrap: break-word;
 }
 
-.step-index {
+.paper-list a:hover {
+  border-color: #6ee7c8;
+  color: #6ee7c8;
+}
+
+.section-heading-centered {
+  justify-content: center;
+  text-align: center;
+}
+
+.loop-map {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+  max-width: 1040px;
+  padding: 0;
+  margin: 0 auto;
+  list-style: none;
+  counter-reset: loop-step;
+}
+
+.loop-step {
+  counter-increment: loop-step;
+  min-height: 154px;
+  margin: 0;
+  padding: 18px;
+  border: 1px solid #303946;
+  border-radius: 8px;
+  background: #141922;
+}
+
+.loop-step::before {
+  content: counter(loop-step);
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 24px;
-  height: 24px;
-  margin-bottom: 12px;
+  width: 32px;
+  height: 32px;
+  margin-bottom: 18px;
   border-radius: 50%;
-  background: #26313e;
+  background: #20303a;
   color: #6ee7c8;
-  font-size: 12px;
-  font-weight: 700;
+  font-weight: 800;
 }
 
-.step-arrow {
-  position: absolute;
-  right: 12px;
-  bottom: 10px;
+.loop-step strong,
+.loop-step span {
+  display: block;
+}
+
+.loop-step strong {
   color: #f2d68a;
+}
+
+.loop-step span {
+  margin-top: 8px;
+  color: #b7c1cf;
+  line-height: 1.45;
 }
 
 .note-panel,
@@ -483,11 +585,13 @@ summary {
   color: #f2d68a;
 }
 
-.glossary-grid {
+.glossary-grid,
+.trace-grid {
   grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
 }
 
 .glossary-grid p,
+.trace-grid p,
 .exec-metrics > div {
   margin: 0;
   padding: 14px;
@@ -497,13 +601,22 @@ summary {
 }
 
 .glossary-grid strong,
-.glossary-grid span {
+.glossary-grid span,
+.trace-grid strong,
+.trace-grid span {
   display: block;
 }
 
-.glossary-grid span {
+.glossary-grid span,
+.trace-grid span {
   margin-top: 8px;
   color: #aeb8c6;
+}
+
+.trace-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  max-width: 1040px;
+  margin: 0 auto;
 }
 
 .helper-panel,
@@ -522,7 +635,12 @@ summary {
 }
 
 .run-form {
-  margin-top: 26px;
+  max-width: 980px;
+  margin: 34px auto 0;
+}
+
+.run-form > button {
+  margin-top: 4px;
 }
 
 .exec-metrics {
@@ -597,7 +715,7 @@ summary {
   }
 
   h1 {
-    font-size: 36px;
+    font-size: 32px;
   }
 
   .top-nav,
@@ -617,12 +735,22 @@ summary {
     grid-template-columns: 1fr;
   }
 
-  .workflow-strip,
+  .framing-panel,
+  .loop-map,
   .prompt-grid,
   .followup-grid,
   .glossary-grid,
+  .trace-grid,
   .exec-metrics {
     grid-template-columns: 1fr;
+  }
+
+  .framing-panel {
+    padding: 18px;
+  }
+
+  .framing-copy h2 {
+    font-size: 24px;
   }
 
   .wide-metric {
