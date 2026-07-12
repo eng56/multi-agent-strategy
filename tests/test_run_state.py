@@ -75,7 +75,7 @@ def test_run_state_summarizes_pending_research_and_next_tool_action() -> None:
     assert state.open_questions == ["Find SAP catalysts"]
     assert state.agent_count == 1
     assert state.budget_remaining == 3.25
-    assert state.tool_budget_remaining == {"tavily_credits": 2, "market_data_requests": 1}
+    assert state.tool_budget_remaining == {"tavily_credits": 50, "market_data_requests": 20}
     assert state.next_action_candidates[0].action_type == PrincipalActionType.REQUEST_TOOL_CALL
 
 

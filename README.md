@@ -131,15 +131,15 @@ gcloud container clusters delete "$GKE_CLUSTER" \
 
 ## Tool limits
 
-The first version intentionally uses simple provider-native limits: the UI defaults to a $1 shared
-OpenRouter budget, 2 Tavily credits, and 1 market-data request for each run. Tavily basic searches
+The first version intentionally uses simple provider-native limits: the UI defaults to a $5 shared
+OpenRouter budget, 50 Tavily credits, and 20 market-data requests for each run. Tavily basic searches
 consume one credit and market-data calls consume one request. Credential validation checks provider
 keys before the run starts, but these per-run tool limits are reserved for actual agent tool calls.
 Exact USD accounting is enforced for OpenRouter using reservations and returned usage cost; tool USD
 cost is not estimated because it depends on the deployment owner's provider plans.
 
 The OpenRouter budget is a hard cap, not a spend target. Low-cost models such as `openai/gpt-4.1-mini`
-can complete an end-to-end run while spending only a small fraction of a $4 cap. For deeper and more
+can complete an end-to-end run while spending only a small fraction of a $5 cap. For deeper and more
 expensive runs, choose higher-cost OpenRouter models in the UI, increase role caps, and increase
 `max_output_tokens`; the runtime will still reconcile reservations to the actual usage cost returned
 by OpenRouter.

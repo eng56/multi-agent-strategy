@@ -20,8 +20,8 @@ const weights: Record<string, number> = {
   judge: 0.1,
 };
 const createRunTimeoutMs = 60000;
-const defaultBudgetUsd = 1;
-const defaultToolLimits = {tavily_max_credits: 2, market_data_max_requests: 1};
+const defaultBudgetUsd = 5;
+const defaultToolLimits = {tavily_max_credits: 50, market_data_max_requests: 20};
 
 const workflowSteps = [
   "objective",
