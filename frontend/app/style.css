@@ -425,6 +425,10 @@ summary {
 .framing-panel > *,
 .paper-list a,
 .loop-step,
+.architecture-flow li,
+.architecture-card,
+.architecture-note,
+.layer-table-wrap,
 .trace-grid > *,
 .prompt-card,
 .copy-card {
@@ -553,13 +557,16 @@ summary {
 .prompt-grid,
 .followup-grid,
 .glossary-grid,
+.trace-grid,
 .exec-metrics {
   display: grid;
   gap: 12px;
 }
 
 .prompt-grid {
-  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
 }
 
 .prompt-card,
@@ -575,6 +582,11 @@ summary {
   color: #dfe6ef;
 }
 
+.prompt-card {
+  flex: 1 1 240px;
+  max-width: calc((100% - 36px) / 4);
+}
+
 .prompt-card:hover,
 .copy-card:hover {
   border-color: #6ee7c8;
@@ -585,9 +597,14 @@ summary {
   color: #f2d68a;
 }
 
-.glossary-grid,
 .trace-grid {
   grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+}
+
+.glossary-grid {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
 }
 
 .glossary-grid p,
@@ -598,6 +615,11 @@ summary {
   border: 1px solid #303946;
   border-radius: 8px;
   background: #141922;
+}
+
+.glossary-grid p {
+  flex: 1 1 250px;
+  max-width: calc((100% - 36px) / 4);
 }
 
 .glossary-grid strong,
@@ -611,6 +633,155 @@ summary {
 .trace-grid span {
   margin-top: 8px;
   color: #aeb8c6;
+}
+
+.architecture-section {
+  max-width: 1120px;
+  margin-right: auto;
+  margin-left: auto;
+}
+
+.architecture-intro {
+  max-width: 860px;
+  margin: 0 auto 22px;
+  color: #dfe6ef;
+  text-align: center;
+}
+
+.architecture-flow {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 28px;
+  justify-content: center;
+  max-width: 1120px;
+  padding: 0;
+  margin: 0 auto 24px;
+  list-style: none;
+}
+
+.architecture-flow li {
+  position: relative;
+  display: flex;
+  flex: 1 1 0;
+  align-items: center;
+  justify-content: center;
+  min-height: 78px;
+  padding: 12px;
+  margin: 0;
+  border: 1px solid #303946;
+  border-radius: 8px;
+  background: #141922;
+  color: #e8edf5;
+  font-weight: 800;
+  line-height: 1.25;
+  text-align: center;
+}
+
+.architecture-flow li:not(:last-child)::after {
+  position: absolute;
+  top: 50%;
+  right: -22px;
+  color: #f2d68a;
+  font-size: 20px;
+  font-weight: 800;
+  content: "→";
+  transform: translateY(-50%);
+}
+
+.architecture-card-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  justify-content: center;
+  max-width: 1040px;
+  margin: 0 auto;
+}
+
+.architecture-card {
+  padding: 16px;
+  border: 1px solid #303946;
+  border-radius: 8px;
+  background: #141922;
+  flex: 1 1 250px;
+  max-width: calc((100% - 28px) / 3);
+}
+
+.architecture-card h3 {
+  margin: 0 0 10px;
+  color: #f2d68a;
+  font-size: 18px;
+}
+
+.architecture-card p,
+.architecture-card ul {
+  margin: 0;
+  color: #aeb8c6;
+}
+
+.architecture-card ul {
+  display: grid;
+  gap: 7px;
+  padding-left: 18px;
+}
+
+.architecture-note {
+  max-width: 1040px;
+  margin: 18px auto 0;
+  padding: 16px 18px;
+  border: 1px solid #6f613f;
+  border-radius: 8px;
+  background: #1c1a13;
+  color: #e8edf5;
+}
+
+.architecture-note p {
+  margin: 0;
+}
+
+.architecture-note strong {
+  color: #f2d68a;
+}
+
+.layer-table-wrap {
+  max-width: 1040px;
+  margin: 14px auto 0;
+  overflow-x: auto;
+  border: 1px solid #303946;
+  border-radius: 8px;
+  background: #141922;
+}
+
+.layer-table {
+  width: 100%;
+  min-width: 520px;
+  border-collapse: collapse;
+}
+
+.layer-table th,
+.layer-table td {
+  padding: 12px 14px;
+  border-bottom: 1px solid #26313d;
+  text-align: left;
+  vertical-align: top;
+}
+
+.layer-table th {
+  background: #101721;
+  color: #f2d68a;
+}
+
+.layer-table tr:last-child td {
+  border-bottom: 0;
+}
+
+.architecture-summary-copy {
+  max-width: 1040px;
+  margin: 0 auto 14px;
+}
+
+.architecture-card-grid-compact .architecture-card {
+  flex-basis: 230px;
+  max-width: calc((100% - 42px) / 4);
 }
 
 .trace-grid {
@@ -705,6 +876,25 @@ summary {
   margin-top: 34px;
 }
 
+@media (max-width: 980px) {
+  .glossary-grid p,
+  .prompt-card,
+  .architecture-card,
+  .architecture-card-grid-compact .architecture-card {
+    max-width: calc((100% - 14px) / 2);
+  }
+
+  .architecture-flow {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+  }
+
+  .architecture-flow li:not(:last-child)::after {
+    display: none;
+  }
+}
+
 @media (max-width: 720px) {
   .shell {
     padding: 32px 16px 56px;
@@ -737,6 +927,7 @@ summary {
 
   .framing-panel,
   .loop-map,
+  .architecture-card-grid,
   .prompt-grid,
   .followup-grid,
   .glossary-grid,
@@ -751,6 +942,46 @@ summary {
 
   .framing-copy h2 {
     font-size: 24px;
+  }
+
+  .architecture-intro {
+    text-align: left;
+  }
+
+  .glossary-grid p,
+  .prompt-card,
+  .architecture-card,
+  .architecture-card-grid-compact .architecture-card {
+    max-width: none;
+  }
+
+  .architecture-flow {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 24px;
+  }
+
+  .architecture-flow li {
+    min-height: auto;
+  }
+
+  .architecture-flow li:not(:last-child)::after {
+    display: block;
+    top: auto;
+    right: auto;
+    bottom: -22px;
+    left: 50%;
+    content: "↓";
+    transform: translateX(-50%);
+  }
+
+  .layer-table {
+    min-width: 0;
+  }
+
+  .layer-table th,
+  .layer-table td {
+    padding: 10px;
   }
 
   .wide-metric {

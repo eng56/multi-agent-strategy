@@ -1,4 +1,4 @@
-const architectureItems = [
+const controlLoopItems = [
   {
     title: "Principal",
     text: "The controller reads RunState, selects typed actions, allocates work, and decides whether to repair evidence or stop under budget.",
@@ -18,6 +18,25 @@ const architectureItems = [
   {
     title: "Aggregator and judge",
     text: "The aggregator produces a caveated synthesis from the evidence tiers, and the judge records a payoff-style usefulness/calibration signal.",
+  },
+];
+
+const managedArchitectureItems = [
+  {
+    title: "Frontend and API",
+    text: "The Next.js UI creates runs, while the FastAPI orchestrator validates requests, writes state, and starts coordination.",
+  },
+  {
+    title: "Workers and event bus",
+    text: "GKE runs fixed role deployments. Kafka / Confluent carries coordination events between those workers.",
+  },
+  {
+    title: "State and artifacts",
+    text: "Redis / Upstash is the blackboard and run-state source of truth. GCS stores raw tool outputs and artifacts.",
+  },
+  {
+    title: "Models and tools",
+    text: "OpenRouter, Tavily, Massive, and optional fetch/search providers supply model calls and observations, with Langfuse tracing LLM calls.",
   },
 ];
 
@@ -77,16 +96,45 @@ export default function AboutPage() {
       <section className="section-block">
         <div className="section-heading">
           <div>
-            <p className="tag">Architecture summary</p>
+            <p className="tag">Control-loop summary</p>
             <h2>How the pieces fit together</h2>
           </div>
         </div>
         <div className="glossary-grid">
-          {architectureItems.map((item) => (
+          {controlLoopItems.map((item) => (
             <p key={item.title}>
               <strong>{item.title}</strong>
               <span>{item.text}</span>
             </p>
+          ))}
+        </div>
+      </section>
+
+      <section className="section-block" aria-labelledby="about-architecture-title">
+        <div className="section-heading">
+          <div>
+            <p className="tag">Architecture</p>
+            <h2 id="about-architecture-title">Managed infrastructure and logical agents</h2>
+          </div>
+        </div>
+        <div className="text-panel architecture-summary-copy">
+          <p>
+            The system uses managed infrastructure. Redis/Upstash is the blackboard and source of truth for run state.
+            Kafka/Confluent is used for coordination events between role workers. Kubernetes/GKE runs the orchestrator
+            and a fixed set of workers. GCS stores raw artifacts. OpenRouter, Tavily, Massive, and optional search/fetch
+            providers provide model and observation capabilities.
+          </p>
+          <p>
+            This is not a dynamic pod-per-agent system. The agents are logical AgentSpecs. The physical workers are
+            static role deployments.
+          </p>
+        </div>
+        <div className="architecture-card-grid architecture-card-grid-compact">
+          {managedArchitectureItems.map((item) => (
+            <article className="architecture-card" key={item.title}>
+              <h3>{item.title}</h3>
+              <p>{item.text}</p>
+            </article>
           ))}
         </div>
       </section>

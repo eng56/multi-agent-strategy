@@ -8,6 +8,30 @@ For the current control-loop and research-quality internals, see
 [docs/PRINCIPAL_POLICY.md](docs/PRINCIPAL_POLICY.md) and
 [docs/EVIDENCE_ENGINE.md](docs/EVIDENCE_ENGINE.md).
 
+## Architecture
+
+- **Frontend:** a Next.js UI creates runs and displays run details, Principal actions, artifacts,
+  budgets, and the final answer.
+- **FastAPI orchestrator:** validates run requests, writes run state, and publishes the initial run
+  event.
+- **Kafka / Confluent:** coordination event bus for `run.created`, `task.created`,
+  `observation.created`, `claim.created`, `final.created`, and related events; it is not the run
+  state source of truth.
+- **Kubernetes / GKE workers:** GKE hosts the orchestrator and a fixed set of role-worker
+  deployments such as planner, worker, tool-runner, verifier, skeptic, aggregator, and judge.
+- **Redis / Upstash blackboard:** source of truth for operational run state, including runs, tasks,
+  observations, claims, verifications, artifacts, PrincipalActions, AgentSpecs, dead letters, and
+  organization plans.
+- **GCS artifact store:** stores raw artifacts and tool outputs.
+- **OpenRouter / Langfuse:** OpenRouter provides model calls, and Langfuse provides tracing and
+  LLM-call observability.
+- **Tavily / Massive / optional providers:** Tavily and optional Brave, Exa, or Firecrawl providers
+  supply web evidence; Massive supplies market snapshots.
+
+Logical agents are not Kubernetes pods. The Principal creates logical `AgentSpec` records for each
+run, and a fixed pool of Kubernetes role workers executes those logical agents. The frontend
+`/about` page includes the same user-facing architecture summary.
+
 ## Paper alignment
 
 This project is inspired by the Principal / environment / observation / payoff loop from the
